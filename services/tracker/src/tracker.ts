@@ -5,8 +5,8 @@
  * committed a block with ETH transfers) plus a polling fallback on
  * max(eth_transfers.block). Blocks are processed in order from the tracker's own
  * checkpoint (settings 'tracker.checkpoint'), so missed notifications are caught up.
- * Every `sweepIntervalMs`: expire candidates past expires_at, mark candidates whose
- * wallet launched as 'fired', disarm the rest of a play once stopAfter fired.
+ * Every `sweepIntervalMs`: mark candidates whose wallet launched as 'fired', expire
+ * candidates past expires_at, disarm the rest of a play once stopAfter fired.
  */
 import { errMsg, weiToEth, type Address, type Log } from '@hood/indexer';
 import { armedKey, funderMatch, matchTransfer, type ContractOrigin, type TransferEvent, type WatchPlay } from './match.js';
@@ -75,11 +75,11 @@ export class Tracker {
     this.notifyExplicitly = !(await this.store.armedTriggerInstalled());
     this.stats.checkpoint = await this.store.getCheckpoint();
     if (this.stats.checkpoint === null) {
+      // first start: history that predates the tracker is not "new funding" (optionally
+      // look back a few blocks); on an empty DB everything that arrives later is new
       const max = await this.store.maxTransferBlock();
-      if (max !== null) {
-        this.stats.checkpoint = Math.max(0, max - this.cfg.initialLookbackBlocks);
-        await this.store.setCheckpoint(this.stats.checkpoint);
-      }
+      this.stats.checkpoint = max === null ? 0 : Math.max(0, max - this.cfg.initialLookbackBlocks);
+      await this.store.setCheckpoint(this.stats.checkpoint);
     }
     this.log.info({ plays: this.plays.length, checkpoint: this.stats.checkpoint, explicitNotify: this.notifyExplicitly }, 'tracker init');
   }
@@ -107,16 +107,23 @@ export class Tracker {
 
   async processUpTo(block: number): Promise<void> {
     let from = this.stats.checkpoint === null ? block : this.stats.checkpoint + 1;
+    if (from > block) return;
     while (from <= block) {
-      const to = Math.min(block, from + this.cfg.catchUpBatch - 1);
-      const transfers = await this.store.transfersBetween(from, to);
+      const first = await this.store.nextTransferBlock(from, block);
+      if (first === null) break;
+      const to = Math.min(block, first + this.cfg.catchUpBatch - 1);
+      const transfers = await this.store.transfersBetween(first, to);
       this.stats.transfersSeen += transfers.length;
       await this.handleTransfers(transfers);
       await this.store.setCheckpoint(to);
       this.stats.checkpoint = to;
-      this.stats.lastBlockAt = Date.now();
       from = to + 1;
     }
+    if (this.stats.checkpoint === null || this.stats.checkpoint < block) {
+      await this.store.setCheckpoint(block);
+      this.stats.checkpoint = block;
+    }
+    this.stats.lastBlockAt = Date.now();
   }
 
   /** Match a batch of transfers (ordered by block, id) against the watch plays. */
@@ -188,10 +195,11 @@ export class Tracker {
   }
 
   async sweep(): Promise<CandidateChange[]> {
-    const expired = await this.store.expire(this.now());
+    // fired first: a wallet that launched before its expiry check is 'fired', not 'expired'
     const fired = await this.store.markFired();
+    const expired = await this.store.expire(this.now());
     const disarmed = await this.store.disarmExhausted(this.plays);
-    const changes = [...expired, ...fired, ...disarmed];
+    const changes = [...fired, ...expired, ...disarmed];
     for (const c of changes) {
       await this.store.insertEvent(`candidate_${c.status}`, c);
       if (this.notifyExplicitly) await this.store.notifyArmed({ op: c.status.toUpperCase(), ...c });

@@ -86,7 +86,8 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
     this.createSocket =
       options.createSocket ??
       ((url, headers) =>
-        new WebSocket(url, { perMessageDeflate: false, headers, handshakeTimeout: 5000 }) as FeedSocket);
+        // the Robinhood feed rejects clients that do not offer permessage-deflate (HTTP 400 "Compression is required")
+        new WebSocket(url, { perMessageDeflate: true, headers, handshakeTimeout: 5000 }) as FeedSocket);
   }
 
   /** Highest block delivered so far (-1 before the first). */

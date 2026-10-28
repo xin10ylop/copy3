@@ -1,6 +1,8 @@
 /** PgStore against the real @hood/db migrations on in-process PGlite. */
 import { PGlite } from '@electric-sql/pglite';
-import { applyMigrations, fromPglite, setSetting, upsertPlay, armCandidate, type PgliteClient, type Sql } from '@hood/db';
+import { applyMigrations, fromPglite, setSetting, upsertPlay, armCandidate, type Sql } from '@hood/db';
+
+type PgliteClient = Parameters<typeof fromPglite>[0];
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { PgStore } from '../src/store-db.js';
 import type { ChangeChannel } from '../src/store.js';

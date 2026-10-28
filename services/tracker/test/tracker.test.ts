@@ -39,6 +39,7 @@ describe('Tracker on PGlite (packages/db migration)', () => {
     const { sql, indexer, tracker, notes } = await setup();
     await indexer.writeBatch({ ...emptyBatch(), transfers: [tr(5, 50, '', OLD, OLD, 1n, 'tx'), tr(6, 60, '', a(0x999), OLD, mE(1), 'tx')] });
     await tracker.init();
+    expect(tracker.stats.checkpoint).toBe(6);
     expect(tracker.plays.map((p) => p.name)).toEqual(['sprayer']);
     expect(tracker.stats.checkpoint).toBe(6);
 
@@ -82,13 +83,14 @@ describe('Tracker on PGlite (packages/db migration)', () => {
     await sql.end();
   });
 
-  it('catches up from its checkpoint and via the polling fallback', async () => {
+  it('starts after pre-existing history, then catches up via polling and notifications', async () => {
     const { indexer, tracker, sql } = await setup();
-    await tracker.init();
-    expect(tracker.stats.checkpoint).toBeNull();
+    // funding that happened before the tracker ever ran is history, not a new arm
     await indexer.writeBatch({ ...emptyBatch(), transfers: [tr(20, 1, '', FUNDER, W1, mE(12), 'tx')], wallets: [wallet(W1, 1, 0)] });
+    await tracker.init();
+    expect(tracker.stats.checkpoint).toBe(20);
     await indexer.writeBatch({ ...emptyBatch(), transfers: [tr(21, 2, '', FUNDER, W2, mE(12), 'tx')], wallets: [wallet(W2, 2, 0)] });
-    await tracker.poll(); // no notification at all: first block seen = newest
+    await tracker.poll(); // missed NOTIFY: the poll finds block 21
     expect(tracker.stats.checkpoint).toBe(21);
     await indexer.writeBatch({ ...emptyBatch(), transfers: [tr(30, 3, '', FUNDER, W3, mE(12), 'tx')], wallets: [wallet(W3, 3, 0)] });
     await tracker.onBlock(30);
@@ -97,10 +99,11 @@ describe('Tracker on PGlite (packages/db migration)', () => {
     await sql.end();
   });
 
-  it('sweeps: expires, fires on launch by the armed wallet, disarms after stopAfter', async () => {
+  it('sweeps: fires on launch by the armed wallet, expires, disarms after stopAfter', async () => {
     let now = new Date(T0 * 1000);
     const { indexer, tracker, sql } = await setup(() => now);
-    await tracker.init();
+    await tracker.init(); // empty DB -> checkpoint 0, everything later is new
+    expect(tracker.stats.checkpoint).toBe(0);
     await indexer.writeBatch({
       ...emptyBatch(),
       transfers: [tr(40, 1, '', FUNDER, W1, mE(12), 'tx'), tr(40, 2, '', FUNDER, W2, mE(12), 'tx'), tr(41, 3, '', FUNDER, W3, mE(12), 'tx')],
@@ -117,13 +120,13 @@ describe('Tracker on PGlite (packages/db migration)', () => {
     now = new Date((T0 + 3600 + 1) * 1000); // W2 and W1's original expiry passed, W3 not yet
     const changes = await tracker.sweep();
     expect(changes.map((c) => [c.wallet, c.status])).toEqual([
-      [W2, 'expired'],
       [W1, 'fired'],
+      [W2, 'expired'],
       [W3, 'disarmed'],
     ]);
     expect(changes.find((c) => c.status === 'fired')?.token).toBe(a(0xaaa));
     const types = await sql.query<{ type: string }>(`select type from events where type like 'candidate_%' order by id`);
-    expect(types.map((t) => t.type)).toEqual(['candidate_expired', 'candidate_fired', 'candidate_disarmed']);
+    expect(types.map((t) => t.type)).toEqual(['candidate_fired', 'candidate_expired', 'candidate_disarmed']);
     expect(await new PgTrackerStore(sql).armedCount()).toBe(0);
     await sql.end();
   });

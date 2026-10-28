@@ -19,6 +19,8 @@ export interface TrackerStore {
   getCheckpoint(): Promise<number | null>;
   setCheckpoint(block: number): Promise<void>;
   maxTransferBlock(): Promise<number | null>;
+  /** smallest block in [from, to] that has eth_transfers (skips empty ranges) */
+  nextTransferBlock(from: number, to: number): Promise<number | null>;
   transfersBetween(from: number, to: number): Promise<TransferEvent[]>;
   /** enabled plays with trigger.armedWallet; invalid triggers are reported via onInvalid */
   watchPlays(onInvalid?: (id: number, err: string) => void): Promise<WatchPlay[]>;
@@ -69,6 +71,15 @@ export class PgTrackerStore implements TrackerStore {
 
   async maxTransferBlock(): Promise<number | null> {
     const rows = await this.sql.query<{ b: number | null }>(`select max(block)::float8 as b from eth_transfers`);
+    const b = rows[0]?.b;
+    return b === undefined || b === null ? null : Number(b);
+  }
+
+  async nextTransferBlock(from: number, to: number): Promise<number | null> {
+    const rows = await this.sql.query<{ b: number | null }>(
+      `select min(block)::float8 as b from eth_transfers where block between $1 and $2`,
+      [from, to],
+    );
     const b = rows[0]?.b;
     return b === undefined || b === null ? null : Number(b);
   }
