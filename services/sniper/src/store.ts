@@ -28,14 +28,17 @@ export interface SnipeRecord {
   notes?: string | null;
 }
 
-/** A pending/open snipe row to reconcile at startup. */
+/**
+ * A snipe row to reconcile at startup: pending / open, or aborted while a burst member was still
+ * in flight (`burst[].status = 'sent'`: the process stopped before the run ended — N3).
+ */
 export interface ActiveSnipe {
   id: number;
   playId: number;
   token: string;
   curve: string;
   mode: 'live' | 'paper';
-  status: 'pending' | 'open';
+  status: 'pending' | 'open' | 'aborted';
   decidedAt: Date;
   decision: unknown;
   quoteIn: bigint | null;
@@ -83,6 +86,11 @@ export interface SniperStore {
   notifySnipeEvent(payload: string): Promise<void>;
   insertFeedBlocks(rows: FeedBlockRow[]): Promise<void>;
   close(): Promise<void>;
+}
+
+/** A recorded burst with a member still marked `sent` (the run never reached its end). */
+export function inFlight(burst: unknown): boolean {
+  return Array.isArray(burst) && burst.some((m) => typeof m === 'object' && m !== null && (m as { status?: unknown }).status === 'sent');
 }
 
 /** In-memory store (tests, DB-less paper mode). */
@@ -136,14 +144,14 @@ export class MemoryStore implements SniperStore {
   }
   async loadActiveSnipes(mode: 'live' | 'paper'): Promise<ActiveSnipe[]> {
     return [...this.snipes.entries()]
-      .filter(([, s]) => s.mode === mode && (s.status === 'pending' || s.status === 'open'))
+      .filter(([, s]) => s.mode === mode && (s.status === 'pending' || s.status === 'open' || (s.status === 'aborted' && inFlight(s.burst))))
       .map(([id, s]) => ({
         id,
         playId: s.playId,
         token: s.token,
         curve: s.curve,
         mode: s.mode,
-        status: s.status as 'pending' | 'open',
+        status: s.status as ActiveSnipe['status'],
         decidedAt: s.decidedAt,
         decision: s.decision,
         quoteIn: s.quoteIn ?? null,

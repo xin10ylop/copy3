@@ -125,3 +125,17 @@ Approve/Reject buttons. Alerts cover armed wallets, burst sent, filled (entry mc
 
 Monthly running cost: ≈ $545-900 (Chicago server $233, L1 endpoints, Ohio VM ≈ $70, Anthropic,
 gas). See RUNBOOK §11.
+
+## Operating without Telegram
+
+Telegram is optional (compose profile `telegram`). Nothing in the trading loop
+depends on it: plays that pass `settings.auto_approve` are enabled automatically,
+and everything else is reachable from the command line:
+
+```
+pnpm --filter @hood/db ctl status          # kill state, enabled plays, armed, open positions, today's PnL
+pnpm --filter @hood/db ctl pnl 7           # realised PnL per day and per play
+pnpm --filter @hood/db ctl kill | resume   # global kill switch
+pnpm --filter @hood/db ctl plays | play on|off <id> | events 50
+```
+Health endpoints: every service exposes `/healthz`; logs are JSON (pino).

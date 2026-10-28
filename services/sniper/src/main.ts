@@ -62,7 +62,8 @@ async function main(): Promise<void> {
       exitReceiptTimeoutMs: cfg.EXIT_RECEIPT_TIMEOUT_MS,
       minGasBalanceWei: parseEther(String(cfg.MIN_GAS_BALANCE_ETH)),
       fillerMaxFeeGwei: cfg.MAX_GAS_PRICE_GWEI,
-      onFinal: (run) => sniper?.recorder.snipe(run, sniper.positions.get(run.key), 'burst_final'),
+      // N7: member statuses are final — update the run's row, never insert a second one
+      onFinal: (run) => sniper?.recorder.update(run, sniper.positions.get(run.key), 'burst_final'),
       onAlert: (type, payload) => sniper?.alert(type, payload, 'error'),
     });
     if (live.burstKeys.length === 1 && live.burstKeys[0] === live.exitKey)

@@ -203,6 +203,8 @@ export interface RunResult {
   /** the first play proposed in this run (also in proposedPlays) */
   proposedPlay?: ProposedPlay | undefined;
   proposedPlays: ProposedPlay[];
+  /** play ids enabled by settings.auto_approve in this run (manual /play runs too) */
+  autoApproved?: number[];
   summary: string;
   costUsd: number;
   rounds: number;
@@ -440,7 +442,20 @@ export async function runPlayFinder(args: PlayFinderArgs, overrides?: Partial<Ag
   const runId = await insertAgentRun(deps.sql, 'play', input);
   const state = newRunState();
   const outcome = await runModel(deps, 'play', runId, playFinderMessage(input, deps.now(), deps.limits), state);
-  return finalize(deps, 'play', runId, input, state, outcome, [ca]);
+  const result = await finalize(deps, 'play', runId, input, state, outcome, [ca]);
+  // Manual /play requests go through the same settings.auto_approve policy as scout proposals:
+  // a proposal whose backtest clears every bar is enabled at once; the rest wait for Telegram.
+  if (result.proposedPlays.length > 0) {
+    try {
+      const outcomes = await autoApproveProposals(deps.sql, result.proposedPlays, deps.logger);
+      const approved = outcomes.filter((o) => o.approved).map((o) => o.playId);
+      if (approved.length > 0) result.summary += ` Auto-approved play(s): ${approved.join(', ')}.`;
+      result.autoApproved = approved;
+    } catch (err) {
+      deps.logger.error({ runId, err: err instanceof Error ? err.message : String(err) }, 'auto-approval failed; proposals stay pending for Telegram');
+    }
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------

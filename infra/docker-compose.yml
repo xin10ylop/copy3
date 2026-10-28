@@ -237,6 +237,7 @@ services:
   # ANTHROPIC_API_KEY and the shared reports volume to attach the CSV/report files.
   telegram:
     <<: *app
+    profiles: ["telegram"]   # optional: notifications/approvals only; the trading loop never depends on it
     environment:
       <<: *app-env
       SERVICE: telegram

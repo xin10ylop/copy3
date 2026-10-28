@@ -128,6 +128,8 @@ export interface SnipeRun {
   sendCleared?: boolean;
   /** executor key address that signed the burst (M1) */
   signer?: Address;
+  /** holds a MAX_CONCURRENT slot (taken once the launch is receipt-confirmed, N10) */
+  slot?: boolean;
   /** launch-second ledger of the launch (launch-second plays: confirmation + last-moment re-check) */
   ledger?: LaunchSecondLedger;
   /** how `quoteIn` was sized (Preset.sizing) */

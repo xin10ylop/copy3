@@ -110,7 +110,7 @@ export class PgStore implements SniperStore {
       token: string;
       curve: string;
       mode: 'live' | 'paper';
-      status: 'pending' | 'open';
+      status: ActiveSnipe['status'];
       decided_at: Date;
       decision: unknown;
       quote_in: string | null;
@@ -118,7 +118,13 @@ export class PgStore implements SniperStore {
       entry_price: number | null;
       buy_block: string | number | null;
       sells: unknown;
-    }>(`SELECT * FROM snipes WHERE mode = $1 AND status IN ('pending','open') ORDER BY id`, [mode]);
+    }>(
+      // N3: an aborted run whose burst still has a member marked 'sent' never reached its end
+      `SELECT * FROM snipes WHERE mode = $1 AND (status IN ('pending','open')
+         OR (status = 'aborted' AND EXISTS (SELECT 1 FROM jsonb_array_elements(burst) e WHERE e->>'status' = 'sent')))
+       ORDER BY id`,
+      [mode],
+    );
     return rows.map((r) => ({
       id: Number(r.id),
       playId: r.play_id ?? 0,

@@ -5,6 +5,9 @@
  *   OWNER=0x…                       REQUIRED cold owner (sweeps, admin) — must differ from every hot key
  *   OPERATORS=0x…,0x…               burst keys + exit key (EXECUTOR / EXIT addresses of services/sniper)
  *   [MAX_QUOTE_IN_ETH=0.2]          per-snipe cap enforced on-chain (owner can change it)
+ *   [MAX_SPEND_PER_WINDOW_ETH=4×MAX_QUOTE_IN_ETH] [SPEND_WINDOW_SEC=3600]
+ *                                   rolling buy budget (N4: bounds what a stolen operator key can
+ *                                   lose via its own launches); SPEND_WINDOW_SEC=0 disables it
  *   [TREASURY=0x…]                  receiver of exit proceeds (default: the owner; printed as owner calldata)
  *   [FACTORY=0x7ed5…]               PonsV2LaunchFactory (default from @hood/core)
  *   [RPC_URL=https://rpc.mainnet.chain.robinhood.com] [FUND_ETH=0.2] [DRY_RUN=1]
@@ -56,6 +59,9 @@ const factory = (process.env.FACTORY ?? PONS_V2_FACTORY) as Address;
 const treasury = process.env.TREASURY as Address | undefined;
 if (treasury !== undefined && !isAddress(treasury)) throw new Error('TREASURY must be an address');
 const maxQuoteIn = parseEther(process.env.MAX_QUOTE_IN_ETH ?? '0.2');
+const maxSpend = process.env.MAX_SPEND_PER_WINDOW_ETH ? parseEther(process.env.MAX_SPEND_PER_WINDOW_ETH) : maxQuoteIn * 4n;
+const spendWindow = Number(process.env.SPEND_WINDOW_SEC ?? '3600');
+if (!Number.isInteger(spendWindow) || spendWindow < 0 || spendWindow > 2 ** 32 - 1) throw new Error('SPEND_WINDOW_SEC must be a uint32');
 
 const publicClient = createPublicClient({ chain: robinhood, transport: http(rpcUrl) });
 const wallet = createWalletClient({ account, chain: robinhood, transport: http(rpcUrl) });
@@ -66,10 +72,10 @@ async function main(): Promise<void> {
   const nonce = await publicClient.getTransactionCount({ address: account.address });
   const predicted = getContractAddress({ from: account.address, nonce: BigInt(nonce) });
   console.log(`deployer ${account.address} nonce ${nonce} → PonsSniper at ${predicted}`);
-  console.log(`owner ${owner} operators ${operators.join(',')} factory ${factory} maxQuoteIn ${maxQuoteIn}`);
+  console.log(`owner ${owner} operators ${operators.join(',')} factory ${factory} maxQuoteIn ${maxQuoteIn} spend budget ${maxSpend} per ${spendWindow}s`);
   if (process.env.DRY_RUN === '1') return;
 
-  const hash = await wallet.deployContract({ abi: sniperAbi, bytecode: sniperBytecode, args: [owner!, operators[0]!, factory, maxQuoteIn] });
+  const hash = await wallet.deployContract({ abi: sniperAbi, bytecode: sniperBytecode, args: [owner!, operators[0]!, factory, maxQuoteIn, maxSpend, spendWindow] });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
   if (receipt.status !== 'success' || !receipt.contractAddress) throw new Error(`deploy failed: ${hash}`);
   const address = receipt.contractAddress;

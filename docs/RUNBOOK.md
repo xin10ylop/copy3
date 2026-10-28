@@ -350,3 +350,10 @@ the sniper reads through `settings_changed`). Open positions keep their exits. `
 Trading costs are separate from infrastructure and much larger per trade. At +1 s the snipe tax is
 6.18 % of each buy (0.0043 ETH on 0.07 ETH, ≈ $15), plus a 1 % curve fee on both the buy and the
 sell. These are already inside the realized PnL the bot reports.
+
+## Telegram is optional
+
+Start the bot only if you want push notifications or chat approvals
+(`docker compose --profile telegram up -d telegram`). Without it, use
+`pnpm --filter @hood/db ctl …` (status, pnl, kill, resume, plays, play on/off,
+events). Proposed plays that fail `auto_approve` simply stay disabled.

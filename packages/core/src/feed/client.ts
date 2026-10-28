@@ -42,6 +42,13 @@ export interface FeedClientOptions {
    */
   maxJump?: number;
   resetAfter?: number;
+  /**
+   * Forward plausibility bound (N9): a block more than `elapsed × maxBlocksPerSec + jumpMargin`
+   * ahead of the head (elapsed = time since the head block arrived) cannot be real on a ~10
+   * blocks/s chain and is dropped as bogus — also inside an otherwise valid frame. Defaults 12 / 100.
+   */
+  maxBlocksPerSec?: number;
+  jumpMargin?: number;
   now?: () => number;
   stats?: FeedStats;
   createSocket?: (url: string, headers: Record<string, string>) => FeedSocket;
@@ -81,6 +88,11 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
   private lastFrameAt = 0;
   private connectedAt = 0;
   private lastBlock = -1;
+  /** frame arrival time of the head block (forward plausibility bound) */
+  private lastBlockAt = 0;
+  /** two stale connections in a row without a new block: the head may be poisoned (N9) */
+  private headSuspect = false;
+  private staleStreak = 0;
   private suspect: { max: number; count: number } | null = null;
   private watchdog: NodeJS.Timeout | null = null;
   private pinger: NodeJS.Timeout | null = null;
@@ -99,6 +111,8 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
       requestReplay: options.requestReplay ?? true,
       maxJump: options.maxJump ?? 50_000,
       resetAfter: options.resetAfter ?? 3,
+      maxBlocksPerSec: options.maxBlocksPerSec ?? 12,
+      jumpMargin: options.jumpMargin ?? 100,
     };
     this.now = options.now ?? nowMs;
     this.stats = options.stats ?? defaultFeedStats;
@@ -167,8 +181,18 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
     if (range === undefined) return [];
     let reset = false;
     const { maxJump, resetAfter } = this.opts;
-    if (this.lastBlock >= 0 && (range.min > this.lastBlock + maxJump || range.max < this.lastBlock - maxJump)) {
-      // far from our head: a bogus frame, or a genuine reset (chain restart / our head is wrong)
+    const head = this.lastBlock;
+    const ahead = head >= 0 && range.min > this.forwardCap(receivedAt);
+    const behind = head >= 0 && range.max < head - maxJump;
+    if (this.headSuspect && head >= 0 && (ahead || range.max < head)) {
+      // first frames after a stale reconnect (no replay requested): the server's head wins
+      this.reportError(new Error(`feed: head ${head} not confirmed after a stale reconnect, resetting to ${range.min}`));
+      this.emit('reset', { from: head, to: range.min });
+      this.stats.resets++;
+      this.lastBlock = range.min - 1;
+      reset = true;
+    } else if (ahead || behind) {
+      // implausibly far from our head: a bogus frame, or a genuine reset (chain restart / our head is wrong)
       const consistent = this.suspect !== null && range.min > this.suspect.max && range.min - this.suspect.max <= maxJump;
       this.suspect = { max: range.max, count: consistent ? this.suspect!.count + 1 : 1 };
       this.stats.bogus++;
@@ -187,31 +211,48 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
     const t0 = this.now();
     const blocks = decodeParsedFrame(frame, receivedAt, this.lastBlock);
     const decodeMs = this.now() - t0;
+    const delivered: FeedBlock[] = [];
     for (const b of blocks) {
       if (b.block <= this.lastBlock) continue; // out-of-order inside a frame
+      // a bogus message next to real ones (N9): never let it become the head
+      if (!reset && this.lastBlock >= 0 && b.block > this.forwardCap(receivedAt)) {
+        this.stats.bogus++;
+        continue;
+      }
       if (!reset && this.lastBlock >= 0 && b.block > this.lastBlock + 1) {
         const gap = { from: this.lastBlock + 1, to: b.block - 1 };
         this.stats.recordGap(gap.from, gap.to);
         this.emit('gap', gap);
       }
       reset = false;
+      this.headSuspect = false;
+      this.staleStreak = 0;
       this.lastBlock = b.block;
+      this.lastBlockAt = receivedAt;
       this.lastFrameAt = receivedAt; // liveness only advances on new in-order blocks
       this.stats.recordBlock(b, decodeMs / blocks.length);
+      delivered.push(b);
       try {
         this.emit('block', b);
       } catch (e) {
         this.reportError(new Error(`feed: block listener threw: ${(e as Error).message}`));
       }
     }
-    return blocks;
+    return delivered;
+  }
+
+  /** Highest block number plausible at `at` (head + elapsed × max rate + margin). */
+  private forwardCap(at: number): number {
+    const elapsed = Math.max(0, at - this.lastBlockAt);
+    return this.lastBlock + Math.ceil((elapsed / 1000) * this.opts.maxBlocksPerSec) + this.opts.jumpMargin;
   }
 
   private connect(): void {
     if (!this.running) return;
     const url = this.opts.urls[this.urlIndex]!;
     const headers: Record<string, string> = { 'Arbitrum-Feed-Client-Version': '2' };
-    if (this.opts.requestReplay && this.lastBlock >= 0) {
+    // after a stale connection the head may be poisoned: do not ask the server to replay from it
+    if (this.opts.requestReplay && this.lastBlock >= 0 && !this.headSuspect) {
       headers['Arbitrum-Requested-Sequence-Number'] = String(this.lastBlock + 1);
     }
     let sock: FeedSocket;
@@ -289,6 +330,8 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
       this.reportError(new Error(`feed stale for ${Math.round(now - this.lastFrameAt)} ms`));
       this.socket = null;
       s.terminate();
+      // the replay request from our head did not bring a block either: stop trusting the head
+      if (++this.staleStreak >= 2) this.headSuspect = true;
       this.onDown(this.opts.urls[this.urlIndex]!, 'stale');
       return;
     }

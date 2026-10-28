@@ -700,7 +700,7 @@ export class Sniper {
       this.recorder.snipe(run, undefined, 'snipe_aborted');
       return run;
     }
-    this.risk.reserve();
+    // N10: no MAX_CONCURRENT slot yet — it is taken once the launch receipt proved the launch
     this.paperBank?.commit(run.key, run.quoteIn);
     this.runs.set(run.key, run);
     this.recorder.snipe(run, undefined, 'snipe_decided');
@@ -721,7 +721,7 @@ export class Sniper {
     run.status = final;
     run.notes.push(why);
     this.counters[final]!++;
-    this.risk.release(run.playId, run.confirmed === true);
+    this.risk.release(run.playId, run.confirmed === true, run.slot === true);
     this.paperBank?.release(run.key);
     this.runs.delete(run.key);
     this.unresolvedRuns.delete(run.key);
@@ -817,6 +817,8 @@ export class Sniper {
       this.endRun(run, 'aborted', cc.reasons.join('; '));
       return;
     }
+    this.risk.reserve();
+    run.slot = true;
     this.risk.confirm(run.playId, c.token, c.deployer);
     run.confirmed = true;
     this.recorder.snipe(run, undefined, 'snipe_confirmed');
@@ -1014,8 +1016,10 @@ export class Sniper {
   private async pollReserves(): Promise<void> {
     const curves = new Set(this.positions.open.filter((p) => p.phase === 'open').map((p) => p.curve));
     if (curves.size === 0) return;
-    // M5: one explicit block for every snapshot; logs at or below it are ignored by the book
+    // M5: one explicit block for every snapshot; logs at or below it are ignored by the book.
+    // N13: without a block number an unpinned snapshot could double count: skip this tick.
     const block = await this.o.chain.getBlockNumber().catch(() => undefined);
+    if (block === undefined) return;
     await Promise.all(
       [...curves].map((c) =>
         this.o.chain.getReserves(c, block).then(
@@ -1042,7 +1046,8 @@ export class Sniper {
         this.unresolvedRows.delete(row.id);
       } catch (e) {
         this.unresolvedRows.set(row.id, row);
-        this.alert('snipe_unresolved', { snipeId: row.id, token: row.token, err: (e as Error).message }, 'error');
+        if (e instanceof NotFinalYet) this.o.logger.info({ snipeId: row.id, why: e.message }, 'snipe row not final yet: retrying');
+        else this.alert('snipe_unresolved', { snipeId: row.id, token: row.token, err: (e as Error).message }, 'error');
       }
     }
   }
@@ -1109,6 +1114,11 @@ export class Sniper {
       this.alert('position_closed_externally', { snipeId: row.id, token, realizedEth: pnl }, 'error');
       return;
     }
+    // N12: members of an unfinished burst may still land until the deadline block
+    if (dec && dec.deadlineBlock > 0) {
+      const head = await this.o.chain.getBlockNumber();
+      if (head < dec.deadlineBlock) throw new NotFinalYet(`chain head ${head} < burst deadline ${dec.deadlineBlock}`);
+    }
     await this.markRow(row, 'failed', `reconciled at startup: chain shows no buy (bought=false) — stale ${row.status} row`);
     this.alert('stale_snipe_failed', { snipeId: row.id, token, status: row.status });
   }
@@ -1149,6 +1159,7 @@ export class Sniper {
       burst: [],
       notes: [`rebuilt at startup from chain state (balance ${balance})`],
       confirmed: true,
+      slot: true,
     };
     const fill: Fill = {
       block: row.buyBlock ?? dec.block + 1,
@@ -1244,7 +1255,12 @@ interface StoredDecision {
   block: number;
   ts: number;
   txHash: Hex;
+  /** the burst's deadline block (0 = unknown) */
+  deadlineBlock: number;
 }
+
+/** A row whose outcome is not final on chain yet (burst deadline not reached): retry, no alert. */
+class NotFinalYet extends Error {}
 
 const rec = (v: unknown): Record<string, unknown> => (typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : {});
 const str = (v: unknown, d = ''): string => (typeof v === 'string' ? v : d);
@@ -1291,6 +1307,7 @@ function decisionOf(row: ActiveSnipe): StoredDecision | null {
     block: Number(launch.block ?? 0) || 0,
     ts: Number(launch.ts ?? 0) || 0,
     txHash: str(launch.txHash, '0x') as Hex,
+    deadlineBlock: Number(d.deadlineBlock ?? 0) || 0,
   };
 }
 

@@ -62,6 +62,8 @@ export interface ExitResult {
   error?: string;
   /** broadcast, but no receipt in time: the outcome must be read from the chain */
   unknown?: boolean;
+  /** mined and reverted on chain (a verdict; everything else failed before the chain decided) */
+  reverted?: boolean;
 }
 
 export interface PreflightInput {
@@ -669,7 +671,7 @@ export class LiveExecutor implements ExecutionBackend {
         while (Date.now() < deadline) {
           const r = await this.o.chain.getReceipt(hash).catch(() => null);
           if (r) {
-            if (r.status !== 'success') return { ok: false, tokensIn: order.tokensIn, quoteOut: 0n, txHash: hash, block: r.blockNumber, error: 'exit reverted' };
+            if (r.status !== 'success') return { ok: false, tokensIn: order.tokensIn, quoteOut: 0n, txHash: hash, block: r.blockNumber, error: 'exit reverted', reverted: true };
             let quoteOut = 0n;
             let tokensIn = order.tokensIn;
             for (const l of r.logs) {

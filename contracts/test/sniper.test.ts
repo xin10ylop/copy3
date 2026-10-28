@@ -31,6 +31,7 @@ let rejecter: Artifact;
 let gasBurner: Artifact;
 let ALL_ABI: Abi;
 const MAX_QUOTE_IN = parseEther('0.5');
+const MAX_SPEND = parseEther('2');
 const gas: Record<string, bigint> = {};
 
 beforeAll(() => {
@@ -107,7 +108,7 @@ describe('PonsSniper (in-process EVM, Cancun)', () => {
     factory = f.createdAddress!;
     expect((await chain.send(owner, { to: factory, data: encodeFunctionData({ abi: factoryArt.abi, functionName: 'register', args: [token, curve] }) })).ok).toBe(true);
     const s = await chain.send(owner, {
-      data: encodeDeployData({ abi: sniperAbi, bytecode: sniperBytecode, args: [owner.address, operator.address, factory, MAX_QUOTE_IN] }),
+      data: encodeDeployData({ abi: sniperAbi, bytecode: sniperBytecode, args: [owner.address, operator.address, factory, MAX_QUOTE_IN, MAX_SPEND, 3600] }),
     });
     expect(s.ok).toBe(true);
     sniper = s.createdAddress!;
@@ -277,6 +278,37 @@ describe('PonsSniper (in-process EVM, Cancun)', () => {
     expect((await chain.send(operator, { to: sniper, data: data(curve, token, parseEther('0.6')) })).ok).toBe(true);
   });
 
+  it('N4: a rolling spend budget caps what operator keys can buy per window (stolen-key sandwich on its own launches)', async () => {
+    const d = (functionName: string, args: unknown[] = []): Hex => encodeFunctionData({ abi: sniperAbi as Abi, functionName, args });
+    // the thief's own REAL launches: registered by the factory, so the curve check passes
+    const curves: { curve: Hex; token: Hex }[] = [];
+    for (let i = 0; i < 3; i++) {
+      const c = await chain.send(stranger, { data: encodeDeployData({ abi: mock.abi, bytecode: mock.bytecode, args: [PHANTOM, SUPPLY, 1000n, LAUNCH_TS] }) });
+      const t = (await read(c.createdAddress!, mock.abi, 'token')) as Hex;
+      await chain.send(owner, { to: factory, data: encodeFunctionData({ abi: factoryArt.abi, functionName: 'register', args: [t, c.createdAddress!] }) });
+      curves.push({ curve: c.createdAddress!, token: t });
+    }
+    await chain.send(owner, { to: sniper, value: parseEther('5') });
+    expect(revertName(await chain.send(operator, { to: sniper, data: d('setSpendLimit', [parseEther('1'), 3600]) }))).toBe('NotOwner()');
+    expect((await chain.send(owner, { to: sniper, data: d('setSpendLimit', [parseEther('1'), 3600]) })).ok).toBe(true);
+    expect((await read(sniper, sniperAbi as Abi, 'maxSpendPerWindow')) as bigint).toBe(parseEther('1'));
+    const q = parseEther('0.4');
+    const snipe = (i: number): Hex => d('snipe', [curves[i]!.curve, curves[i]!.token, q, 0n, 1000, 1000n]);
+    chain.setBlock(101n, LAUNCH_TS + 10n);
+    expect((await chain.send(operator, { to: sniper, data: snipe(0) })).ok).toBe(true);
+    expect((await chain.send(operator, { to: sniper, data: snipe(1) })).ok).toBe(true);
+    // 0.8 spent: the third 0.4 would exceed the 1 ETH budget of this window
+    expect(revertName(await chain.send(operator, { to: sniper, data: snipe(2) }))).toBe(`SpendLimitExceeded(${parseEther('0.8')},${q},${parseEther('1')})`);
+    expect(await read(sniper, sniperAbi as Abi, 'spentInWindow')).toBe(parseEther('0.8'));
+    // a reverted buy does not consume budget; a new window resets it
+    chain.setBlock(102n, LAUNCH_TS + 10n + 3600n);
+    expect((await chain.send(operator, { to: sniper, data: snipe(2) })).ok).toBe(true);
+    expect(await read(sniper, sniperAbi as Abi, 'spentInWindow')).toBe(q);
+    // window 0 = budget off (explicit owner choice)
+    expect((await chain.send(owner, { to: sniper, data: d('setSpendLimit', [0n, 0]) })).ok).toBe(true);
+    expect(await read(sniper, sniperAbi as Abi, 'spendWindow')).toBe(0);
+  });
+
   it('L1: exit(tokensIn = 0) reverts instead of selling everything', async () => {
     chain.setBlock(101n, LAUNCH_TS + 1n);
     expect((await chain.send(operator, { to: sniper, data: snipeData() })).ok).toBe(true);
@@ -376,7 +408,7 @@ describe('PonsSniper deadline on Robinhood Chain (chainId 4663 → ArbSys L2 blo
     const token = `0x${tokenWord.slice(26)}` as Hex;
     const f = await chain.send(owner, { data: factoryArt.bytecode });
     await chain.send(owner, { to: f.createdAddress!, data: encodeFunctionData({ abi: factoryArt.abi, functionName: 'register', args: [token, curve] }) });
-    const s = await chain.send(owner, { data: encodeDeployData({ abi: sniperAbi, bytecode: sniperBytecode, args: [owner.address, owner.address, f.createdAddress!, MAX_QUOTE_IN] }) });
+    const s = await chain.send(owner, { data: encodeDeployData({ abi: sniperAbi, bytecode: sniperBytecode, args: [owner.address, owner.address, f.createdAddress!, MAX_QUOTE_IN, MAX_SPEND, 3600] }) });
     const sniper = s.createdAddress!;
     expect(decodeFunctionResult({ abi: sniperAbi, functionName: 'arbBlockNumbers', data: await chain.call(sniper, encodeFunctionData({ abi: sniperAbi, functionName: 'arbBlockNumbers' })) })).toBe(true);
     await chain.send(owner, { to: sniper, value: parseEther('1') });

@@ -27,7 +27,8 @@ interface IArbSys {
 ///         (default: the current owner); if the receiver cannot take ETH they stay here and
 ///         the owner sweeps them with `sweepEth` — an exit never reverts because of the receiver.
 ///         Operator keys are hot: they can only buy real Pons curves (verified against the
-///         immutable factory), at most `maxQuoteIn` per token, once per token, and they can only
+///         immutable factory), at most `maxQuoteIn` per token, once per token, at most
+///         `maxSpendPerWindow` per rolling `spendWindow` seconds in total, and they can only
 ///         sell into those curves; they cannot move ETH or tokens anywhere else.
 contract PonsSniper {
     // ---------------------------------------------------------------- errors / events
@@ -43,6 +44,7 @@ contract PonsSniper {
     error QuoteTooLarge(uint256 quoteIn, uint256 maxQuoteIn);
     error UnknownCurve();
     error NotPendingOwner();
+    error SpendLimitExceeded(uint256 spent, uint256 quoteIn, uint256 maxSpend);
 
     event Sniped(address indexed token, address indexed curve, uint256 quoteIn, uint256 tokensOut, uint256 taxBps);
     event Exited(address indexed token, address indexed curve, uint256 tokensIn, uint256 quoteOut);
@@ -50,6 +52,7 @@ contract PonsSniper {
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event MaxQuoteInSet(uint256 maxQuoteIn);
+    event SpendLimitSet(uint256 maxSpendPerWindow, uint256 spendWindow);
     event TreasurySet(address indexed treasury);
     event ProceedsSent(address indexed to, uint256 amount);
     event ProceedsHeld(address indexed to, uint256 amount);
@@ -70,6 +73,13 @@ contract PonsSniper {
     // ---------------------------------------------------------------- storage
     address public owner; // packed with maxQuoteIn (one slot)
     uint96 public maxQuoteIn;
+    /// @dev N4: a stolen operator key can buy a curve it controls (its own real Pons launch) and
+    ///      sandwich it; per snipe that costs at most maxQuoteIn, and this budget caps the total
+    ///      buy volume per window. `spendWindow == 0` disables the budget (owner's explicit choice).
+    uint96 public maxSpendPerWindow; // packed with spendWindow (one slot)
+    uint32 public spendWindow;
+    uint64 public windowStart; // packed with spentInWindow (one slot)
+    uint96 public spentInWindow;
     address public pendingOwner;
     /// @dev receiver of exit proceeds; address(0) = the current owner, address(this) = keep here
     address payable public treasury;
@@ -80,13 +90,16 @@ contract PonsSniper {
     /// @dev PonsV2LaunchFactory: the only source of truth for token → curve.
     address public immutable factory;
 
-    constructor(address owner_, address operator_, address factory_, uint96 maxQuoteIn_) {
+    constructor(address owner_, address operator_, address factory_, uint96 maxQuoteIn_, uint96 maxSpendPerWindow_, uint32 spendWindow_) {
         if (owner_ == address(0) || factory_ == address(0)) revert ZeroAddress();
         owner = owner_;
         factory = factory_;
         maxQuoteIn = maxQuoteIn_;
+        maxSpendPerWindow = maxSpendPerWindow_;
+        spendWindow = spendWindow_;
         emit OwnershipTransferred(address(0), owner_);
         emit MaxQuoteInSet(maxQuoteIn_);
+        emit SpendLimitSet(maxSpendPerWindow_, spendWindow_);
         if (operator_ != address(0)) {
             operators[operator_] = true;
             emit OperatorSet(operator_, true);
@@ -111,7 +124,8 @@ contract PonsSniper {
     // ---------------------------------------------------------------- hot path
     /// @notice Buy `token` on `curve` once, only if the snipe tax for this contract is ≤ maxTaxBps.
     /// @dev Check order keeps revert paths cheap: deadline, tax cap, auth, bought, tax; the buy
-    ///      path then checks maxQuoteIn and that `curve` is the factory's curve for `token`.
+    ///      path then checks maxQuoteIn, the rolling spend budget and that `curve` is the
+    ///      factory's curve for `token`.
     function snipe(
         address curve,
         address token,
@@ -128,6 +142,7 @@ contract PonsSniper {
         uint256 tax = IPonsCurve(curve).currentSnipeTaxBps(address(this));
         if (tax > maxTaxBps) revert TaxTooHigh(tax);
         if (quoteIn > maxQuoteIn) revert QuoteTooLarge(quoteIn, maxQuoteIn);
+        _spend(quoteIn);
         _checkCurve(token, curve);
         bought[token] = true;
         uint256 before = IERC20Min(token).balanceOf(address(this));
@@ -162,6 +177,13 @@ contract PonsSniper {
     function setTreasury(address payable t) external onlyOwner {
         treasury = t;
         emit TreasurySet(t);
+    }
+
+    /// @notice Rolling buy budget: at most `maxSpend` wei of quoteIn per `window` seconds (0 = off).
+    function setSpendLimit(uint96 maxSpend, uint32 window) external onlyOwner {
+        maxSpendPerWindow = maxSpend;
+        spendWindow = window;
+        emit SpendLimitSet(maxSpend, window);
     }
 
     function setMaxQuoteIn(uint96 v) external onlyOwner {
@@ -239,6 +261,23 @@ contract PonsSniper {
         (bool ok,) = to.call{value: amount, gas: PROCEEDS_GAS}("");
         if (ok) emit ProceedsSent(to, amount);
         else emit ProceedsHeld(to, amount);
+    }
+
+    /// @dev N4: charge `quoteIn` against the rolling window budget (a new window starts when the
+    ///      current one is `spendWindow` seconds old).
+    function _spend(uint256 quoteIn) internal {
+        uint256 window = spendWindow;
+        if (window == 0) return;
+        uint256 start = windowStart;
+        uint256 spent = spentInWindow;
+        if (block.timestamp >= start + window) {
+            start = block.timestamp;
+            spent = 0;
+        }
+        uint256 limit = maxSpendPerWindow;
+        if (spent + quoteIn > limit) revert SpendLimitExceeded(spent, quoteIn, limit);
+        windowStart = uint64(start);
+        spentInWindow = uint96(spent + quoteIn);
     }
 
     /// @dev `curve` must be the factory's curve for `token` (a hot operator key cannot point the

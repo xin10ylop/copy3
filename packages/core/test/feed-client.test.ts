@@ -165,3 +165,69 @@ describe('FeedClient robustness', () => {
     expect(c3.stats.snapshot().duplicates).toBeGreaterThan(3);
   });
 });
+
+describe('N9: forward jumps bounded by elapsed time; poisoned head recovers', () => {
+  const seqOf = (l: string): number => (JSON.parse(l) as { messages: { sequenceNumber: number }[] }).messages[0]!.sequenceNumber;
+  const shift = (l: string, by: number): string => {
+    const f = JSON.parse(l) as { messages: { sequenceNumber: number }[] };
+    for (const m of f.messages) m.sequenceNumber += by;
+    return JSON.stringify(f);
+  };
+
+  it('PoC I: a bogus far-future message inside a real frame is dropped; the real ones keep flowing', () => {
+    const stats = new FeedStats();
+    const c = new FeedClient({ urls: ['ws://unused'], stats });
+    const got: number[] = [];
+    c.on('block', (b) => got.push(b.block));
+    c.handleFrame(lines[0]!, 0);
+    const mixed = JSON.parse(lines[1]!) as { messages: { sequenceNumber: number }[] };
+    mixed.messages.push({ ...mixed.messages[0]!, sequenceNumber: mixed.messages[0]!.sequenceNumber + 49_000 });
+    c.handleFrame(JSON.stringify(mixed), 1);
+    for (let i = 2; i < 12; i++) c.handleFrame(lines[i]!, i);
+    expect(got).toEqual(Array.from({ length: 12 }, (_, i) => seqOf(lines[0]!) + i));
+    expect(c.head).toBe(seqOf(lines[11]!));
+    expect(stats.snapshot().resets).toBe(0);
+    expect(stats.snapshot().bogus).toBe(1);
+  });
+
+  it('a whole frame 40 000 blocks ahead (inside the old 50k window) is dropped; a real gap after a long silence is accepted', () => {
+    const stats = new FeedStats();
+    const c = new FeedClient({ urls: ['ws://unused'], stats });
+    const gaps: FeedGap[] = [];
+    c.on('gap', (g) => gaps.push(g));
+    c.handleFrame(lines[0]!, 1_000);
+    expect(c.handleFrame(shift(lines[1]!, 40_000), 1_100)).toEqual([]);
+    expect(c.head).toBe(seqOf(lines[0]!));
+    // 60 s later the feed resumes 600 blocks on (≈10 blocks/s): plausible, delivered with a gap
+    expect(c.handleFrame(shift(lines[1]!, 600), 61_000)).toHaveLength(1);
+    expect(c.head).toBe(seqOf(lines[1]!) + 600);
+    expect(gaps).toEqual([{ from: seqOf(lines[0]!) + 1, to: seqOf(lines[1]!) + 599 }]);
+  });
+
+  it('a poisoned head (bogus first frame) is reset by the second stale reconnect, which stops requesting replay from it', async () => {
+    const { wss, url } = await server();
+    const replayHeaders: (string | undefined)[] = [];
+    wss.on('connection', (ws, req) => {
+      replayHeaders.push(req.headers['arbitrum-requested-sequence-number'] as string | undefined);
+      if (replayHeaders.length === 1) ws.send(shift(lines[0]!, 30_000)); // first frame ever: poisoned head
+      let i = 1;
+      const t = setInterval(() => ws.readyState === ws.OPEN && i < lines.length && ws.send(lines[i++]!), 5);
+      ws.on('close', () => clearInterval(t));
+    });
+    const c = new FeedClient({ urls: [url], staleMs: 60, reconnectDelayMs: 5 });
+    clients.push(c);
+    c.on('error', () => undefined);
+    const resets: { from: number; to: number }[] = [];
+    c.on('reset', (r) => resets.push(r));
+    const got: number[] = [];
+    c.on('block', (b) => got.push(b.block));
+    c.start();
+    await until(() => got.length >= 3, 5000);
+    const poisoned = seqOf(lines[0]!) + 30_000;
+    expect(got[0]).toBe(poisoned);
+    expect(replayHeaders[1]).toBe(String(poisoned + 1)); // first reconnect still trusts the head
+    expect(replayHeaders[2]).toBeUndefined(); // second: no replay from a head nobody confirms
+    expect(resets[0]!.from).toBe(poisoned);
+    expect(got.slice(1).every((b) => b < poisoned)).toBe(true);
+  });
+});

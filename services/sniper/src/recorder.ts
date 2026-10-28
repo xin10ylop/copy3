@@ -56,7 +56,9 @@ export function snipeRecord(run: SnipeRun, p?: PositionEntry): SnipeRecord {
     tokensOut: run.fill?.tokensOut ?? null,
     taxPaid: run.fill?.taxPaid ?? null,
     entryPrice: run.fill?.entryPrice ?? null,
-    status: run.status,
+    // N3: a run aborted while burst members are in flight has not ended — it can still fill. Keep
+    // the row pending (the abort reason is in `notes`) so a restart reconciles it with the chain.
+    status: run.status === 'aborted' && !run.ended ? 'pending' : run.status,
     sells: JSON.parse(JSON.stringify(p?.sales ?? [], bigintReplacer)) as unknown,
     realizedPnlEth: closed && p ? (Number(p.realizedQuote) - Number(p.costBasis)) / 1e18 : null,
     closedAt: closed ? new Date() : null,
@@ -128,6 +130,28 @@ export class Recorder {
         if (this.chains.get(run.key) === next) this.chains.delete(run.key);
       });
     }
+  }
+
+  /**
+   * Update the run's existing row, never insert one (N7): late writers such as the executor's
+   * `onFinal` run after the orchestrator may have ended the run and dropped its row binding.
+   */
+  update(run: SnipeRun, p?: PositionEntry, type = 'snipe_update'): void {
+    if (this.chains.has(run.key)) {
+      this.snipe(run, p, type);
+      return;
+    }
+    if (run.id <= 0) return; // never written: nothing to update
+    const rec = snipeRecord(run, p);
+    this.store.updateSnipe(run.id, rec).then(
+      () => {
+        this.stats.writes++;
+      },
+      (e: unknown) => {
+        this.stats.errors++;
+        this.logger.error({ err: e, key: run.key }, 'snipe update failed');
+      },
+    );
   }
 
   private async notify(payload: Record<string, unknown>): Promise<void> {

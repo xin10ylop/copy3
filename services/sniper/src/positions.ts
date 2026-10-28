@@ -13,7 +13,10 @@
  * Exits (reviewer H4): one round = up to 3 attempts at widening slippage (`all` exits use
  * `exitAll`). A failed round re-reads the chain — `balanceOf(sniper)` books any sale the chain
  * shows; `curve.graduated()` (or a CurveCompleted log) moves the position to the terminal
- * `graduated` phase — and otherwise retries with exponential backoff. After `maxExitRounds`
+ * `graduated` phase — and otherwise retries with exponential backoff. Failures that are not an
+ * on-chain verdict (no endpoint accepted the tx, no receipt in time, RPC errors, paper
+ * slippage) are retried indefinitely with the backoff capped at `maxExitBackoffMs` (N2); only an
+ * exit that REVERTED ON CHAIN at minQuoteOut = 0 counts toward the cap. After `maxExitRounds`
  * failed rounds the position is `stuck` (terminal). Both terminal phases raise an alert and stop
  * sending txs; see README "Graduation and stuck positions" for the manual procedure.
  */
@@ -60,7 +63,13 @@ export interface SaleRecord {
 
 export type PositionPhase = 'open' | 'graduated' | 'stuck' | 'closed';
 
-export type PositionAlert = 'position_graduated' | 'position_stuck' | 'sale_from_chain' | 'position_closed_externally';
+export type PositionAlert =
+  | 'position_graduated'
+  | 'position_stuck'
+  | 'position_rearmed'
+  | 'exit_retrying'
+  | 'sale_from_chain'
+  | 'position_closed_externally';
 
 export interface ReserveBook {
   base: Reserves | null;
@@ -90,8 +99,12 @@ export interface PositionEntry {
   realizedQuote: bigint;
   phase: PositionPhase;
   exiting: boolean;
-  /** failed exit rounds so far (H4) */
+  /** exit rounds whose minQuoteOut = 0 attempt reverted on chain (H4 cap → stuck) */
   exitRounds: number;
+  /** exit rounds that failed without an on-chain verdict (broadcast / receipt / RPC): retried forever (N2) */
+  transientRounds: number;
+  /** local time the position became `stuck` (re-armed by `recheck` after `stuckRearmMs`) */
+  stuckAt: number;
   /** no exit attempt before this local time (backoff) */
   nextExitAt: number;
   /** exit everything at the next evaluation regardless of price (H2: fill after an abort) */
@@ -128,6 +141,10 @@ export interface PositionsOptions {
   maxExitRounds?: number;
   /** backoff after the first failed round; doubles per round. Default 3000 ms. */
   exitBackoffMs?: number;
+  /** cap for the doubling backoff of transient failures (N2). Default 60 000 ms. */
+  maxExitBackoffMs?: number;
+  /** `recheck` re-arms a stuck position that still holds tokens this long after it got stuck. Default 300 000 ms. */
+  stuckRearmMs?: number;
   onSale?: (p: PositionEntry, s: SaleRecord) => void;
   onClosed?: (p: PositionEntry, pnlEth: number) => void;
   onExitFailed?: (p: PositionEntry, err: string) => void;
@@ -189,6 +206,8 @@ export class Positions {
       phase: 'open',
       exiting: false,
       exitRounds: 0,
+      transientRounds: 0,
+      stuckAt: 0,
       nextExitAt: 0,
       forced: null,
       closed: false,
@@ -435,6 +454,8 @@ export class Positions {
     this.stats.exits++;
     const slips = this.o.exitSlippageBps ?? [1500, 4000, 10_000];
     let res: ExitResult | null = null;
+    /** the minQuoteOut = 0 attempt reverted on chain: a real verdict, counts toward `stuck` */
+    let revertedAtZero = false;
     for (let i = 0; i < slips.length; i++) {
       const expected = p.reserves ? quoteSell(p.reserves, sig.sellTokens, this.o.feeBps ?? CURVE_FEE_BPS, p.creatorTaxBps) : 0n;
       const minQuoteOut = (expected * BigInt(10_000 - Math.min(10_000, slips[i]!))) / 10_000n;
@@ -451,36 +472,41 @@ export class Positions {
           maxFeeGwei: this.o.maxFeeGwei ?? p.preset.maxFeeGwei,
         })
         .catch((e: unknown): ExitResult => ({ ok: false, tokensIn: sig.sellTokens, quoteOut: 0n, error: (e as Error).message }));
-      if (res.ok || p.phase !== 'open') break;
-      this.o.logger.warn({ key: p.key, attempt: i + 1, round: p.exitRounds + 1, err: res.error }, 'exit attempt failed');
+      if (res.ok) break;
+      if (res.reverted && minQuoteOut === 0n) revertedAtZero = true;
+      if (p.phase !== 'open') break;
+      this.o.logger.warn({ key: p.key, attempt: i + 1, round: p.exitRounds + p.transientRounds + 1, err: res.error }, 'exit attempt failed');
       // a receipt-less attempt may have sold: do not stack more sells on top, ask the chain
       if (res.unknown || (res.error !== undefined && GRADUATED_RE.test(res.error))) break;
+    }
+    if (res?.ok) {
+      // N6: a sale the chain confirmed is booked even if the phase changed while we waited
+      // (e.g. a CurveCompleted log arrived first) — never leave it to `recheck` as "external, 0"
+      this.bookSale(
+        p,
+        sig,
+        {
+          reason: sig.reason,
+          tokensIn: res.tokensIn,
+          quoteOut: res.quoteOut,
+          ...(res.txHash ? { txHash: res.txHash } : {}),
+          ...(res.block !== undefined ? { block: res.block } : {}),
+          at: this.o.now(),
+        },
+        sig.all,
+      );
+      p.exitRounds = 0;
+      p.transientRounds = 0;
+      p.exiting = false;
+      if (p.state.tokensHeld === 0n) this.close(p);
+      else if (p.phase === 'open') this.evaluate(p);
+      return;
     }
     if (p.phase !== 'open') {
       p.exiting = false;
       return;
     }
-    if (!res || !res.ok) {
-      await this.afterFailedRound(p, sig, res?.error ?? 'unknown');
-      return;
-    }
-    this.bookSale(
-      p,
-      sig,
-      {
-        reason: sig.reason,
-        tokensIn: res.tokensIn,
-        quoteOut: res.quoteOut,
-        ...(res.txHash ? { txHash: res.txHash } : {}),
-        ...(res.block !== undefined ? { block: res.block } : {}),
-        at: this.o.now(),
-      },
-      sig.all,
-    );
-    p.exitRounds = 0;
-    p.exiting = false;
-    if (p.state.tokensHeld === 0n) this.close(p);
-    else this.evaluate(p);
+    await this.afterFailedRound(p, sig, res?.error ?? 'unknown', revertedAtZero);
   }
 
   private bookSale(p: PositionEntry, sig: ExitSignal, sale: SaleRecord, sellsAll: boolean): void {
@@ -496,8 +522,12 @@ export class Positions {
     this.o.onSale?.(p, sale);
   }
 
-  /** H4: one round failed — ask the chain what actually happened, then back off / give up. */
-  private async afterFailedRound(p: PositionEntry, sig: ExitSignal, err: string): Promise<void> {
+  /**
+   * H4: one round failed — ask the chain what actually happened, then back off. Only rounds whose
+   * minQuoteOut = 0 attempt reverted on chain count toward `stuck`; transient failures (no endpoint
+   * accepted the tx, receipt timeout, RPC errors) retry forever with a capped backoff (N2).
+   */
+  private async afterFailedRound(p: PositionEntry, sig: ExitSignal, err: string, reverted: boolean): Promise<void> {
     this.stats.exitFailures++;
     p.lastError = err;
     const [holding, graduated] = await Promise.all([
@@ -520,16 +550,24 @@ export class Positions {
       this.markGraduated(p, `exit failed: ${err}`);
       return;
     }
-    p.exitRounds++;
-    if (p.exitRounds >= (this.o.maxExitRounds ?? 3)) {
-      p.phase = 'stuck';
-      p.exiting = false;
-      this.stats.stuck++;
-      this.alert(p, 'position_stuck', { rounds: p.exitRounds, err, tokensHeld: p.state.tokensHeld.toString() });
-      this.o.onExitFailed?.(p, `stuck after ${p.exitRounds} rounds: ${err}`);
-      return;
+    const base = this.o.exitBackoffMs ?? 3000;
+    if (reverted) {
+      p.exitRounds++;
+      if (p.exitRounds >= (this.o.maxExitRounds ?? 3)) {
+        p.phase = 'stuck';
+        p.stuckAt = this.o.now();
+        p.exiting = false;
+        this.stats.stuck++;
+        this.alert(p, 'position_stuck', { rounds: p.exitRounds, err, tokensHeld: p.state.tokensHeld.toString() });
+        this.o.onExitFailed?.(p, `stuck after ${p.exitRounds} reverted rounds: ${err}`);
+        return;
+      }
+      p.nextExitAt = this.o.now() + base * 2 ** (p.exitRounds - 1);
+    } else {
+      p.transientRounds++;
+      p.nextExitAt = this.o.now() + Math.min(this.o.maxExitBackoffMs ?? 60_000, base * 2 ** (p.transientRounds - 1));
+      if (p.transientRounds === 3) this.alert(p, 'exit_retrying', { rounds: p.transientRounds, err, note: 'transient failures: retrying with a capped backoff' });
     }
-    p.nextExitAt = this.o.now() + (this.o.exitBackoffMs ?? 3000) * 2 ** (p.exitRounds - 1);
     p.exiting = false;
     this.o.onExitFailed?.(p, err);
   }
@@ -561,23 +599,58 @@ export class Positions {
   }
 
   /**
-   * Terminal positions (graduated / stuck): close them once the chain shows the contract no
-   * longer holds the token (swept / sold manually). Live only (needs `sniper`).
+   * Terminal positions (graduated / stuck), every RECONCILE_MS:
+   *  - live: close them once the chain shows the contract no longer holds the token (swept /
+   *    sold manually); re-arm a `stuck` position that still holds tokens on a curve that has not
+   *    graduated, `stuckRearmMs` after it got stuck (N2);
+   *  - paper (N8): a graduated position is closed with a simulated sale at the last book price
+   *    (frees its slot); a stuck one is re-armed after the same cooldown.
    */
   async recheck(): Promise<void> {
-    if (!this.o.sniper) return;
+    const now = this.o.now();
+    const rearmAfter = this.o.stuckRearmMs ?? 300_000;
     for (const p of [...this.byKey.values()]) {
       if (p.phase !== 'graduated' && p.phase !== 'stuck') continue;
+      if (!this.o.sniper) {
+        if (this.o.backend.mode !== 'paper') continue; // live without a contract address: nothing to read
+        if (p.phase === 'graduated') {
+          const held = p.state.tokensHeld;
+          const est = p.reserves && held > 0n ? quoteSell(p.reserves, held, this.o.feeBps ?? CURVE_FEE_BPS, p.creatorTaxBps) : 0n;
+          const sig: ExitSignal = { reason: 'timeout', sellTokens: held, pnlPct: p.lastPnlPct ?? 0, all: true };
+          this.bookSale(p, sig, { reason: 'graduated(paper)', tokensIn: held, quoteOut: est, at: now, estimated: true }, true);
+          this.close(p);
+        } else if (now - p.stuckAt >= rearmAfter) this.rearm(p);
+        continue;
+      }
       const h = await this.o.chain.readSniper(this.o.sniper, p.token).catch(() => null);
-      if (!h || h.balance >= p.state.tokensHeld) continue;
-      const sold = p.state.tokensHeld - h.balance;
-      const sig: ExitSignal = { reason: 'timeout', sellTokens: sold, pnlPct: p.lastPnlPct ?? 0, all: h.balance === 0n };
-      this.bookSale(p, sig, { reason: 'external', tokensIn: sold, quoteOut: 0n, at: this.o.now(), estimated: true }, h.balance === 0n);
-      if (h.balance === 0n) {
-        this.alert(p, 'position_closed_externally', { phase: p.phase, note: 'proceeds unknown, booked as 0' });
-        this.close(p);
+      if (!h) continue;
+      if (h.balance < p.state.tokensHeld) {
+        const sold = p.state.tokensHeld - h.balance;
+        const sig: ExitSignal = { reason: 'timeout', sellTokens: sold, pnlPct: p.lastPnlPct ?? 0, all: h.balance === 0n };
+        this.bookSale(p, sig, { reason: 'external', tokensIn: sold, quoteOut: 0n, at: now, estimated: true }, h.balance === 0n);
+        if (h.balance === 0n) {
+          this.alert(p, 'position_closed_externally', { phase: p.phase, note: 'proceeds unknown, booked as 0' });
+          this.close(p);
+          continue;
+        }
+      }
+      if (p.phase === 'stuck' && h.balance > 0n && now - p.stuckAt >= rearmAfter) {
+        const graduated = await this.o.chain.curveGraduated(p.curve).catch((): boolean | null => null);
+        if (graduated === true) this.markGraduated(p, 'stuck position: curve graduated');
+        else if (graduated === false) this.rearm(p);
       }
     }
+  }
+
+  /** A stuck position that still holds tokens gets a fresh set of exit rounds. */
+  private rearm(p: PositionEntry): void {
+    p.phase = 'open';
+    p.exitRounds = 0;
+    p.transientRounds = 0;
+    p.nextExitAt = 0;
+    p.exiting = false;
+    this.alert(p, 'position_rearmed', { tokensHeld: p.state.tokensHeld.toString(), lastError: p.lastError });
+    this.evaluate(p);
   }
 
   private close(p: PositionEntry): void {

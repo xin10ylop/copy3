@@ -57,6 +57,8 @@ const utcDay = (ms: number): number => Math.floor(ms / 86_400_000);
 export class Risk {
   private settings: Record<string, unknown> = {};
   private openCount = 0;
+  /** N1: new entries refused while set (startup gate failing); open positions keep being managed */
+  private entryBlock: string | null = null;
   private realizedTodayEth = 0;
   private day = utcDay(Date.now());
   /** first bankroll figure of the current UTC day (ETH) */
@@ -140,6 +142,7 @@ export class Risk {
     this.rollDay(now);
     const reasons: string[] = [];
     if (this.killSwitch) reasons.push('kill switch on');
+    if (this.entryBlock !== null) reasons.push(`new entries blocked: ${this.entryBlock}`);
     if (this.realizedTodayEth <= -this.dailyLossLimitEth) reasons.push(`daily loss ${this.realizedTodayEth.toFixed(4)} ETH ≥ limit ${this.dailyLossLimitEth}`);
     return { ok: reasons.length === 0, reasons };
   }
@@ -182,14 +185,30 @@ export class Risk {
     return Math.min(p.maxFeeGwei, this.opts.maxGasPriceGwei);
   }
 
-  /** Concurrency slot for a decided run (no other bookkeeping yet). */
+  /**
+   * Concurrency slot. Taken only once the launch receipt proved the launch (N10: reverted
+   * spoofs to the real factory must not hold slots while their receipt is pending).
+   */
   reserve(): void {
     this.openCount++;
   }
 
-  /** Re-check token cap / firstBuyOnly / stopAfter with the confirmed launch (a sibling run may have confirmed first). */
+  /**
+   * Block (reason) or allow (null) new entries without touching open positions — e.g. while
+   * the live startup gate fails (N1). Checked at decide time and right before the first send.
+   */
+  blockEntries(reason: string | null): void {
+    this.entryBlock = reason;
+  }
+
+  get entriesBlocked(): string | null {
+    return this.entryBlock;
+  }
+
+  /** Re-check concurrency / token cap / firstBuyOnly / stopAfter with the confirmed launch (a sibling run may have confirmed first). */
   confirmCheck(playId: number, p: Preset, token: string, deployer: string): RiskVerdict {
     const reasons: string[] = [];
+    if (this.openCount >= this.maxConcurrent) reasons.push(`max concurrent ${this.maxConcurrent} reached`);
     if (this.tokens.has(token.toLowerCase())) reasons.push('token already sniped');
     if (p.firstBuyOnly && this.playDeployers.has(`${playId}:${deployer.toLowerCase()}`)) reasons.push('firstBuyOnly: deployer already sniped by this play');
     const n = this.countsByPlay.get(playId) ?? 0;
@@ -204,9 +223,9 @@ export class Risk {
     this.playDeployers.add(`${playId}:${deployer.toLowerCase()}`);
   }
 
-  /** A run ended without a position: free its slot; un-count a confirmed run for stopAfter. */
-  release(playId: number, confirmed: boolean): void {
-    this.openCount = Math.max(0, this.openCount - 1);
+  /** A run ended without a position: free its slot (if it held one); un-count a confirmed run for stopAfter. */
+  release(playId: number, confirmed: boolean, heldSlot = true): void {
+    if (heldSlot) this.openCount = Math.max(0, this.openCount - 1);
     if (confirmed) this.countsByPlay.set(playId, Math.max(0, (this.countsByPlay.get(playId) ?? 1) - 1));
   }
 
