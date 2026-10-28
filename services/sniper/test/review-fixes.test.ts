@@ -481,8 +481,10 @@ describe('L6 / live-mode gate: startup checks', () => {
   const COLD = '0x00000000000000000000000000000000000c01d0' as Address;
   const mk = (over: Partial<NonNullable<FakeChain['sniperConfig']>> = {}): FakeChain => {
     const c = new FakeChain();
-    c.recent = { token: LAUNCH.token, curve: LAUNCH.curve };
+    c.recents = [{ token: LAUNCH.token, curve: LAUNCH.curve, block: 100_299_000 }];
     c.blockNumber = 100_300_000;
+    c.blockTs.set(100_300_000, T + 100);
+    c.blockTs.set(100_299_000, T);
     c.sniperConfig = { owner: COLD, factory: PONS_V2.factory as Address, maxQuoteIn: parseEther('0.2'), operators: [true, true], ...over };
     return c;
   };
@@ -491,20 +493,21 @@ describe('L6 / live-mode gate: startup checks', () => {
 
   it('passes with a cold owner, operator keys and an estimate under the limit', async () => {
     const r = await run(mk());
-    expect(r).toMatchObject({ ok: true, errors: [], gasEstimate: 180_000n });
+    expect(r).toMatchObject({ ok: true, errors: [], gasEstimate: 180_000n, exitGasEstimate: 180_000n, maxQuoteIn: parseEther('0.2') });
   });
 
   it('refuses to start when snipe() needs more gas than the preset limit, or cannot be estimated', async () => {
     const c = mk();
     c.estimate = 320_000n;
-    expect((await run(c)).errors).toEqual([expect.stringMatching(/L6: snipe\(\) estimate 320000 gas > preset gas limit 300000/)]);
-    c.estimate = new Error('execution reverted: AlreadyBought()');
-    expect((await run(c)).errors).toEqual([expect.stringMatching(/L6: eth_estimateGas of snipe\(\) failed/)]);
-    c.recent = null;
+    expect((await run(c)).errors).toEqual(expect.arrayContaining([expect.stringMatching(/L6: snipe\(\) estimate 320000 gas > preset gas limit 300000/)]));
+    c.estimate = new Error('execution reverted: SlippageExceeded()');
+    expect((await run(c)).errors).toEqual([expect.stringMatching(/L6: snipe\(\) could not be estimated on any of 1 recent curves/)]);
+    const saved = c.recents;
+    c.recents = [];
     expect((await run(c)).errors).toEqual([expect.stringMatching(/no TokenLaunched/)]);
     expect((await run(c, { gasCheck: false })).ok).toBe(true);
     c.estimate = 250_000n;
-    c.recent = { token: LAUNCH.token, curve: LAUNCH.curve };
+    c.recents = saved;
     const near = await run(c);
     expect(near.ok).toBe(true);
     expect(near.warnings).toEqual([expect.stringMatching(/within 20 %/)]);
@@ -515,14 +518,17 @@ describe('L6 / live-mode gate: startup checks', () => {
     expect((await run(mk({ owner: EXIT_KEY }), { allowHotOwner: true })).ok).toBe(true);
     expect((await run(mk({ operators: [true, false] }))).errors).toEqual([expect.stringMatching(/0x00000000000000000000000000000000000b0001 is not an operator/)]);
     expect((await run(mk({ factory: ATTACKER }))).errors).toEqual([expect.stringMatching(/factory/)]);
-    expect((await run(mk(), { maxBuyEth: 0.5 })).warnings).toEqual([expect.stringMatching(/QuoteTooLarge/)]);
+    expect((await run(mk(), { maxBuyEth: 0.5 })).warnings).toEqual([expect.stringMatching(/refused at decide time/)]);
   });
 
   it('config: EXECUTOR_PRIVATE_KEYS (first = exit key), legacy single key, duplicates refused', () => {
     const k = (n: number): string => `0x${String(n).repeat(64)}`;
     const base = { EXECUTION_MODE: 'live', SNIPER_CONTRACT: SNIPER, DATABASE_URL: 'postgres://x', SEND_ENDPOINTS: 'http://a' };
     expect(executorKeys(loadConfig({ ...base, EXECUTOR_PRIVATE_KEYS: `${k(1)}, ${k(2)},${k(3)}` }))).toEqual([k(1), k(2), k(3)]);
-    expect(executorKeys(loadConfig({ ...base, EXECUTOR_PRIVATE_KEY: k(4) }))).toEqual([k(4)]);
+    expect(executorKeys(loadConfig({ ...base, EXECUTOR_PRIVATE_KEY: k(4), ALLOW_SINGLE_KEY: '1' }))).toEqual([k(4)]);
+    // N5: one key (exits queue behind bursts) is refused in live mode unless explicitly allowed
+    expect(() => loadConfig({ ...base, EXECUTOR_PRIVATE_KEY: k(4) })).toThrow(/≥ 2 keys/);
+    expect(() => loadConfig({ ...base, EXECUTOR_PRIVATE_KEYS: k(5) })).toThrow(/ALLOW_SINGLE_KEY/);
     expect(() => loadConfig({ ...base, EXECUTOR_PRIVATE_KEYS: `${k(1)},${k(1)}` })).toThrow(/duplicate/);
     expect(() => loadConfig({ ...base, EXECUTOR_PRIVATE_KEYS: '0x12' })).toThrow(/EXECUTOR_PRIVATE_KEYS/);
     expect(() => loadConfig({ LAUNCHERS: 'nope' })).toThrow(/not an address/);

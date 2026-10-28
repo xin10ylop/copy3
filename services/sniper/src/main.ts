@@ -11,7 +11,7 @@ import { installCrashGuards } from './guards.js';
 import { startHealthServer } from './health.js';
 import { createLogger } from './log.js';
 import { PaperExecutor } from './paper.js';
-import { liveStartupChecks } from './preflight.js';
+import { LiveGate, liveStartupChecks } from './preflight.js';
 import { JsonRpcHttp } from './rpc.js';
 import { PreciseScheduler } from './scheduler.js';
 import { Sniper } from './sniper.js';
@@ -71,27 +71,6 @@ async function main(): Promise<void> {
     if (cfg.MAX_CONCURRENT > live.burstKeys.length)
       logger.warn({ maxConcurrent: cfg.MAX_CONCURRENT, burstKeys: live.burstKeys.length }, 'fewer burst keys than MAX_CONCURRENT: concurrent bursts beyond the key count are refused');
     await live.init();
-
-    // live-mode gate: cold owner, operators, factory, L6 gas estimate
-    const plays = (await store.loadPlays()).filter((p) => p.enabled);
-    const gate = await liveStartupChecks({
-      chain,
-      sniper: sniperContract!,
-      keys: live.keys.map((k) => k.address),
-      estimateFrom: live.burstKeys[0]!.address,
-      gasLimit: plays.length ? Math.min(...plays.map((p) => p.preset.gasLimit)) : 300_000,
-      // bankroll sizing can buy up to sizing.maxEth: warn when that exceeds the contract's maxQuoteIn
-      ...(plays.length ? { maxBuyEth: Math.max(...plays.map((p) => (p.preset.sizing.mode === 'bankroll' ? p.preset.sizing.maxEth : p.preset.buyEth))) } : {}),
-      allowHotOwner: cfg.ALLOW_HOT_OWNER,
-      gasCheck: cfg.GAS_CHECK,
-      lookbackBlocks: cfg.GAS_CHECK_LOOKBACK_BLOCKS,
-    });
-    for (const w of gate.warnings) logger.warn(w);
-    if (!gate.ok) {
-      logger.fatal({ errors: gate.errors, gasEstimate: gate.gasEstimate?.toString() }, 'live startup checks failed: refusing to start');
-      process.exit(1);
-    }
-    logger.info({ gasEstimate: gate.gasEstimate?.toString(), keys: live.keys.map((k) => `${k.role}:${k.address}`) }, 'live startup checks passed');
     backend = live;
   } else {
     backend = new PaperExecutor({
@@ -125,11 +104,49 @@ async function main(): Promise<void> {
     reconcileMs: cfg.RECONCILE_MS,
     maxExitRounds: cfg.EXIT_MAX_ROUNDS,
     exitBackoffMs: cfg.EXIT_BACKOFF_MS,
+    maxExitBackoffMs: cfg.EXIT_MAX_BACKOFF_MS,
+    stuckRearmMs: cfg.STUCK_REARM_MS,
     ...(sniperContract && cfg.EXECUTION_MODE === 'live' ? { sniperContract } : {}),
     nonce: () => live?.nonces.value ?? null,
   });
   const s = sniper;
+  // N1: the live gate runs AFTER the startup reconciliation (positions are managed whatever it
+  // says) and only blocks new entries while it fails; it retries every GATE_RETRY_MS
+  let gate: LiveGate | null = null;
+  if (live) s.risk.blockEntries('live startup checks have not passed yet');
   await s.start();
+  if (live) {
+    const exec = live;
+    gate = new LiveGate({
+      logger,
+      retryMs: cfg.GATE_RETRY_MS,
+      check: async () => {
+        const plays = (await store.loadPlays()).filter((p) => p.enabled);
+        return liveStartupChecks({
+          chain,
+          sniper: sniperContract!,
+          keys: exec.keys.map((k) => k.address),
+          estimateFrom: exec.burstKeys[0]!.address,
+          exitFrom: exec.exitKey.address,
+          gasLimit: plays.length ? Math.min(...plays.map((p) => p.preset.gasLimit)) : 300_000,
+          // bankroll sizing can buy up to sizing.maxEth
+          ...(plays.length ? { maxBuyEth: Math.max(...plays.map((p) => (p.preset.sizing.mode === 'bankroll' ? p.preset.sizing.maxEth : p.preset.buyEth))) } : {}),
+          allowHotOwner: cfg.ALLOW_HOT_OWNER,
+          gasCheck: cfg.GAS_CHECK,
+          lookbackBlocks: cfg.GAS_CHECK_LOOKBACK_BLOCKS,
+        });
+      },
+      onResult: (r) => {
+        s.setContractLimits({ maxQuoteIn: r.maxQuoteIn });
+        if (r.ok) s.risk.blockEntries(null);
+        else {
+          s.risk.blockEntries(`live gate: ${r.errors.join('; ')}`);
+          s.alert('live_gate_failed', { errors: r.errors }, 'error');
+        }
+      },
+    });
+    void gate.run(); // never rejects; the feed starts right away (positions need it)
+  }
 
   const feed = new FeedClient({ urls: [cfg.FEED_URL, ...cfg.FEED_URL_SECONDARY] });
   feed.on('block', (b) => s.onFeedBlock(b));
@@ -156,6 +173,7 @@ async function main(): Promise<void> {
     logger.info({ sig }, 'shutting down');
     clearInterval(pinger);
     if (balances) clearInterval(balances);
+    gate?.stop();
     feed.stop();
     health.close();
     await s.stop();

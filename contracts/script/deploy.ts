@@ -1,9 +1,11 @@
 /**
  * Deploy PonsSniper to Robinhood Chain (chainId 4663). NOT run by tests or CI.
  *
- *   EXECUTOR_PRIVATE_KEY=0x…        deployer (pays gas; may be a burst key)
+ *   EXECUTOR_PRIVATE_KEY=0x…        deployer (pays gas; may be a burst key). Default: the first key of
+ *                                   EXECUTOR_PRIVATE_KEYS (the sniper's env file, sourced as is)
  *   OWNER=0x…                       REQUIRED cold owner (sweeps, admin) — must differ from every hot key
- *   OPERATORS=0x…,0x…               burst keys + exit key (EXECUTOR / EXIT addresses of services/sniper)
+ *   OPERATORS=0x…,0x…               exit key + burst keys (the addresses of the sniper's EXECUTOR_PRIVATE_KEYS).
+ *                                   Default: every key of EXECUTOR_PRIVATE_KEYS (else the deployer)
  *   [MAX_QUOTE_IN_ETH=0.2]          per-snipe cap enforced on-chain (owner can change it)
  *   [MAX_SPEND_PER_WINDOW_ETH=4×MAX_QUOTE_IN_ETH] [SPEND_WINDOW_SEC=3600]
  *                                   rolling buy budget (N4: bounds what a stolen operator key can
@@ -34,8 +36,14 @@ import { sniperAbi, sniperBytecode } from '../src/index.js';
 
 const PONS_V2_FACTORY = '0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e';
 const rpcUrl = process.env.RPC_URL ?? 'https://rpc.mainnet.chain.robinhood.com';
-const pk = process.env.EXECUTOR_PRIVATE_KEY as Hex | undefined;
-if (!pk || !/^0x[0-9a-fA-F]{64}$/.test(pk)) throw new Error('EXECUTOR_PRIVATE_KEY (0x + 64 hex) required');
+const KEY_RE = /^0x[0-9a-fA-F]{64}$/;
+const sniperKeys = (process.env.EXECUTOR_PRIVATE_KEYS ?? '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean) as Hex[];
+if (sniperKeys.some((k) => !KEY_RE.test(k))) throw new Error('EXECUTOR_PRIVATE_KEYS must be 0x + 64 hex keys');
+const pk = (process.env.EXECUTOR_PRIVATE_KEY || sniperKeys[0]) as Hex | undefined;
+if (!pk || !KEY_RE.test(pk)) throw new Error('EXECUTOR_PRIVATE_KEY or EXECUTOR_PRIVATE_KEYS (0x + 64 hex) required');
 
 const robinhood = defineChain({
   id: 4663,
@@ -47,7 +55,8 @@ const robinhood = defineChain({
 const account = privateKeyToAccount(pk);
 const owner = process.env.OWNER as Address | undefined;
 if (!owner || !isAddress(owner)) throw new Error('OWNER (cold address) is required');
-const operators = (process.env.OPERATORS ?? account.address)
+const defaultOperators = sniperKeys.length ? sniperKeys.map((k) => privateKeyToAccount(k).address).join(',') : account.address;
+const operators = (process.env.OPERATORS ?? defaultOperators)
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean) as Address[];

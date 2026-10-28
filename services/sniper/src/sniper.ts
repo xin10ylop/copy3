@@ -89,6 +89,10 @@ export interface SniperOptions {
   reconcileMs?: number;
   maxExitRounds?: number;
   exitBackoffMs?: number;
+  /** cap of the transient-failure exit backoff (N2). Default 60 s. */
+  maxExitBackoffMs?: number;
+  /** re-arm a stuck position this long after it got stuck (N2). Default 5 min. */
+  stuckRearmMs?: number;
 }
 
 
@@ -140,6 +144,8 @@ export class Sniper {
   private unsubs: (() => void | Promise<void>)[] = [];
   private seq = 0;
   private statsLoaded = false;
+  /** PonsSniper.maxQuoteIn (live gate): presets that could buy more are refused (N15) */
+  private contractMaxQuoteIn: bigint | null = null;
   private readonly startedAt = Date.now();
 
   constructor(private readonly o: SniperOptions) {
@@ -162,6 +168,8 @@ export class Sniper {
       ...(o.mode === 'live' && o.sniperContract ? { sniper: o.sniperContract } : {}),
       ...(o.maxExitRounds !== undefined ? { maxExitRounds: o.maxExitRounds } : {}),
       ...(o.exitBackoffMs !== undefined ? { exitBackoffMs: o.exitBackoffMs } : {}),
+      ...(o.maxExitBackoffMs !== undefined ? { maxExitBackoffMs: o.maxExitBackoffMs } : {}),
+      ...(o.stuckRearmMs !== undefined ? { stuckRearmMs: o.stuckRearmMs } : {}),
       onSale: (p, s) => {
         this.recorder.snipe(p.run, p, 'snipe_sell');
         o.logger.info({ key: p.key, reason: s.reason, tokensIn: s.tokensIn.toString(), quoteOut: s.quoteOut.toString(), estimated: s.estimated }, 'sold');
@@ -183,6 +191,11 @@ export class Sniper {
         this.alert(type, { key: p.key, snipeId: p.run.id, token: p.token, curve: p.curve, phase: p.phase, ...detail }, type === 'sale_from_chain' ? 'warn' : 'error');
       },
     });
+  }
+
+  /** Contract limits learnt by the live gate (N15). */
+  setContractLimits(l: { maxQuoteIn: bigint | null }): void {
+    this.contractMaxQuoteIn = l.maxQuoteIn;
   }
 
   /** Bankroll for sizing: the cached contract ETH balance (live) or the paper bankroll. Memory-only. */
@@ -490,6 +503,7 @@ export class Sniper {
 
   /** The ledger changed: re-run the rules for launch-second plays (memory, µs) and fire on a match. */
   private onLedgerChanged(lg: LaunchSecondLedger): void {
+    lg.wake(); // a confirmation loop waiting on this ledger re-evaluates now (N16)
     if (lg.decided || lg.dead) return;
     const t0 = performance.now();
     const stats = lg.stats();
@@ -530,7 +544,8 @@ export class Sniper {
       const receipts = await Promise.all(pending.map((h) => this.o.chain.getReceipt(h).catch(() => null)));
       let progressed = false;
       for (const r of receipts) if (r) progressed = lg.applyReceipt(r) || progressed;
-      if (!progressed) await sleep(Math.max(1, Math.min(poll, until - this.o.scheduler.now())));
+      // N16: a node CurveBuy log confirms a buy as soon as it lands: wake on any ledger change
+      if (!progressed) await lg.changed(Math.max(1, Math.min(poll, until - this.o.scheduler.now())));
     }
   }
 
@@ -545,7 +560,13 @@ export class Sniper {
     }
     if (!parsed.txHash) return;
     const hash = parsed.txHash;
-    const known = this.detector.resolve(hash, { token: parsed.token, curve: parsed.curve, source: 'log', deployer: parsed.deployer });
+    const known = this.detector.resolve(hash, {
+      token: parsed.token,
+      curve: parsed.curve,
+      source: 'log',
+      deployer: parsed.deployer,
+      ...(parsed.block !== undefined ? { block: parsed.block } : {}),
+    });
     const lg = this.ledgers.get(hash.toLowerCase());
     if (lg && parsed.deployer.toLowerCase() === lg.launch.event.deployer.toLowerCase() && this.ledgerAddresses(lg, parsed.token, parsed.curve)) {
       this.onLedgerChanged(lg);
@@ -601,6 +622,14 @@ export class Sniper {
     const poll = this.o.receiptPollMs ?? 20;
     const realUntil = Date.now() + Math.max(0, until - this.o.scheduler.now()) + poll;
     for (;;) {
+      // N16: whichever arrives first — the node's TokenLaunched ws log or the receipt
+      const viaLog = this.detector.logConfirmation(l);
+      if (viaLog) {
+        l.token = viaLog.token;
+        l.curve = viaLog.curve;
+        l.addressSource = l.addressSource === 'fallback' ? 'fallback' : 'log';
+        return { ok: true, confirmation: viaLog, notes: ['launch confirmed by the TokenLaunched ws log (receipt verified in the background)'], viaLog: true };
+      }
       const r = await this.o.chain.getReceipt(l.txHash).catch(() => null);
       if (r) {
         const v = verifyLaunchReceipt(r, l, this.detector.factory);
@@ -621,6 +650,37 @@ export class Sniper {
       const known = l.token !== undefined && l.curve !== undefined && l.addressSource !== undefined;
       await (known ? sleep(step) : Promise.race([sleep(step), this.detector.waitAddresses(l, step)]));
     }
+  }
+
+  /**
+   * N16: a launch confirmed by its TokenLaunched ws log is still checked against the receipt in
+   * the background: a contradiction aborts the run (an in-flight fill then exits at once, H2);
+   * the receipt's SnipeTaxExempted set replaces the calldata team set.
+   */
+  private verifyLaunchLater(run: SnipeRun): void {
+    const l = run.launch;
+    const check = async (): Promise<void> => {
+      const deadline = Date.now() + 15_000;
+      while (Date.now() < deadline) {
+        const r = await this.o.chain.getReceipt(l.txHash).catch(() => null);
+        if (r) {
+          const v = verifyLaunchReceipt(r, l, this.detector.factory);
+          if (!v.ok) {
+            this.alert('launch_receipt_mismatch', { key: run.key, tx: l.txHash, reason: v.reason }, 'error');
+            this.abortRun(run, `launch receipt contradicts the TokenLaunched log: ${v.reason}`);
+            return;
+          }
+          const ex = v.confirmation.exemptions;
+          l.event = { ...l.event, exemptions: ex };
+          run.ledger?.setExemptions(ex);
+          this.positions.setExempt(run.key, ex);
+          return;
+        }
+        await sleep(Math.max(20, this.o.receiptPollMs ?? 20) * 5);
+      }
+      this.alert('launch_receipt_missing', { key: run.key, tx: l.txHash }, 'warn');
+    };
+    check().catch((e: unknown) => this.error('background launch receipt check', e));
   }
 
   // ------------------------------------------------------------------ decide + execute
@@ -677,6 +737,12 @@ export class Sniper {
     const run = this.newRun(l, d);
     if (ledger) run.ledger = ledger;
     const verdict = this.risk.preCheck(d, l);
+    // N15: a preset that can buy more than the contract's maxQuoteIn would only revert QuoteTooLarge
+    const presetMaxEth = d.preset.sizing?.mode === 'bankroll' ? d.preset.sizing.maxEth : d.preset.buyEth;
+    if (this.contractMaxQuoteIn !== null && (parseEther(String(presetMaxEth)) > this.contractMaxQuoteIn || run.quoteIn > this.contractMaxQuoteIn)) {
+      verdict.ok = false;
+      verdict.reasons.push(`preset buys up to ${presetMaxEth} ETH > contract maxQuoteIn ${Number(this.contractMaxQuoteIn) / 1e18} ETH (preset refused)`);
+    }
     this.lastDecideUs = (performance.now() - t0) * 1000;
     this.counters.decisions!++;
     this.o.logger.info(
@@ -781,6 +847,7 @@ export class Sniper {
       return;
     }
     const c = verdict.confirmation;
+    if (verdict.viaLog) this.verifyLaunchLater(run);
     const before = new Set(l.event.exemptions.map((x) => x.toLowerCase()));
     const teamChanged = c.exemptions.length !== before.size || c.exemptions.some((x) => !before.has(x));
     l.event = { ...l.event, token: c.token, curve: c.curve, exemptions: c.exemptions };
@@ -932,7 +999,9 @@ export class Sniper {
     this.unresolvedRuns.delete(run.key);
     this.counters.fills!++;
     if (fill.recovered) this.counters.fills_recovered!++;
-    const pos = this.positions.openPosition(run, fill, run.decision.preset, run.launch.event.exemptions);
+    // team set: the launch's exemptions plus any wallet exempted later in the launch second
+    const team = [...new Set([...run.launch.event.exemptions.map((x) => x.toLowerCase()), ...(run.ledger?.exemptions ?? [])])];
+    const pos = this.positions.openPosition(run, fill, run.decision.preset, team);
     this.recorder.snipe(run, pos, 'snipe_filled');
     this.o.logger.info(
       { key: run.key, token: pos.token, block: fill.block, taxBps: fill.taxBps, tokensOut: fill.tokensOut.toString(), entryPrice: fill.entryPrice, recovered: fill.recovered },

@@ -1,6 +1,7 @@
 import { TOPICS, type RawLog, type Reserves, type RpcTxLike } from '@hood/core';
 import type { Address, Hex } from 'viem';
-import type { ChainClient, ReceiptLite, SniperConfigState, SniperHolding } from '../../src/chain.js';
+import type { StateOverride } from 'viem';
+import type { ChainClient, ReceiptLite, RecentLaunch, SniperConfigState, SniperHolding } from '../../src/chain.js';
 import type { RawSender, SendResult } from '../../src/rpc.js';
 
 export class FakeChain implements ChainClient {
@@ -27,7 +28,11 @@ export class FakeChain implements ChainClient {
   graduated = new Set<string>();
   receiptFails = false;
   estimate: bigint | Error = 180_000n;
-  recent: { token: Address; curve: Address } | null = null;
+  /** per-call estimate override (e.g. exits, or a revert on one candidate curve) */
+  estimateFn: ((tx: { from: Address; to: Address; data: Hex; stateOverride?: StateOverride }) => Promise<bigint>) | null = null;
+  estimates: { from: Address; to: Address; data: Hex; stateOverride?: StateOverride }[] = [];
+  /** recent TokenLaunched logs, newest first */
+  recents: RecentLaunch[] = [];
   sniperConfig: SniperConfigState | null = null;
 
   async getReserves(curve: Address, blockNumber?: number): Promise<Reserves> {
@@ -45,8 +50,10 @@ export class FakeChain implements ChainClient {
     if (this.receiptFails) throw new Error('HTTP 429');
     return this.receipts.get(hash.toLowerCase()) ?? null;
   }
+  blockNumberFails = false;
   async getBlockNumber(): Promise<number> {
     this.calls.push('getBlockNumber');
+    if (this.blockNumberFails) throw new Error('HTTP 503');
     return this.blockNumber;
   }
   async readSniper(_sniper: Address, token: Address): Promise<SniperHolding> {
@@ -58,12 +65,14 @@ export class FakeChain implements ChainClient {
     this.calls.push(`curveGraduated:${curve}`);
     return this.graduated.has(curve.toLowerCase());
   }
-  async estimateGas(): Promise<bigint> {
+  async estimateGas(tx: { from: Address; to: Address; data: Hex; stateOverride?: StateOverride }): Promise<bigint> {
+    this.estimates.push(tx);
+    if (this.estimateFn) return this.estimateFn(tx);
     if (this.estimate instanceof Error) throw this.estimate;
     return this.estimate;
   }
-  async recentLaunch(): Promise<{ token: Address; curve: Address } | null> {
-    return this.recent;
+  async recentLaunches(_lookback: number, limit: number): Promise<RecentLaunch[]> {
+    return this.recents.slice(0, limit);
   }
   async readSniperConfig(_s: Address, keys: readonly Address[]): Promise<SniperConfigState> {
     if (!this.sniperConfig) throw new Error('no contract');

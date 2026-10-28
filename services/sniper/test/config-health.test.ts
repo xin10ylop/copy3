@@ -16,7 +16,7 @@ describe('config', () => {
     expect(() => loadConfig({ EXECUTION_MODE: 'live' })).toThrow(/EXECUTOR_PRIVATE_KEY/);
     const c = loadConfig({
       EXECUTION_MODE: 'live',
-      EXECUTOR_PRIVATE_KEY: `0x${'1'.repeat(64)}`,
+      EXECUTOR_PRIVATE_KEYS: `0x${'1'.repeat(64)},0x${'3'.repeat(64)}`,
       SNIPER_CONTRACT: `0x${'2'.repeat(40)}`,
       SEND_ENDPOINTS: 'https://rpc.mainnet.chain.robinhood.com,http://127.0.0.1:8547',
       DATABASE_URL: 'postgres://x',

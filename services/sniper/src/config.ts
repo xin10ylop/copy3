@@ -85,6 +85,10 @@ export const ConfigSchema = z
     EXIT_MAX_ROUNDS: num(3),
     /** first backoff between exit rounds; doubles per round */
     EXIT_BACKOFF_MS: num(3000),
+    /** cap of that backoff for failures without an on-chain verdict (retried forever, N2) */
+    EXIT_MAX_BACKOFF_MS: num(60_000),
+    /** a stuck position that still holds tokens is re-armed this long after it got stuck (N2) */
+    STUCK_REARM_MS: num(300_000),
     /** chain reconciliation of unresolved runs and stuck/graduated positions */
     RECONCILE_MS: num(30_000),
     /** live startup: eth_estimateGas of snipe() on a recent curve must fit the gas limit (L6) */
@@ -92,6 +96,10 @@ export const ConfigSchema = z
     GAS_CHECK_LOOKBACK_BLOCKS: num(36_000),
     /** allow an executor key to be the contract owner (M4: the owner should be a cold key) */
     ALLOW_HOT_OWNER: bool(false),
+    /** allow live mode with ONE executor key (exits then queue behind bursts; N5: refused by default) */
+    ALLOW_SINGLE_KEY: bool(false),
+    /** retry the live gate this often while it fails (new entries blocked meanwhile, N1) */
+    GATE_RETRY_MS: num(60_000),
   })
   .superRefine((c, ctx) => {
     if (c.EXECUTION_MODE === 'live') {
@@ -100,6 +108,12 @@ export const ConfigSchema = z
         ctx.addIssue({ code: 'custom', path: ['EXECUTOR_PRIVATE_KEYS'], message: 'live mode needs 0x-prefixed 32-byte keys (EXECUTOR_PRIVATE_KEYS, first = exit key)' });
       if (new Set(keys.map((k) => k.toLowerCase())).size !== keys.length)
         ctx.addIssue({ code: 'custom', path: ['EXECUTOR_PRIVATE_KEYS'], message: 'duplicate executor key' });
+      if (keys.length === 1 && !c.ALLOW_SINGLE_KEY)
+        ctx.addIssue({
+          code: 'custom',
+          path: ['EXECUTOR_PRIVATE_KEYS'],
+          message: 'live mode needs ≥ 2 keys: EXECUTOR_PRIVATE_KEYS=exitKey,burstKey1[,burstKey2…] (one key makes exits wait behind bursts; ALLOW_SINGLE_KEY=1 overrides)',
+        });
       if (!ADDR_RE.test(c.SNIPER_CONTRACT))
         ctx.addIssue({ code: 'custom', path: ['SNIPER_CONTRACT'], message: 'live mode needs the PonsSniper address' });
       if (c.SEND_ENDPOINTS.length === 0)

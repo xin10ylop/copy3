@@ -101,7 +101,8 @@ export class Recorder {
 
   /** Insert on first call, update afterwards (serialised per run). */
   snipe(run: SnipeRun, p?: PositionEntry, type = 'snipe_update'): void {
-    const prev = this.chains.get(run.key) ?? Promise.resolve<number | null>(null);
+    // N7: a run that already has a row (its binding dropped after it ended) is updated, never re-inserted
+    const prev = this.chains.get(run.key) ?? Promise.resolve<number | null>(run.id > 0 ? run.id : null);
     const rec = snipeRecord(run, p);
     const next = prev.then(async (id) => {
       try {

@@ -197,30 +197,51 @@ First close the open items in RESEARCH §7 (`buy`/`sell` argument order, contrac
    want 1-3 ms. Then set up WireGuard with `infra/wireguard/*.example`, put `PG_BIND=10.66.0.1` and
    `NITRO_BIND=10.66.0.1` in the Chicago `.env`, and add the docker drop-in described in that
    file.
-2. **Executor key.** Generate it on the executor and never copy it anywhere else:
+2. **Executor keys.** The sniper needs one **exit key** plus one **burst key** per concurrent
+   snipe (`MAX_CONCURRENT`, default 3), all in `EXECUTOR_PRIVATE_KEYS` with the exit key first.
+   Live mode refuses a single key, because exits would wait behind bursts on one nonce
+   (`ALLOW_SINGLE_KEY=1` overrides that, for tests only). Generate the keys on the executor and
+   never copy them anywhere else. The example makes 1 + 3 keys:
    ```bash
    cd /opt/hood/hoodsniper && sudo -u hood -H pnpm --filter @hood/contracts exec node --input-type=module -e \
-     "import {generatePrivateKey,privateKeyToAccount} from 'viem/accounts';const k=generatePrivateKey();\
-      process.stdout.write('EXECUTOR_PRIVATE_KEY='+k+'\n');console.error('address',privateKeyToAccount(k).address)" \
+     "import {generatePrivateKey,privateKeyToAccount} from 'viem/accounts';const ks=Array.from({length:4},()=>generatePrivateKey());\
+      process.stdout.write('EXECUTOR_PRIVATE_KEYS='+ks.join(',')+'\n');\
+      ks.forEach((k,i)=>console.error(i?'burst'+i:'exit ',privateKeyToAccount(k).address))" \
      | sudo tee -a .env.executor >/dev/null
    ```
-3. **Deploy.** The owner is the cold wallet; the operator is the executor key. Every `exit`
-   forwards its sale proceeds straight to the owner, so profits never sit on the hot key.
+   Delete the empty `EXECUTOR_PRIVATE_KEYS=` line from the template, so the generated line is
+   the only one. Note the printed addresses: they are the operators in step 3 and the gas
+   accounts in step 4.
+3. **Deploy.** The owner is the cold wallet. Every key in `EXECUTOR_PRIVATE_KEYS` becomes an
+   operator: the script deploys from the first key (the exit key; set `EXECUTOR_PRIVATE_KEY` to use
+   another deployer), and the constructor makes it the first operator. Every `exit` forwards its
+   sale proceeds straight to the owner (the treasury), so profits never sit on a hot key.
+   `MAX_QUOTE_IN_ETH` caps one snipe. `MAX_SPEND_PER_WINDOW_ETH` (default 4 × `MAX_QUOTE_IN_ETH`) per
+   `SPEND_WINDOW_SEC` (default 3600) caps all buys in a rolling window (`SpendLimitExceeded`). Both
+   bound what a stolen operator key can lose by buying its own launches with the contract's ETH.
+   The owner can change them later with `setMaxQuoteIn` and `setSpendLimit`.
    ```bash
    deploy() { sudo -u hood -H bash -c "cd /opt/hood/hoodsniper && set -a && . ./.env.executor && set +a && $*"; }
-   deploy OWNER=<cold wallet> DRY_RUN=1 pnpm --filter @hood/contracts run deploy   # predicted address
-   deploy OWNER=<cold wallet> pnpm --filter @hood/contracts run deploy             # prints SNIPER_CONTRACT=0x…
+   deploy OWNER=<cold wallet> MAX_QUOTE_IN_ETH=0.1 DRY_RUN=1 pnpm --filter @hood/contracts run deploy   # predicted address
+   deploy OWNER=<cold wallet> MAX_QUOTE_IN_ETH=0.1 pnpm --filter @hood/contracts run deploy             # prints SNIPER_CONTRACT=0x…
    ```
-   Use `pnpm … run deploy`. Plain `pnpm deploy` is a pnpm built-in. The deploy script refuses any
-   chain id other than 4663 and checks owner, operator and `arbBlockNumbers` after deploying. The
+   The script prints `setOperator(<key>, true)` calldata for every other key (and `setTreasury`
+   calldata if `TREASURY` is set). Send each one **from the cold owner**: a burst key that is not
+   an operator reverts every snipe. Use `pnpm … run deploy`. Plain `pnpm deploy` is a pnpm built-in.
+   The deploy script refuses any chain id other than 4663, and checks owner, operator and
+   `arbBlockNumbers` after deploying. The
    compiled bytecode lives in `contracts/src/generated/`; run `pnpm --filter @hood/contracts build`
    first if it is missing.
 4. **Fund.** Bridge ETH to Robinhood Chain with the official bridge (an L1 deposit takes about
    10-15 minutes).
-   - The **executor EOA** needs gas only. 0.02 ETH covers about 5,000 burst transactions at
-     0.02 gwei.
-   - The **PonsSniper contract** holds the buy capital. Recommended working balance: **0.5 ETH**,
-     which is roughly buyEth × MAX_CONCURRENT × 2 plus headroom. Send it from the cold wallet, or
+   - **Each executor key** (the exit key and every burst key) pays its own gas. Fund each one
+     with about 0.01 ETH. 0.01 ETH covers about 2,500 burst transactions at 0.02 gwei. A key below the
+     gas floor (`MIN_GAS_BALANCE_ETH`) raises `low_balance`. A burst is refused if its burst key or
+     the exit key is that low, so positions can always be exited.
+   - The **PonsSniper contract** holds the buy capital. Keep its working balance at **a few ×
+     buyEth**, roughly buyEth × MAX_CONCURRENT × 2 (0.5 ETH at most for the default play). The
+     on-chain caps bound each snipe and each window. The balance bounds everything else a stolen
+     operator key could reach, so do not park the bankroll there. Send it from the cold wallet, or
      with `FUND_ETH=0.5` during deploy.
    - Because proceeds go to the owner, the contract balance shrinks with every buy. Top it up from
      the cold wallet. Daily ops (§9) shows how.
@@ -277,7 +298,7 @@ first `T+1` block's pre-trade reserves with the real 618 bps tax and 1 % fee. No
 | Daily | Update `settings.eth_usd` if ETH moved more than ~5 % (USD columns only). |
 | Weekly | **Profits.** Proceeds already sit in the cold owner wallet. Refill the contract's working balance from it, and record the realized PnL for taxes (`/pnl 7`, the `snipes` table). If you deployed with the hot key as owner, sweep it now: `PonsSniper.sweepEth(cold, 0)` from the owner. |
 | Weekly | `infra/backup.sh --list`, copy the newest dump off the box (rclone/rsync), and run `df -h /data`. |
-| Monthly | **Rotate the executor key.** Generate a new key (step 6.2). From the owner call `setOperator(new, true)`, switch `.env.executor`, restart, then `setOperator(old, false)` and move the old EOA's dust. Also rotate the Telegram token (BotFather `/revoke`) and the Anthropic key if anyone else had access. |
+| Monthly | **Rotate the executor keys** (all of them: the exit key and every burst key). Generate a new set (step 6.2). From the owner call `setOperator(new, true)` for each new key and fund each new key with gas. Switch `EXECUTOR_PRIVATE_KEYS` in `.env.executor` and restart. Then call `setOperator(old, false)` for **every** old key and move each old EOA's dust. Also rotate the Telegram token (BotFather `/revoke`) and the Anthropic key if anyone else had access. |
 | On release | **Update the node.** Read the Robinhood node docs and the nitro release notes (some ArbOS upgrades force a version). Set `NITRO_IMAGE=…` in `.env`, run `infra/compose.sh pull nitro && infra/compose.sh up -d nitro`, then `run-node.sh status`. |
 | On release | **Update the code.** Chicago: `git -C /opt/hoodsniper fetch && git checkout <ref> && systemctl reload hood-stack`. Ohio: re-run `install-executor.sh` (idempotent; it restarts the sniper). |
 | Quarterly or at 85 % disk | Restore a fresh pruned snapshot: `systemctl stop hood-stack`, then `run-node.sh snapshot --force`, then `systemctl start hood-stack`. The Ohio sniper keeps running on the public feed. |
@@ -327,8 +348,11 @@ the sniper reads through `settings_changed`). Open positions keep their exits. `
 - **Sequencer downtime or reorg.** Blocks stop: positions cannot exit until blocks resume. When
   they do, check `/positions` and expect stop-loss exits. The indexer re-processes up to
   `REORG_DEPTH` blocks.
-- **Executor key or host compromised.** From the cold owner: `setOperator(compromisedKey, false)`,
-  then `sweepEth(cold, 0)`. Rotate the key (§9), rebuild the host, revoke the WireGuard peer.
+- **Executor key or host compromised.** Treat **every** key in `EXECUTOR_PRIVATE_KEYS` as stolen,
+  because they share one env file. From the cold owner, call `setOperator(key, false)` for each
+  key, then `sweepEth(cold, 0)`. Optionally call `setSpendLimit(0, 1)` first, so no buy can
+  pass while you work. Rotate all keys (§9), rebuild the host and revoke the WireGuard peer. Until
+  the keys are revoked, the spend budget and `maxQuoteIn` bound the loss.
 - **Chicago box lost.** Provision a new one (§2). Restore Postgres from the latest off-box dump:
   `pg_restore -d "$DATABASE_URL" --clean --if-exists hood-<ts>.dump`. Then backfill the gap (§3).
   The Ohio sniper keeps trading meanwhile, but its writes fail until Postgres is back, so `/kill`

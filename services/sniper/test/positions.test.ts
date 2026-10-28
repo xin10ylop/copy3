@@ -213,7 +213,8 @@ describe('Positions manager', () => {
 class ScriptedExitBackend implements ExecutionBackend {
   readonly mode: 'live' | 'paper';
   exits: ExitOrder[] = [];
-  result: (o: ExitOrder) => ExitResult = (o) => ({ ok: false, tokensIn: o.tokensIn, quoteOut: 0n, error: 'exit reverted' });
+  /** default: the exit is mined and reverts on chain (a verdict, counts toward `stuck`) */
+  result: (o: ExitOrder) => ExitResult = (o) => ({ ok: false, tokensIn: o.tokensIn, quoteOut: 0n, error: 'exit reverted', reverted: true });
   constructor(mode: 'live' | 'paper' = 'live') {
     this.mode = mode;
   }

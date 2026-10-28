@@ -248,6 +248,20 @@ export class Positions {
     return this.byKey.get(key);
   }
 
+  /** Replace a position's team (exempt) set, e.g. once the launch receipt arrived (N16). */
+  setExempt(key: string, exempt: readonly string[]): void {
+    const p = this.byKey.get(key);
+    if (!p || p.closed) return;
+    p.exempt = new Set(exempt.map((e) => e.toLowerCase()));
+    void this.o.chain
+      .balancesOf(p.token, [...p.exempt] as Address[])
+      .then((bals) => {
+        p.exemptBaseline = bals.reduce((a, b) => a + b, 0n);
+        this.updateOutflowPct(p);
+      })
+      .catch(() => undefined);
+  }
+
   /** H2: sell everything at the next evaluation (e.g. a fill that landed after an abort). */
   forceExit(key: string, reason: ExitReason): void {
     const p = this.byKey.get(key);

@@ -8,7 +8,10 @@
  *  - CurveBuy / CurveSell / Transfer logs (node ws, or receipts): *confirmed* buys (this also
  *    catches buys routed through contracts, which the feed decoder cannot see);
  *  - the launch receipt: token, curve and the exempt set (SnipeTaxExempted logs), plus the
- *    launchAndBuy dev buy.
+ *    launchAndBuy dev buy;
+ *  - SnipeTaxExempted logs of the curve AFTER the launch tx but inside the launch second: the
+ *    deployer can exempt more wallets (`exemptFromSnipeTax`) while the team buys; they count as
+ *    team wallets too.
  *
  * Classification (same as the indexer / backtest): a buy in the launch tx itself or to the
  * deployer is a *dev* buy; a buy to another exempt wallet (deployer ∪ creatorFeeRecipient ∪
@@ -62,6 +65,10 @@ export class LaunchSecondLedger {
   private readonly deployer: string;
   private readonly launchTx: string;
   private exempt: Set<string>;
+  /** wallets exempted after the launch tx (SnipeTaxExempted in a later block of the second) */
+  private readonly addedExempt = new Set<string>();
+  /** waiters woken on every change (confirmation loops plan the burst the moment a log lands) */
+  private waiters: (() => void)[] = [];
   /** feed hints by tx hash (one direct buy per tx) */
   private readonly hints = new Map<string, LedgerBuy>();
   /** confirmed buys by `txHash:logIndex` */
@@ -98,9 +105,37 @@ export class LaunchSecondLedger {
   }
 
   private exemptSet(list: readonly string[]): Set<string> {
-    const s = new Set<string>([this.deployer, this.launch.event.creatorFeeRecipient.toLowerCase(), ...list.map((x) => x.toLowerCase())]);
+    const s = new Set<string>([this.deployer, this.launch.event.creatorFeeRecipient.toLowerCase(), ...list.map((x) => x.toLowerCase()), ...(this.addedExempt ?? [])]);
     s.delete(ZERO);
     return s;
+  }
+
+  /** Every wallet the ledger treats as team (exempt) right now. */
+  get exemptions(): string[] {
+    return [...this.exempt];
+  }
+
+  /** Wake every `changed()` waiter (the caller saw the ledger change). */
+  wake(): void {
+    const ws = this.waiters;
+    this.waiters = [];
+    for (const w of ws) w();
+  }
+
+  /** Resolves on the next `wake()` or after `ms`. */
+  changed(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      let done = false;
+      const fire = (): void => {
+        if (done) return;
+        done = true;
+        clearTimeout(t);
+        resolve();
+      };
+      const t = setTimeout(fire, Math.max(0, ms));
+      t.unref?.();
+      this.waiters.push(fire);
+    });
   }
 
   isExempt(a: string): boolean {
@@ -194,6 +229,14 @@ export class LaunchSecondLedger {
       const quoteIn = BigInt(`0x${log.data.slice(2, 66) || '0'}`);
       return this.confirmBuy(hash, topicAddr(log.topics[2]), quoteIn, block, logIndex);
     }
+    if (addr === this.curve && t0 === TOPICS.SnipeTaxExempted) {
+      // exemptFromSnipeTax during the launch second (deployer-only on the curve): a team wallet
+      const account = topicAddr(log.topics[1]);
+      if (account === ZERO || this.exempt.has(account)) return false;
+      this.addedExempt.add(account);
+      this.exempt.add(account);
+      return true;
+    }
     if (addr === this.curve && t0 === TOPICS.CurveSell) {
       const seller = topicAddr(log.topics[1]);
       return this.addOut(`${hash}:${logIndex}`, seller, 'sell');
@@ -225,8 +268,11 @@ export class LaunchSecondLedger {
     const hash = r.transactionHash.toLowerCase();
     let changed = false;
     if (r.status === 'success') {
-      for (const l of r.logs) {
-        if (l.address.toLowerCase() !== this.curve || l.topics[0] !== TOPICS.CurveBuy) continue;
+      // exemptions first: a tx that exempts a wallet and then buys for it is a team buy
+      const ordered = [...r.logs].sort((a, b) => Number(b.topics[0] === TOPICS.SnipeTaxExempted) - Number(a.topics[0] === TOPICS.SnipeTaxExempted));
+      for (const l of ordered) {
+        if (l.address.toLowerCase() !== this.curve || (l.topics[0] !== TOPICS.CurveBuy && l.topics[0] !== TOPICS.SnipeTaxExempted)) continue;
+        if (l.topics[0] === TOPICS.SnipeTaxExempted && hash === this.launchTx) continue; // the launch's own set: setExemptions
         changed = this.ingestLog({ ...l, transactionHash: l.transactionHash ?? hash, blockNumber: l.blockNumber ?? r.blockNumber }) || changed;
       }
     }

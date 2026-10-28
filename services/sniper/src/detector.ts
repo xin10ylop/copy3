@@ -48,6 +48,8 @@ export interface ResolvedAddresses {
   source: 'nonce' | 'log' | 'receipt' | 'fallback';
   /** TokenLaunched.deployer (must equal the launch event's deployer) */
   deployer?: Address;
+  /** block of the TokenLaunched log (ws) */
+  block?: number;
 }
 
 const LAUNCH_SELECTORS = new Set<string>([
@@ -76,6 +78,8 @@ export class LaunchDetector {
   private readonly waiters = new Map<string, Waiter[]>();
   /** addresses that arrived before the feed tx was processed */
   private readonly early = new Map<string, ResolvedAddresses>();
+  /** N16: TokenLaunched logs pushed by the node (ws), per launch tx */
+  private readonly launchLogs = new Map<string, { token: Address; curve: Address; deployer: Address; block: number | undefined }[]>();
   readonly stats = { candidates: 0, launches: 0, stale: 0, parseErrors: 0, predictedOk: 0, predictedBad: 0, deployerMismatch: 0 };
 
   constructor(opts: LaunchDetectorOptions = {}) {
@@ -175,6 +179,7 @@ export class LaunchDetector {
   resolve(txHash: Hex, addrs: ResolvedAddresses): DetectedLaunch | undefined {
     const key = txHash.toLowerCase();
     const l = this.launches.get(key);
+    if (addrs.source === 'log' && addrs.deployer) this.recordLaunchLog(key, addrs);
     if (l && addrs.deployer && addrs.deployer.toLowerCase() !== l.event.deployer.toLowerCase()) {
       // a TokenLaunched for a different deployer in this tx: never let it stand in for ours
       this.stats.deployerMismatch++;
@@ -242,6 +247,33 @@ export class LaunchDetector {
     });
   }
 
+  private recordLaunchLog(key: string, a: ResolvedAddresses): void {
+    const list = this.launchLogs.get(key) ?? [];
+    if (!list.some((x) => x.token === a.token.toLowerCase() && x.curve === a.curve.toLowerCase())) {
+      list.push({ token: a.token.toLowerCase() as Address, curve: a.curve.toLowerCase() as Address, deployer: a.deployer!.toLowerCase() as Address, block: a.block });
+    }
+    this.launchLogs.set(key, list);
+    if (this.launchLogs.size > 512) this.launchLogs.delete(this.launchLogs.keys().next().value!);
+  }
+
+  /**
+   * N16: confirmation from the node's TokenLaunched ws log (arrives with the block, before a
+   * receipt poll sees it) — same semantics as `verifyLaunchReceipt`: exactly one factory
+   * TokenLaunched for the matched deployer, in the launch block. Only for txs sent straight to
+   * the factory / router (one launch per call; a whitelisted launcher contract could batch, so
+   * those wait for the receipt). Team wallets are the calldata set, which for these entrypoints is
+   * exactly what the factory exempts; the receipt still verifies them in the background.
+   */
+  logConfirmation(l: DetectedLaunch): LaunchConfirmation | null {
+    const to = l.event.launcher?.toLowerCase();
+    if (to !== this.factory && to !== this.router) return null;
+    const mine = (this.launchLogs.get(l.txHash.toLowerCase()) ?? []).filter((x) => x.deployer === l.event.deployer.toLowerCase());
+    if (mine.length !== 1) return null; // none yet, or ambiguous: the receipt decides
+    const m = mine[0]!;
+    if (m.block !== undefined && m.block !== l.block) return null;
+    return { token: m.token, curve: m.curve, deployer: m.deployer, exemptions: l.event.exemptions.map((x) => x.toLowerCase() as Address), block: l.block };
+  }
+
   /** Known launch by tx hash (feed-detected). */
   get(txHash: Hex): DetectedLaunch | undefined {
     return this.launches.get(txHash.toLowerCase());
@@ -249,7 +281,7 @@ export class LaunchDetector {
 }
 
 export type ReceiptVerdict =
-  | { ok: true; confirmation: LaunchConfirmation; notes: string[] }
+  | { ok: true; confirmation: LaunchConfirmation; notes: string[]; /** N16: from the ws log, receipt still pending */ viaLog?: boolean }
   | { ok: false; reason: string; /** the receipt contradicts the feed tx (spoof / wrong deployer) */ spoof: boolean };
 
 const topicAddr = (t: string | undefined): Address => `0x${(t ?? '').slice(26)}`.toLowerCase() as Address;

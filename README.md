@@ -95,7 +95,7 @@ until then) and when to add capital.
 | tracker | Chicago | `pnpm --filter @hood/tracker start` | `DATABASE_URL` | `/healthz` |
 | agent | Chicago | `pnpm --filter @hood/agent start serve` (scout loop + nightly job; `… start nightly` runs it once) | `ANTHROPIC_API_KEY`, `DATABASE_URL`, `NODE_HTTP`, `REPORTS_DIR`, `SCOUT_*`, `AGENT_MAX_COST_USD`, `NIGHTLY_HOUR_UTC`, `REFIT_*` | `/healthz` (`AGENT_HEALTH_PORT`) |
 | telegram | Chicago | `pnpm --filter @hood/telegram start` | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ADMIN_IDS`, `DATABASE_URL`, `REPORTS_DIR`, `TELEGRAM_TZ`, `TELEGRAM_DAILY_SUMMARY_HOUR` | `/healthz` |
-| sniper | **Ohio** (`hood-sniper.service`); Chicago only via compose profile `executor` | `pnpm --filter @hood/sniper start` | `FEED_URL(_SECONDARY)`, `NODE_WS`, `SEND_ENDPOINTS`, `DATABASE_URL`, `EXECUTOR_PRIVATE_KEY`, `SNIPER_CONTRACT`, `EXECUTION_MODE=paper\|live`, `MAX_GAS_PRICE_GWEI`, `DAILY_LOSS_LIMIT_ETH` or `DAILY_LOSS_LIMIT_PCT`, `PAPER_BANKROLL_ETH` | `/healthz` |
+| sniper | **Ohio** (`hood-sniper.service`); Chicago only via compose profile `executor` | `pnpm --filter @hood/sniper start` | `FEED_URL(_SECONDARY)`, `NODE_WS`, `SEND_ENDPOINTS`, `DATABASE_URL`, `EXECUTOR_PRIVATE_KEYS`, `SNIPER_CONTRACT`, `EXECUTION_MODE=paper\|live`, `MAX_GAS_PRICE_GWEI`, `DAILY_LOSS_LIMIT_ETH` or `DAILY_LOSS_LIMIT_PCT`, `PAPER_BANKROLL_ETH` | `/healthz` |
 | monitoring | Chicago, compose profile `monitoring` | Prometheus + Grafana + node/postgres exporters | `GRAFANA_ADMIN_PASSWORD` | – |
 
 Env templates: `.env.example`, `infra/env/chicago.env.example`, `infra/env/executor.env.example`.

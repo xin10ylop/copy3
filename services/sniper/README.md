@@ -70,10 +70,20 @@ in whole seconds. That is 99 % in the launch second `T`, 6.18 % at `T+1`, 0.19 %
    - `NotOperator()`.
    - `AlreadyBought()`: a sibling already bought. 27.5 k gas.
    - `TaxTooHigh(tax)`: the member landed in a `T` block. 37.6 k gas.
-   - `QuoteTooLarge(quoteIn, maxQuoteIn)` and `UnknownCurve()`: an operator key can only spend up to
-     the owner-set `maxQuoteIn`, and only on the curve the immutable factory returns for the token
-     (`getLaunchedToken(token).curve`) — a hot key cannot drain the contract (M4).
-   - Otherwise it buys once and keeps the tokens, pre-approved to the curve. ~182 k gas (mock curve).
+   - `QuoteTooLarge(quoteIn, maxQuoteIn)`, `SpendLimitExceeded(spent, quoteIn, maxSpend)` and
+     `UnknownCurve()`: an operator key can only spend up to the owner-set `maxQuoteIn` per snipe and
+     `maxSpendPerWindow` per rolling `spendWindow` in total, and only on the curve the immutable
+     factory returns for the token (`getLaunchedToken(token).curve`).
+   - Otherwise it buys once and keeps the tokens, pre-approved to the curve. ~210 k gas (mock curve,
+     first buy of a spend window; ~185 k afterwards).
+
+   **What a stolen operator key can still do (N4).** It cannot send ETH anywhere, but it can launch
+   real Pons tokens itself (0.0005 ETH each) and `snipe` them with `minTokensOut = 0`, sandwiching
+   the buy and keeping a 10 % creator tax. Each such snipe costs at most `maxQuoteIn`; the rolling
+   budget (`MAX_SPEND_PER_WINDOW_ETH` per `SPEND_WINDOW_SEC`, default 4 × `maxQuoteIn` per hour,
+   owner-settable with `setSpendLimit`) caps the total. **Keep the contract's working balance at a
+   few × `buyEth`** (top it up from the cold owner), rotate keys on any suspicion and revoke a
+   compromised key with `setOperator(key, false)` from the owner.
 
    Net effect: exactly one buy, in the earliest `T+1` block any member reaches. Reverted members cost
    dust (≈ 0.0000008 ETH each at 0.02 gwei).
@@ -91,8 +101,18 @@ in whole seconds. That is 99 % in the launch second `T`, 6.18 % at `T+1`, 0.19 %
    for `firstBuyOnly`.
 
    The launch deployer uses CREATE2 with salts from the launch params (verified by core), so the
-   addresses are not predictable; the receipt arrives about 100–200 ms after sequencing and the
-   `TokenLaunched` ws log wakes the receipt poll early. Everything else is prepared from the feed tx:
+   addresses are not predictable; the receipt arrives about 100–200 ms after sequencing.
+   **Whichever arrives first confirms (N16):** for a tx sent straight to the factory or the router,
+   the node's `TokenLaunched` ws log (exactly one for the matched deployer, in the launch block) is
+   accepted as confirmation — that call launches exactly one token and its calldata team set is
+   what the factory exempts. The receipt is then still verified in the background: a contradiction
+   aborts the run (an in-flight fill exits at once) and raises `launch_receipt_mismatch`; the
+   receipt's `SnipeTaxExempted` set replaces the calldata set. Launches through a `LAUNCHERS`
+   contract (could batch) and ambiguous logs wait for the receipt. Verified live (N14,
+   `test/launch-and-buy.test.ts`, fixture `packages/core/test/fixtures/launch-and-buy-tx.json`): a
+   launchAndBuy sent to the router has `TokenLaunched.deployer == tx.from`. Third-party launcher
+   contracts also call the router (seen: `0x6319…cce2`, with a per-launch deployer); they are not
+   candidates unless listed in `LAUNCHERS`. Everything else is prepared from the feed tx:
    decision, risk, quote, gas and warm connections. `ADDRESS_PREDICTION=nonce` keeps the original
    CREATE-nonce predictor (it self-disables after two mismatches); it never replaces the receipt.
 
@@ -123,7 +143,9 @@ in whole seconds. That is 99 % in the launch second `T`, 6.18 % at `T+1`, 0.19 %
    the member receipts are read once more and then the contract is asked (`bought(token)`,
    `token.balanceOf(sniper)`); tokens in the contract always become a position (reviewer H3). If the
    chain cannot be read the run stays `pending` (slot held, `snipe_unresolved` alert) and the
-   reconcile timer retries every `RECONCILE_MS`.
+   reconcile timer retries every `RECONCILE_MS`. The executor's late `burst_final` write only ever
+   updates the run's row (N7). A run holds a `MAX_CONCURRENT` slot only from the moment its launch
+   is confirmed (N10: reverted spoofs to the real factory cannot fill the slots).
 
 Fallback: if a `TokenLaunched` log arrives whose tx the feed never showed, it waits 150 ms, then
 rebuilds the launch from the node (only if that tx was sent to a launcher) and runs the same logic,
@@ -144,7 +166,8 @@ its own nonce sequence:
   rejected or dropped while a later one was accepted) is consumed with a 0-value self-transfer
   (21 k gas) so nothing stale can execute later; then the key resyncs from the chain;
 - a single key (`EXECUTOR_PRIVATE_KEY`, legacy) is shared by exits and bursts and serialises them:
-  an exit waiting for its receipt delays a burst. Not recommended for live.
+  a stop-loss exit then waits behind a whole burst reconcile (up to ~18 s). **Live mode refuses to
+  start with one key** unless `ALLOW_SINGLE_KEY=1` (N5).
 
 Fund each key with gas (≥ `MIN_GAS_BALANCE_ETH`; a burst member reserves `gasLimit × maxFee` up
 front). Before every burst the executor checks the cached balances (refreshed every
@@ -178,30 +201,38 @@ key ≥ max(`MIN_GAS_BALANCE_ETH`, `gasLimit × maxFee`). A failing check aborts
 - **Fill after an abort (reviewer H2).** "Exempt wallet sold in the launch second" cancels the
   members not sent yet; members already in flight can still fill. Any fill opens a position; on an
   aborted run it is exited at once (`exempt_dump`) and its PnL counts toward the daily loss limit.
-- **Exit retries (reviewer H4).** One round = up to 3 attempts at 15 %, 40 % and 100 % slippage.
-  A failed round re-reads the chain: `balanceOf(sniper)` books any sale the chain shows (e.g. a
-  receipt timeout that did sell; quote estimated from the book), `curve.graduated()` ends in the
-  `graduated` phase. Otherwise the next round waits `EXIT_BACKOFF_MS`, doubling per round; after
-  `EXIT_MAX_ROUNDS` failed rounds the position is `stuck`. At most `3 × EXIT_MAX_ROUNDS` exit txs
-  are ever sent for one position.
+- **Exit retries (reviewer H4, N2).** One round = up to 3 attempts at 15 %, 40 % and 100 %
+  slippage. A failed round re-reads the chain: `balanceOf(sniper)` books any sale the chain shows
+  (e.g. a receipt timeout that did sell; quote estimated from the book), `curve.graduated()` ends in
+  the `graduated` phase. Otherwise:
+  - failures **without an on-chain verdict** (no endpoint accepted the tx, no receipt in time, RPC
+    errors, paper slippage) are retried forever, the backoff doubling from `EXIT_BACKOFF_MS` up to
+    `EXIT_MAX_BACKOFF_MS` (60 s); after 3 such rounds an `exit_retrying` warning is raised;
+  - rounds whose `minQuoteOut = 0` attempt **reverted on chain** count toward `EXIT_MAX_ROUNDS`;
+    after that many the position is `stuck`.
+  A sale the chain confirmed is always booked, even if the position changed phase while it was in
+  flight (N6).
 
 ### Graduation and stuck positions
 
-`graduated` and `stuck` are terminal: no more exit txs, an `error` event (`position_graduated` /
-`position_stuck`) for telegram, the snipe row stays `open` with the reason in `notes`, the position
-keeps its `MAX_CONCURRENT` slot and shows in `/healthz` (`positions[].phase`) and
-`sniper_positions_terminal`.
+`graduated` and `stuck` stop exit txs: an `error` event (`position_graduated` / `position_stuck`)
+for telegram, the snipe row stays `open` with the reason in `notes`, the position keeps its
+`MAX_CONCURRENT` slot and shows in `/healthz` (`positions[].phase`) and `sniper_positions_terminal`.
 
 - **graduated** (CurveCompleted log, `graduated() == true` or `AlreadyGraduated()`): the curve no
   longer trades; the liquidity is in the Uniswap v4 pool. Sweep the tokens with the owner key
   (`PonsSniper.sweepToken(token, cold, 0)`) and sell them on v4 (PoolManager
   `0x8366…0951`, Pons hook `0xe5e7…e044`). An automated v4 sale can be plugged into
   `Positions` via the `onGraduated` hook (not implemented).
-- **stuck**: inspect the last error in `notes`, fix the cause (gas, RPC, curve), then either restart
-  the service (startup reconciliation re-adopts the position and retries) or sell manually.
+- **stuck** (only after `EXIT_MAX_ROUNDS` on-chain reverts at `minQuoteOut = 0`): the reconcile
+  timer re-arms the position (`position_rearmed`, fresh rounds) `STUCK_REARM_MS` (5 min) after it
+  got stuck, as long as the contract still holds the token and the curve has not graduated.
+  Inspect the last error in `notes`; selling manually is always possible.
 - Either way, once the chain shows `balanceOf(sniper) == 0` the reconcile timer (`RECONCILE_MS`)
   closes the position (proceeds booked as 0, `position_closed_externally` event; the realised loss
   is conservative).
+- **Paper (N8):** a graduated paper position is closed by the reconcile timer with a simulated sale
+  at the last book price (`graduated(paper)`), so graduations never leak `MAX_CONCURRENT` slots.
 
 ### Crash safety and restart (reviewer H3, M2)
 
@@ -211,6 +242,12 @@ keeps its `MAX_CONCURRENT` slot and shows in `/healthz` (`positions[].phase`) an
   row `closed`; no buy or no token → row `failed` (`stale_snipe_failed`). Rows whose chain read fails
   stay unresolved and are retried. Paper rows are rebuilt from their own data. A rebuilt position
   keeps its original open time, so a timeout that expired while the service was down fires at once.
+- A run aborted ("exempt wallet sold") while burst members are in flight keeps its row `pending`
+  (reason in `notes`) until the run ends, so a restart in between reconciles it like any pending row
+  (N3); legacy rows written as `aborted` with a member still `sent` are loaded too. A pending row is
+  only declared "no buy" once the chain head has passed the burst's `deadlineBlock` (N12).
+- `bought(token)` and `balanceOf(sniper)` are read at one block (N11); a reserves poll whose block
+  number cannot be read is skipped instead of taking an unpinned snapshot (N13).
 - Risk aggregates (`stopAfter`, daily loss, token cap, `firstBuyOnly`) are loaded per mode, so paper
   runs never affect live limits (reviewer L5); only open/closed or receipt-confirmed rows mark a
   token or a deployer.
@@ -293,8 +330,9 @@ sizing: { mode: 'fixed' | 'bankroll', fraction: 0.25, minEth: 0.01, maxEth: 0.3 
   balance (0.1 × 0.25 / 3 = 0.008 → the 0.01 floor until the balance passes 0.12 ETH). For
   proceeds to compound, set the contract's treasury to the contract itself (`setTreasury(sniper)`
   from the owner); otherwise exits pay the owner and the bankroll only shrinks.
-- `maxEth` must not exceed the contract's `maxQuoteIn` (the startup gate warns: those snipes would
-  revert `QuoteTooLarge`).
+- `maxEth` must not exceed the contract's `maxQuoteIn`: such a preset (or a `fixed` preset whose
+  `buyEth` does) is refused at decide time once the live gate has read `maxQuoteIn` (N15), and the
+  gate warns at startup.
 - **Daily loss limit as a share of the bankroll.** With `DAILY_LOSS_LIMIT_ETH` unset, the limit is
   `DAILY_LOSS_LIMIT_PCT` (default 15 %) of the first bankroll figure of the UTC day (0.5 ETH until a
   balance is known). `settings.daily_loss_limit_eth` / `daily_loss_limit_pct` override at runtime.
@@ -333,8 +371,8 @@ From the 3-day walk-forward (`docs/BACKTEST.md`, Backtest #2):
 | `SEND_ENDPOINTS` | `NODE_HTTP` or `PUBLIC_RPC` | comma list; every raw tx goes to all of them; the first is used for RTT |
 | `DATABASE_URL` | – | Postgres (`@hood/db`). Required in live mode; without it paper mode uses an in-memory store |
 | `PLAYS_FILE` | – | JSON array of plays (SPEC §4 shape) for DB-less paper runs |
-| `EXECUTOR_PRIVATE_KEYS` | – | live only; comma list of operator keys: **first = exit key**, the rest = one burst slot each. chmod 600 env file on the executor host |
-| `EXECUTOR_PRIVATE_KEY` | – | legacy single key (shared exit/burst sequence; not recommended) |
+| `EXECUTOR_PRIVATE_KEYS` | – | live only; comma list of operator keys: **first = exit key**, the rest = one burst slot each (≥ 2 keys in live mode). Fund each with gas. chmod 600 env file on the executor host |
+| `EXECUTOR_PRIVATE_KEY` | – | legacy single key (shared exit/burst sequence); live mode refuses it unless `ALLOW_SINGLE_KEY=1` (N5) |
 | `SNIPER_CONTRACT` | – | live only; deployed PonsSniper address |
 | `LAUNCHERS` | – | extra launcher contracts (Pons whitelisted launchers) accepted besides the factory and the launch router |
 | `MAX_GAS_PRICE_GWEI` | `1` | global cap: blocks snipes when L2 gas price is above it, clamps every preset's `maxFeeGwei` and the gap fillers' fee |
@@ -358,12 +396,16 @@ From the 3-day walk-forward (`docs/BACKTEST.md`, Backtest #2):
 | `PAPER_FILL` | `first` | paper fill model: `first` in the +1 s block (optimistic) or `last` after its other buys (pessimistic) |
 | `MIN_GAS_BALANCE_ETH` | `0.001` | per-key gas minimum (L8) |
 | `BALANCE_POLL_MS` | `5000` | contract / key balance refresh |
-| `EXIT_MAX_ROUNDS` | `3` | failed exit rounds before `stuck` |
+| `EXIT_MAX_ROUNDS` | `3` | exit rounds that reverted on chain at `minQuoteOut = 0` before `stuck` (transient failures never count, N2) |
 | `EXIT_BACKOFF_MS` | `3000` | first backoff between exit rounds (doubles) |
-| `RECONCILE_MS` | `30000` | retry unresolved runs/rows, re-check graduated/stuck positions |
+| `EXIT_MAX_BACKOFF_MS` | `60000` | cap of that backoff for failures without an on-chain verdict (retried forever, N2) |
+| `STUCK_REARM_MS` | `300000` | re-arm a `stuck` position that still holds tokens this long after it got stuck (N2) |
+| `RECONCILE_MS` | `30000` | retry unresolved runs/rows, re-check graduated/stuck positions (re-arm / close; paper too) |
 | `GAS_CHECK` | `1` | live startup `eth_estimateGas` of `snipe()` against a recent curve (L6); `0` skips it explicitly |
 | `GAS_CHECK_LOOKBACK_BLOCKS` | `36000` | how far back to look for that curve (~1 h) |
 | `ALLOW_HOT_OWNER` | `0` | allow an executor key to be the contract owner (refused by default, M4) |
+| `ALLOW_SINGLE_KEY` | `0` | allow live mode with ONE executor key (refused by default, N5) |
+| `GATE_RETRY_MS` | `60000` | retry the live gate while it fails (new entries blocked meanwhile, N1) |
 
 DB `settings` keys read at start and on `settings_changed`:
 - `kill_switch`: `true`, `"on"`, `"true"`, `1`, `{"on":true}`, `{"enabled":true}` or `{"killed":true,…}`
@@ -451,19 +493,27 @@ Rules of thumb:
 ## Live-mode gate
 
 Live mode is allowed only when every High and Medium row of `docs/REVIEW.md` is `fixed` and has
-been re-reviewed. The service enforces what it can at startup (`liveStartupChecks`) and refuses to
-start otherwise:
+been re-reviewed. Config refuses live mode with a single executor key (N5, `ALLOW_SINGLE_KEY=1`
+overrides). The gate (`liveStartupChecks` + `LiveGate`) runs **after** the startup reconciliation —
+open positions are managed whatever it says — and **blocks only new entries** while it fails
+(`new entries blocked: live gate: …` on refused snipes, `live_gate_failed` event), retrying every
+`GATE_RETRY_MS` (N1). It checks:
 
 - the `PonsSniper` owner is not one of the executor keys (cold owner, M4; `ALLOW_HOT_OWNER=1`
   overrides);
 - the contract's `factory()` is the Pons V2 factory;
 - every executor key is an operator;
-- `eth_estimateGas` of a real `snipe()` against the most recent live curve fits the smallest preset
-  `gasLimit` (L6; within 20 % → warning; estimate impossible → refused; `GAS_CHECK=0` skips);
-- a preset `buyEth` above the contract's `maxQuoteIn` is a warning (those snipes would revert).
+- `eth_estimateGas` of a real `snipe()` fits the smallest preset `gasLimit` (L6; within 20 % →
+  warning; impossible → blocked; `GAS_CHECK=0` skips). The curve is the newest recent launch that
+  we have **not** bought, whose snipe tax is 0 (≥ 3 s old) and that has not graduated; up to 8
+  candidates are tried (N1);
+- `exitAll()` on the same curve (the contract given a balance by a state override, ERC-20 slots 0/1)
+  fits the gas limit; estimate + the 50 k treasury allowance above it → warning; not estimable →
+  warning (N15);
+- a preset that can buy more than `maxQuoteIn` → warning; such presets are refused at decide time.
 
-At runtime: a single executor key logs a warning; fewer burst keys than `MAX_CONCURRENT` logs a
-warning; balance pre-checks block bursts (L8).
+At runtime: fewer burst keys than `MAX_CONCURRENT` logs a warning; balance pre-checks block bursts
+(L8).
 
 ## Going live (exact sequence)
 
@@ -480,16 +530,22 @@ warning; balance pre-checks block bursts (L8).
 3. Keys: a **cold owner** (hardware wallet / Safe, never on the host) and, on the Ohio host, one
    exit key plus one burst key per concurrent snipe (`EXECUTOR_PRIVATE_KEYS=exit,burst1,burst2,…`
    in an env file with `chmod 600`). Fund each hot key with about 0.01 ETH for gas.
-4. Deploy the contract (constructor: owner, first operator, Pons V2 factory, `maxQuoteIn`):
+4. Deploy the contract. The constructor takes the owner, the first operator, the Pons V2 factory,
+   `maxQuoteIn` and the rolling spend budget (`maxSpendPerWindow`, `spendWindow`; N4):
+   - By default the script reads `EXECUTOR_PRIVATE_KEYS` from the sourced env file. It deploys from
+     the first key and makes every key an operator; `EXECUTOR_PRIVATE_KEY=<deployer>` and
+     `OPERATORS=` override that.
+   - `MAX_SPEND_PER_WINDOW_ETH` (default 4 × `MAX_QUOTE_IN_ETH`) per `SPEND_WINDOW_SEC` (default
+     3600; `0` = off) caps all buys of the window on chain.
    - Dry run first:
      ```bash
-     DRY_RUN=1 EXECUTOR_PRIVATE_KEY=<deployer> OWNER=<cold> OPERATORS=<exit>,<burst1>,<burst2> pnpm --filter @hood/contracts deploy
+     DRY_RUN=1 OWNER=<cold> MAX_QUOTE_IN_ETH=0.1 pnpm --filter @hood/contracts run deploy
      ```
    - Then for real. This deploys, checks `owner`, `operators`, `factory` and
      `arbBlockNumbers()==true`, funds the contract and prints the `setOperator` (and optional
      `TREASURY` → `setTreasury`) calldata the cold owner must send for the other operators:
      ```bash
-     FUND_ETH=0.2 MAX_QUOTE_IN_ETH=0.1 EXECUTOR_PRIVATE_KEY=<deployer> OWNER=<cold> OPERATORS=<exit>,<burst1>,<burst2> pnpm --filter @hood/contracts deploy
+     FUND_ETH=0.2 MAX_QUOTE_IN_ETH=0.1 OWNER=<cold> pnpm --filter @hood/contracts run deploy
      ```
    - Send the printed calldata from the owner. Set `SNIPER_CONTRACT`.
    - Exit proceeds go to the `treasury` (default: the owner); if it cannot take ETH they stay in

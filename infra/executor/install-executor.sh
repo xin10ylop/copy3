@@ -178,7 +178,7 @@ if [[ -n "$db_url" && "$db_url" != *CHANGE_ME* ]]; then
   sleep 5
   systemctl --no-pager --lines=15 status hood-sniper.service || true
 else
-  log "not starting: fill in $ENV_FILE (DATABASE_URL, SNIPER_CONTRACT, EXECUTOR_PRIVATE_KEY), then: systemctl start hood-sniper"
+  log "not starting: fill in $ENV_FILE (DATABASE_URL, SNIPER_CONTRACT, EXECUTOR_PRIVATE_KEYS), then: systemctl start hood-sniper"
 fi
 
 # ---------------------------------------------------------------------------------- report
