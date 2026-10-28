@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { Links } from '../src/format.js';
-import { eventMessage, presetSummary, snipeAbortedMessage, snipeClosedMessage, snipeFilledMessage, snipeSentMessage, type FormatCtx } from '../src/messages.js';
+import { eventMessage, presetSummary, triggerSummary, snipeAbortedMessage, snipeClosedMessage, snipeFilledMessage, snipeSentMessage, type FormatCtx } from '../src/messages.js';
 import type { SendExtra } from '../src/messenger.js';
 import { Notifier, snipeIdsFromPayload, snipeSteps, type NotifyChannel } from '../src/notifier.js';
 import { Registry } from '../src/registry.js';
@@ -8,6 +8,18 @@ import { SETTINGS, type ArmedRow } from '../src/store.js';
 import { FakeStore, FUNDER, makePlay, makeSnipe, NOW, silentLog, TX, WALLET } from './helpers.js';
 
 const ctx: FormatCtx = { links: new Links(), ethUsd: 3000, tz: 'UTC', now: NOW };
+
+describe('trigger summary', () => {
+  it('shows the launch-second fingerprint and the blacklists', () => {
+    const t = triggerSummary(
+      { launchSecond: { minTeamBuyEth: 0.1, requireNoDevBuy: true }, deployerNotIn: ['0x1111111111111111111111111111111111111111'], teamWalletsNotIn: [] },
+      new Links(),
+    );
+    expect(t).toContain('launch second: team buy 0.1–∞ ETH, no dev buy');
+    expect(t).toContain('1 deployer(s) blacklisted');
+    expect(t).not.toContain('team wallet(s) blacklisted');
+  });
+});
 
 describe('preset summary', () => {
   it('summarises the backtested defaults and shows disabled exits as off', () => {
@@ -20,6 +32,7 @@ describe('preset summary', () => {
     expect(off).toContain('timeout off');
     expect(off).not.toContain('team');
     expect(presetSummary({ exitIfExemptSellsPct: 30 })).toContain('exit when team sold ≥30%');
+    expect(presetSummary({ sizing: { mode: 'bankroll' } })).toMatch(/^buy 25% of bankroll \/ slots, /);
   });
 });
 

@@ -24,5 +24,23 @@ export { simulateSnipe, backtestPlay, gridSearch, derivePresetFromPeaks, peakSta
 export type { BacktestItem, BacktestLaunch, BacktestTrade, BacktestTransfer, SimPreset, SnipeResult, BacktestSummary } from './backtest.js';
 export { CSV_COLUMNS, type CsvRow } from './report.js';
 export { DEFAULT_PRESET } from './defaults.js';
-export { loadEnv, type AgentEnv } from './config.js';
+export { loadEnv, nightlyOptions, type AgentEnv } from './config.js';
+export {
+  autoApproveProposals,
+  autoApproveVerdict,
+  parseAutoApprovePolicy,
+  runNightly,
+  decideNightly,
+  refitPreset,
+  rollingExpectancy,
+  losingOperators,
+  msUntilNextRun,
+  DEFAULT_NIGHTLY,
+  REFIT_GRID,
+  type AutoApprovePolicy,
+  type AutoApproveOutcome,
+  type NightlyOptions,
+  type NightlyDecision,
+  type NightlyPlayReport,
+} from './autopilot.js';
 export { tagged, type Db, type Queryable } from './db.js';

@@ -142,3 +142,66 @@ describe('runScout', () => {
     expect(r2.costUsd).toBe(0);
   });
 });
+
+describe('runScout + settings.auto_approve', () => {
+  let db: TestDb;
+  let dir: string;
+  beforeAll(async () => {
+    db = await createTestDb();
+    await seedOperator(db.pg);
+    dir = mkdtempSync(path.join(tmpdir(), 'agent-scout-auto-'));
+  });
+  afterAll(async () => {
+    await db.pg.close();
+  });
+
+  it('a generic fingerprint play does not cover operator clusters; a proposal clearing the policy is enabled at once', async () => {
+    // the seeded generic play matches both Amlil coins (0.38 ETH team buys) but targets a pattern, not this operator
+    await db.pg.exec(`insert into plays (name, enabled, trigger, preset, created_by)
+      values ('team-buy-0.1', true, '{"launchSecond":{"minTeamBuyEth":0.1}}', '{}', 'seed');
+      insert into settings (key, value) values ('auto_approve', '{"enabled":true,"minCoins":1,"minExpectancyEth":-1,"minWinRate":0,"maxConcurrentPlays":20}');`);
+    const mock = mockAnthropic([
+      {
+        blocks: [
+          {
+            type: 'tool_use',
+            name: 'propose_play',
+            input: {
+              operator_name: 'amlil-sprayer',
+              operator_notes: 'sprayer',
+              play_name: 'amlil fresh-dev',
+              pattern: 'team_buys',
+              trigger: { armedWallet: { funders: [A.FUNDER], minEth: 0.009, maxEth: 0.015, freshOnly: true, maxAgeSec: 172_800, contractMode: true }, require: ['armedWallet'] },
+              evidence_tokens: [A.TOKEN1, A.TOKEN2],
+              summary: 'two coins, one sprayer',
+            },
+          },
+        ],
+        stop: 'tool_use',
+      },
+      { blocks: [{ type: 'text', text: 'Proposed.' }], stop: 'end_turn' },
+    ]);
+    const r = await runScout(
+      { sinceMinutes: 4 * 1440, minPeak10Pct: 100 },
+      {
+        sql: db.sql,
+        client: mock.client,
+        rpc: null,
+        reportsDir: dir,
+        logger: pino({ level: 'silent' }),
+        now: () => new Date((T + 2 * 86_400) * 1000),
+        limits: { maxRounds: 10, maxCostUsd: 2 },
+        scout: { maxClusters: 1, minClusterSize: 2, ignore: [] },
+      },
+    );
+    expect(r.skippedCovered).toBe(0);
+    expect(r.investigated).toHaveLength(1);
+    const playId = r.investigated[0]!.proposedPlays[0]!.playId;
+    expect(r.autoApproval).toEqual([{ playId, approved: true, reasons: [expect.stringMatching(/^n 2, expectancy/)] }]);
+    expect(r.summary).toMatch(/1 play\(s\) proposed, 1 auto-approved/);
+    const play = await db.pg.query<{ enabled: boolean; status: string }>(`select p.enabled, o.status from plays p join operators o on o.id = p.operator_id where p.id = $1`, [playId]);
+    expect(play.rows[0]).toEqual({ enabled: true, status: 'active' });
+    const ev = await db.pg.query<{ type: string }>(`select type from events where type in ('play_proposed', 'play_auto_approved', 'scout_finished') order by id`);
+    expect(ev.rows.map((e) => e.type)).toEqual(['play_proposed', 'play_auto_approved', 'scout_finished']);
+  });
+});

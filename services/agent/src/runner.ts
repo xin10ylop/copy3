@@ -14,6 +14,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import type { BetaMessage, BetaUsage } from '@anthropic-ai/sdk/resources/beta/messages/messages';
 import pino, { type Logger } from 'pino';
 import { createPublicClient, http } from 'viem';
+import { autoApproveProposals, type AutoApproveOutcome } from './autopilot.js';
 import { backtestPlay, gridSearch, peakStats } from './backtest.js';
 import { loadEnv, type AgentEnv } from './config.js';
 import { DEFAULT_LIMITS, DEFAULT_PRESET } from './defaults.js';
@@ -40,7 +41,7 @@ import { buildCsvRow, renderReport, resolveEthUsd, toCsv, writeOutput } from './
 import { getEthUsdSetting } from './queries.js';
 import { clusterRunners, fingerprintOf, type RunnerCluster } from './scout.js';
 import { buildTools, defaultGrid, derive, newRunState, tokensForTrigger, type ProposedPlay, type RpcLike, type RunState } from './tools.js';
-import type { LaunchContext } from './trigger.js';
+import { isGenericTrigger, type LaunchContext } from './trigger.js';
 
 export const MODEL = 'claude-opus-5-5';
 export const FALLBACK_BETA = 'server-side-fallback-2026-07-01';
@@ -459,6 +460,8 @@ export interface ScoutResult {
   clusters: Array<Pick<RunnerCluster, 'key' | 'covered' | 'coveredBy' | 'sharedFunders' | 'sharedTeamWallets' | 'sharedDeployers'> & { tokens: string[] }>;
   investigated: RunResult[];
   skippedCovered: number;
+  /** settings.auto_approve verdict for every play proposed in this pass */
+  autoApproval: AutoApproveOutcome[];
   reportPath: string;
   summary: string;
   costUsd: number;
@@ -483,9 +486,11 @@ export async function runScout(args: ScoutArgs, overrides?: Partial<AgentDeps>):
     rows.map((r) => r.token),
   );
   const ctxMap = new Map<string, LaunchContext>(contexts.map((c) => [c.token, c]));
+  // generic fingerprint plays (e.g. team-buy-0.1) snipe a pattern, not an operator: they must not
+  // mark operator clusters as covered, or the scout would stop proposing operator plays
   const plays = (await activePlays(sql)).flatMap((p) => {
     const t = PlayTriggerSchema.safeParse(p.trigger);
-    return t.success ? [{ playId: p.id, trigger: t.data }] : [];
+    return t.success && !isGenericTrigger(t.data) ? [{ playId: p.id, trigger: t.data }] : [];
   });
   const fps = rows.flatMap((r) => {
     const c = ctxMap.get(r.token);
@@ -505,6 +510,16 @@ export async function runScout(args: ScoutArgs, overrides?: Partial<AgentDeps>):
     investigated.push(await finalize(deps, 'scout', childId, childInput, state, outcome, cluster.tokens.map((t) => t.token)));
   }
 
+  // settings.auto_approve: proposals whose backtest clears every bar are enabled right away
+  const proposals = investigated.flatMap((r) => r.proposedPlays);
+  let autoApproval: AutoApproveOutcome[] = [];
+  try {
+    autoApproval = await autoApproveProposals(sql, proposals, logger);
+  } catch (err) {
+    logger.error({ runId, err: err instanceof Error ? err.message : String(err) }, 'auto-approval failed; proposals stay pending for Telegram');
+  }
+  const approvedIds = autoApproval.filter((a) => a.approved).map((a) => a.playId);
+
   const lines = [
     `# Scout run #${runId}`,
     '',
@@ -516,6 +531,7 @@ export async function runScout(args: ScoutArgs, overrides?: Partial<AgentDeps>):
     ),
     '',
     ...investigated.map((r) => `- run #${r.runId}: ${r.stop}, ${r.proposedPlays.length} play(s) proposed, report ${r.reportPath}`),
+    ...autoApproval.map((a) => `- play #${a.playId}: ${a.approved ? 'AUTO-APPROVED' : 'awaiting approval'} (${a.reasons.join('; ')})`),
   ];
   const md = lines.join('\n') + '\n';
   const reportPath = await writeOutput(deps.reportsDir, `scout-run${runId}`, 'md', md, deps.now());
@@ -536,9 +552,9 @@ export async function runScout(args: ScoutArgs, overrides?: Partial<AgentDeps>):
     proposedPlay: null,
     costUsd,
   });
-  const summary = `Scout: ${rows.length} runners, ${clusters.length} clusters, ${clusters.length - uncovered.length} covered, ${investigated.length} investigated, ${investigated.reduce((s, r) => s + r.proposedPlays.length, 0)} play(s) proposed.`;
-  await insertEvent(sql, { level: 'info', type: 'scout_finished', payload: { runId, summary, reportPath, childRuns: investigated.map((r) => r.runId) } });
-  return { runId, runners: rows.length, clusters: summaryClusters, investigated, skippedCovered: clusters.length - uncovered.length, reportPath, summary, costUsd };
+  const summary = `Scout: ${rows.length} runners, ${clusters.length} clusters, ${clusters.length - uncovered.length} covered, ${investigated.length} investigated, ${proposals.length} play(s) proposed, ${approvedIds.length} auto-approved.`;
+  await insertEvent(sql, { level: 'info', type: 'scout_finished', payload: { runId, summary, reportPath, childRuns: investigated.map((r) => r.runId), autoApproved: approvedIds } });
+  return { runId, runners: rows.length, clusters: summaryClusters, investigated, skippedCovered: clusters.length - uncovered.length, autoApproval, reportPath, summary, costUsd };
 }
 
 // ---------------------------------------------------------------------------

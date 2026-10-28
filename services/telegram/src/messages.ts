@@ -110,6 +110,17 @@ export function triggerSummary(raw: unknown, links: Links): string {
   if (t.symbolRegex) parts.push(`symbol ${code(`/${t.symbolRegex}/`)}`);
   if (t.launchKind !== 'any') parts.push(`kind ${t.launchKind}`);
   if (t.minDevBuyEth !== undefined || t.maxDevBuyEth !== undefined) parts.push(`dev buy ${t.minDevBuyEth ?? 0}–${t.maxDevBuyEth ?? '∞'} ETH`);
+  if (t.launchSecond) {
+    const ls = t.launchSecond;
+    const bits: string[] = [];
+    if (ls.minTeamBuyEth !== undefined || ls.maxTeamBuyEth !== undefined) bits.push(`team buy ${ls.minTeamBuyEth ?? 0}–${ls.maxTeamBuyEth ?? '∞'} ETH`);
+    if (ls.minTeamBuyers !== undefined) bits.push(`≥${ls.minTeamBuyers} team buyer(s)`);
+    if (ls.minDevBuyEth !== undefined || ls.maxDevBuyEth !== undefined) bits.push(`dev buy ${ls.minDevBuyEth ?? 0}–${ls.maxDevBuyEth ?? '∞'} ETH`);
+    if (ls.requireNoDevBuy) bits.push('no dev buy');
+    parts.push(`launch second: ${bits.join(', ') || 'any'}`);
+  }
+  if (t.deployerNotIn?.length) parts.push(`${t.deployerNotIn.length} deployer(s) blacklisted`);
+  if (t.teamWalletsNotIn?.length) parts.push(`${t.teamWalletsNotIn.length} team wallet(s) blacklisted`);
   if (t.require.length) parts.push(`require ${t.require.join('+')}`);
   return parts.join(' · ') || 'trigger: (empty)';
 }
@@ -119,7 +130,9 @@ export function presetSummary(raw: unknown): string {
   if (!parsed.success) return 'preset: (invalid)';
   const p: Preset = parsed.data;
   const parts = [
-    `buy ${fmtEth(p.buyEth)}`,
+    p.sizing.mode === 'bankroll'
+      ? `buy ${Math.round(p.sizing.fraction * 100)}% of bankroll / slots, ${fmtEth(p.sizing.minEth)}–${fmtEth(p.sizing.maxEth)}`
+      : `buy ${fmtEth(p.buyEth)}`,
     `tax≤${fmtBps(p.maxTaxBps)}`,
     `TP ${p.takeProfits.map((tp) => `+${tp.pct}%→${tp.sellPct}%`).join(' ') || 'none'}`,
     p.trailing ? `trail +${p.trailing.activatePct}%/-${p.trailing.dropPct}%` : 'trail off',

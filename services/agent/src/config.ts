@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { NightlyOptions } from './autopilot.js';
 import { DEFAULT_LIMITS } from './defaults.js';
 
 const csv = z
@@ -27,6 +28,20 @@ export const AgentEnvSchema = z.object({
   SCOUT_MIN_CLUSTER_SIZE: z.coerce.number().int().min(1).max(20).default(2),
   SCOUT_IGNORE: csv,
   AGENT_HEALTH_PORT: z.coerce.number().int().min(0).max(65_535).default(9470),
+  /** `serve`: hour (UTC) of the nightly refit / auto-disable / blacklist job; -1 = off */
+  NIGHTLY_HOUR_UTC: z.coerce.number().int().min(-1).max(23).default(3),
+  /** look-back of the nightly refit backtest, days */
+  REFIT_DAYS: z.coerce.number().positive().max(60).default(3),
+  /** minimum simulated snipes for a refit (and for a refit-based disable) */
+  REFIT_MIN_COINS: z.coerce.number().int().min(1).default(20),
+  /** a refit preset must beat the current one by more than this, ETH per snipe */
+  REFIT_MARGIN_ETH: z.coerce.number().min(0).default(0.0005),
+  /** rolling window of realised snipes (paper or live) for the auto-disable */
+  ROLLING_TRADES: z.coerce.number().int().min(1).max(500).default(30),
+  /** realised snipes needed before the rolling expectancy can disable a play */
+  DISABLE_MIN_TRADES: z.coerce.number().int().min(1).default(10),
+  /** generic plays: blacklist operators whose last N matching launches all lost */
+  BLACKLIST_MIN_LAUNCHES: z.coerce.number().int().min(2).default(5),
 });
 
 export type AgentEnv = z.infer<typeof AgentEnvSchema>;
@@ -38,4 +53,16 @@ export function loadEnv(env: NodeJS.ProcessEnv = process.env): AgentEnv {
     throw new Error(`invalid agent environment (${problems})`);
   }
   return r.data;
+}
+
+/** Nightly job options (autopilot.ts) from the environment. */
+export function nightlyOptions(env: AgentEnv): Partial<NightlyOptions> {
+  return {
+    refitDays: env.REFIT_DAYS,
+    minCoins: env.REFIT_MIN_COINS,
+    marginEth: env.REFIT_MARGIN_ETH,
+    rollingTrades: env.ROLLING_TRADES,
+    minTrades: env.DISABLE_MIN_TRADES,
+    blacklistMinLaunches: env.BLACKLIST_MIN_LAUNCHES,
+  };
 }

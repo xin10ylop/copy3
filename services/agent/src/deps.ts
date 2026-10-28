@@ -15,7 +15,7 @@ export {
   type PlayTrigger,
   type TakeProfit,
 } from '@hood/core';
-export { createDb, fromPglite, applyMigrations, type Sql as HoodSql } from '@hood/db';
+export { createDb, fromPglite, applyMigrations, DEFAULT_AUTO_APPROVE, type AutoApprovePolicy, type Sql as HoodSql } from '@hood/db';
 
 /** Launch supply in whole tokens (core: LAUNCH_SUPPLY_WHOLE) for mcap = price * supply. */
 export const TOKEN_SUPPLY = 1_000_000_000;

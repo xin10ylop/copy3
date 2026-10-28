@@ -3,18 +3,22 @@
  *   tsx src/main.ts play <ca> [--hint "text"]
  *   tsx src/main.ts scout [--since-minutes N] [--min-peak N] [--max-clusters N]
  *   tsx src/main.ts backtest <playId> [--since-days N]
- *   tsx src/main.ts serve            (scout every SCOUT_INTERVAL_MIN, /healthz on AGENT_HEALTH_PORT)
+ *   tsx src/main.ts nightly          (refit / auto-disable / blacklist every enabled play, once, now)
+ *   tsx src/main.ts serve            (scout every SCOUT_INTERVAL_MIN + nightly at NIGHTLY_HOUR_UTC, /healthz on AGENT_HEALTH_PORT)
  */
 import { createServer } from 'node:http';
 import { parseArgs } from 'node:util';
-import { loadEnv } from './config.js';
+import { msUntilNextRun, runNightly } from './autopilot.js';
+import { loadEnv, nightlyOptions } from './config.js';
 import { createAgentDeps, runBacktest, runPlayFinder, runScout } from './runner.js';
 
 const USAGE = `usage:
   agent play <ca> [--hint "text"]
   agent scout [--since-minutes N] [--min-peak N] [--max-clusters N]
   agent backtest <playId> [--since-days N]
+  agent nightly
   agent serve`;
+
 
 async function main(argv: string[]): Promise<number> {
   const { positionals, values } = parseArgs({
@@ -73,6 +77,11 @@ async function main(argv: string[]): Promise<number> {
         console.log(`report: ${r.reportPath}${r.csvPath ? `\ncsv: ${r.csvPath}` : ''}`);
         return 0;
       }
+      case 'nightly': {
+        const r = await runNightly({ sql: deps.sql, logger, now: deps.now }, nightlyOptions(env));
+        console.log(JSON.stringify(r, null, 2));
+        return 0;
+      }
       case 'serve':
         return await serve(env, deps);
       default:
@@ -91,13 +100,15 @@ async function serve(env: ReturnType<typeof loadEnv>, deps: ReturnType<typeof cr
   const sinceMinutes = env.SCOUT_SINCE_MIN ?? Math.ceil(env.SCOUT_INTERVAL_MIN * 2);
   let lastOk: string | null = null;
   let lastError: string | null = null;
+  let lastNightly: string | null = null;
   let running = false;
+  let nightlyRunning = false;
   let stopped = false;
 
   const health = createServer((req, res) => {
     if (req.url === '/healthz') {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, lastScout: lastOk, lastError, running }));
+      res.end(JSON.stringify({ ok: true, lastScout: lastOk, lastError, running, lastNightly, nightlyHourUtc: env.NIGHTLY_HOUR_UTC }));
     } else {
       res.writeHead(404).end();
     }
@@ -120,6 +131,32 @@ async function serve(env: ReturnType<typeof loadEnv>, deps: ReturnType<typeof cr
     }
   };
 
+  // nightly refit / auto-disable / operator blacklist (autopilot.ts), once a day at NIGHTLY_HOUR_UTC
+  let nightlyTimer: NodeJS.Timeout | null = null;
+  const nightly = async (): Promise<void> => {
+    if (stopped || nightlyRunning) return;
+    nightlyRunning = true;
+    try {
+      const r = await runNightly({ sql: deps.sql, logger, now: deps.now }, nightlyOptions(env));
+      lastNightly = new Date().toISOString();
+      logger.info({ plays: r.length, actions: r.map((x) => `${x.playId}:${x.action}`) }, 'nightly job done');
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      logger.error({ err: lastError }, 'nightly job failed');
+    } finally {
+      nightlyRunning = false;
+    }
+  };
+  const scheduleNightly = (): void => {
+    if (stopped || env.NIGHTLY_HOUR_UTC < 0) return;
+    const wait = msUntilNextRun(new Date(), env.NIGHTLY_HOUR_UTC);
+    nightlyTimer = setTimeout(() => {
+      void nightly().finally(scheduleNightly);
+    }, wait);
+    logger.info({ inMin: Math.round(wait / 60_000), hourUtc: env.NIGHTLY_HOUR_UTC }, 'nightly job scheduled');
+  };
+  scheduleNightly();
+
   logger.info({ intervalMin: env.SCOUT_INTERVAL_MIN, sinceMinutes }, 'agent serve: scout loop started');
   const timer = setInterval(() => void tick(), intervalMs);
   void tick();
@@ -127,13 +164,14 @@ async function serve(env: ReturnType<typeof loadEnv>, deps: ReturnType<typeof cr
     const shutdown = (): void => {
       stopped = true;
       clearInterval(timer);
+      if (nightlyTimer) clearTimeout(nightlyTimer);
       health.close();
       resolve();
     };
     process.once('SIGINT', shutdown);
     process.once('SIGTERM', shutdown);
   });
-  while (running) await new Promise((r) => setTimeout(r, 250));
+  while (running || nightlyRunning) await new Promise((r) => setTimeout(r, 250));
   await deps.sql.end();
   return 0;
 }

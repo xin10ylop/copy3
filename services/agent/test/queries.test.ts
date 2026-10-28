@@ -12,6 +12,7 @@ import {
   finishAgentRun,
   insertProposedPlay,
   launchContexts,
+  launchesMatchingTrigger,
   loadBacktestItems,
   recentLaunches,
   runners,
@@ -243,5 +244,49 @@ describe('settings, runs and proposals', () => {
     expect(ev.rows[0]).toMatchObject({ type: 'play_proposed', payload: { playId: rec.playId, runId } });
     const run = await db.pg.query<{ cost_usd: number; csv_path: string }>(`select cost_usd, csv_path from agent_runs where id = $1`, [runId]);
     expect(run.rows[0]).toEqual({ cost_usd: 1.25, csv_path: '/tmp/x.csv' });
+  });
+});
+
+describe('launches matching a PlayTrigger (launch-second fingerprint from curve_trades + the exempt set)', () => {
+  const since = T - 10 * 86_400;
+  const match = async (trigger: Record<string, unknown>, untilTs?: number): Promise<string[]> =>
+    (await launchesMatchingTrigger(db.sql, { require: [], ...trigger }, { sinceTs: since, untilTs })).tokens.sort();
+  const both = [A.TOKEN1, A.TOKEN2].sort();
+
+  it('launchContexts carries the launch-second totals: TEAM1 0.1924 + TEAM2 0.1877 at +0 s, no dev buy', async () => {
+    const [c] = await launchContexts(db.sql, [A.TOKEN1]);
+    expect(c!.launchSecond).toEqual({ teamBuyEth: expect.closeTo(0.3801, 9), teamBuyers: 2, devBuyEth: 0 });
+    expect(c!.ts).toBe(T);
+    expect(c!.txFrom).toBe(A.DEV1);
+    const [decoy] = await launchContexts(db.sql, [A.DECOY1]);
+    expect(decoy!.launchSecond).toEqual({ teamBuyEth: 0, teamBuyers: 0, devBuyEth: 0 });
+  });
+
+  it('every launchSecond field', async () => {
+    expect(await match({ launchSecond: { minTeamBuyEth: 0.1 } })).toEqual(both);
+    expect(await match({ launchSecond: { minTeamBuyEth: 0.5 } })).toEqual([]);
+    expect(await match({ launchSecond: { minTeamBuyEth: 0.1, maxTeamBuyEth: 0.3 } })).toEqual([]);
+    expect(await match({ launchSecond: { minTeamBuyEth: 0.1, maxTeamBuyEth: 1 } })).toEqual(both);
+    expect(await match({ launchSecond: { minTeamBuyers: 2 } })).toEqual(both);
+    expect(await match({ launchSecond: { minTeamBuyers: 3 } })).toEqual([]);
+    expect(await match({ launchSecond: { minDevBuyEth: 0.01 } })).toEqual([]);
+    expect(await match({ launchSecond: { minTeamBuyEth: 0.1, maxDevBuyEth: 0 } })).toEqual(both);
+    expect(await match({ launchSecond: { minTeamBuyEth: 0.1, requireNoDevBuy: true } })).toEqual(both);
+    // the first taxed buyer at +1 s and later buys are not launch-second buys
+    expect(await match({ launchSecond: { minTeamBuyEth: 0.39 } })).toEqual([]);
+    // a launch-second rule without an ETH demand is not a condition on its own
+    expect(await match({ launchSecond: { requireNoDevBuy: true } })).toEqual([]);
+  });
+
+  it('blacklists, identity conditions (AND launchSecond) and the time window', async () => {
+    expect(await match({ launchSecond: { minTeamBuyEth: 0.1 }, deployerNotIn: [A.DEV1] })).toEqual([A.TOKEN2]);
+    expect(await match({ launchSecond: { minTeamBuyEth: 0.1 }, teamWalletsNotIn: [A.TEAM1] })).toEqual([]);
+    expect(await match({ deployerIn: [A.DEV2], launchSecond: { minTeamBuyEth: 0.1 } })).toEqual([A.TOKEN2]);
+    expect(await match({ deployerIn: [A.SPAM], launchSecond: { minTeamBuyEth: 0.1 } })).toEqual([]); // decoys had no team buy
+    expect(await match({ nameRegex: '^amlil', deployerNotIn: [A.SPAM] })).toEqual(both);
+    expect(await match({ launchSecond: { minTeamBuyEth: 0.1 } }, T + 3600)).toEqual([A.TOKEN1]);
+    const r = await launchesMatchingTrigger(db.sql, { launchSecond: { minTeamBuyEth: 0.1 } }, { sinceTs: since });
+    expect(r.candidates).toBe(2);
+    expect(r.contexts.map((c) => c.launchSecond?.teamBuyers)).toEqual([2, 2]);
   });
 });
