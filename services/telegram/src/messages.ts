@@ -80,10 +80,10 @@ export function helpText(): string {
     code('/play 0x7c3a…'),
     code('/watch 0xfunder… 0.057 0.174 fresh "Amlil operator"'),
     code('/preset 3 buyEth=0.05 maxTaxBps=700 trailing.activatePct=80 tp=100:50,200:100'),
-    code('/preset 3 timeoutSec=none'),
+    code('/preset 3 timeoutSec=none trailing=off'),
     '',
     'Preset keys: buyEth maxTaxBps slippageBps burst.startMs burst.spacingMs burst.count gasLimit maxFeeGwei priorityFeeGwei stopAfter firstBuyOnly tokenCap takeProfits trailing.activatePct trailing.dropPct stopLossPct timeoutSec minQuoteReserveEth maxEntryMcapEth abortIfExemptSellInLaunchBlock exitIfExemptSellsPct',
-    'Aliases: buy tax slippage sl tp timeout trail. <code>none</code> removes a key (defaults apply).',
+    'Aliases: buy tax slippage sl tp timeout trail. <code>none</code> removes a key (defaults apply); <code>trailing=off</code> disables the trailing stop, setting trailing.activatePct/dropPct turns it back on.',
   ].join('\n');
 }
 
@@ -120,7 +120,7 @@ export function presetSummary(raw: unknown): string {
     `buy ${fmtEth(p.buyEth)}`,
     `tax≤${fmtBps(p.maxTaxBps)}`,
     `TP ${p.takeProfits.map((tp) => `+${tp.pct}%→${tp.sellPct}%`).join(' ') || '-'}`,
-    `trail +${p.trailing.activatePct}%/-${p.trailing.dropPct}%`,
+    p.trailing ? `trail +${p.trailing.activatePct}%/-${p.trailing.dropPct}%` : 'trail off',
     `SL -${p.stopLossPct}%`,
   ];
   if (p.timeoutSec !== undefined) parts.push(`timeout ${fmtDuration(p.timeoutSec)}`);

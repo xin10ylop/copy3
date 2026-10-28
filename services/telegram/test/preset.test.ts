@@ -47,6 +47,21 @@ describe('applyPresetAssignments', () => {
     expect(r2).toMatchObject({ ok: true, preset: { takeProfits: [{ pct: 180, sellPct: 100 }] } });
   });
 
+  it('trailing=off disables the trailing stop (null) and a nested key re-creates it from the defaults', () => {
+    for (const word of ['off', 'none', 'null', 'false']) {
+      const off = applyPresetAssignments({}, assign(`trailing=${word}`));
+      expect(off).toMatchObject({ ok: true, preset: { trailing: null }, changes: [{ path: 'trailing', before: { activatePct: 100, dropPct: 25 }, after: null }] });
+    }
+    const back = applyPresetAssignments({ trailing: null }, assign('trailing.dropPct=20'));
+    expect(back).toMatchObject({ ok: true, preset: { trailing: { activatePct: 100, dropPct: 20 } } });
+    const alias = applyPresetAssignments({ trailing: null }, assign('trail.activatePct=60', 'trail.dropPct=30'));
+    expect(alias).toMatchObject({ ok: true, preset: { trailing: { activatePct: 60, dropPct: 30 } } });
+    expect(presetLines({ trailing: null })).toContain('trailing=off');
+    // optional (non-nullable) keys are still removed by none
+    const t = applyPresetAssignments({ timeoutSec: 30 }, assign('timeoutSec=none'));
+    expect(t.ok && t.preset.timeoutSec).toBeUndefined();
+  });
+
   it('rejects typos instead of silently dropping them', () => {
     expect(applyPresetAssignments({}, assign('trailing.activatPct=80'))).toMatchObject({ ok: false, errors: [expect.stringContaining('unknown key')] });
   });

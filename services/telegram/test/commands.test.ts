@@ -31,6 +31,13 @@ describe('/preset', () => {
     expect(h.store.events.find((e) => e.type === 'preset_changed')!.payload).toMatchObject({ playId: 2, by: '@owner' });
   });
 
+  it('accepts trailing=off and shows it in the diff', async () => {
+    const h = setup();
+    await h.send(commandUpdate('/preset 2 trailing=off'));
+    expect(h.store.plays.get(2)!.preset).toMatchObject({ trailing: null });
+    expect(h.texts()[0]).toContain('trailing: {"activatePct":100,"dropPct":25} → <b>off</b>');
+  });
+
   it('rejects unknown keys and invalid values without writing', async () => {
     const h = setup();
     await h.send(commandUpdate('/preset 2 trailing.activatPct=80'));

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { Links } from '../src/format.js';
-import { eventMessage, snipeAbortedMessage, snipeClosedMessage, snipeFilledMessage, snipeSentMessage, type FormatCtx } from '../src/messages.js';
+import { eventMessage, presetSummary, snipeAbortedMessage, snipeClosedMessage, snipeFilledMessage, snipeSentMessage, type FormatCtx } from '../src/messages.js';
 import type { SendExtra } from '../src/messenger.js';
 import { Notifier, snipeIdsFromPayload, snipeSteps, type NotifyChannel } from '../src/notifier.js';
 import { Registry } from '../src/registry.js';
@@ -8,6 +8,13 @@ import { SETTINGS, type ArmedRow } from '../src/store.js';
 import { FakeStore, FUNDER, makePlay, makeSnipe, NOW, silentLog, TX, WALLET } from './helpers.js';
 
 const ctx: FormatCtx = { links: new Links(), ethUsd: 3000, tz: 'UTC', now: NOW };
+
+describe('preset summary', () => {
+  it('shows a disabled trailing stop as "trail off"', () => {
+    expect(presetSummary({ trailing: null })).toContain('trail off');
+    expect(presetSummary({})).toContain('trail +100%/-25%');
+  });
+});
 
 describe('notification formatting from sample snipes', () => {
   it('snipe sent: mode, token links and burst summary', () => {

@@ -199,7 +199,7 @@ export function coerceValue(raw: string, key?: string): Parsed<unknown> {
   return ok(s);
 }
 
-export const PRESET_USAGE = '/preset <playId> key=value … (e.g. buyEth=0.05 trailing.activatePct=80 tp=100:50,200:100 timeoutSec=none)';
+export const PRESET_USAGE = '/preset <playId> key=value … (e.g. buyEth=0.05 trailing.activatePct=80 tp=100:50,200:100 timeoutSec=none trailing=off)';
 
 export function parsePresetAssignments(tokens: string[]): Parsed<PresetAssignment[]> {
   if (tokens.length === 0) return fail(`usage: ${PRESET_USAGE}`);

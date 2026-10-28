@@ -37,6 +37,17 @@ function unwrap(schema: z.ZodType): z.ZodType {
   return s;
 }
 
+/** True when `null` is a valid value for the field (e.g. `trailing`: null = trailing stop off). */
+export function isNullableField(schema: z.ZodType): boolean {
+  let s: z.ZodType = schema;
+  for (let i = 0; i < 10; i++) {
+    if (s instanceof z.ZodNullable) return true;
+    if (s instanceof z.ZodDefault || s instanceof z.ZodOptional) s = s.unwrap() as z.ZodType;
+    else return false;
+  }
+  return false;
+}
+
 /** The schema at a dotted path inside PresetSchema, or an error naming the bad segment. */
 export function schemaAtPath(path: string[]): { ok: true; schema: z.ZodType } | { ok: false; error: string } {
   let cur: z.ZodType = PresetSchema;
@@ -131,7 +142,7 @@ function sanity(p: Preset, limits: PresetLimits): { errors: string[]; warnings: 
   for (const [i, tp] of p.takeProfits.entries()) {
     if (tp.pct <= 0) errors.push(`takeProfits.${i}.pct must be > 0`);
   }
-  if (p.trailing.dropPct <= 0 || p.trailing.dropPct >= 100) errors.push('trailing.dropPct must be in (0, 100)');
+  if (p.trailing && (p.trailing.dropPct <= 0 || p.trailing.dropPct >= 100)) errors.push('trailing.dropPct must be in (0, 100)');
   if (p.maxTaxBps < 618) warnings.push('maxTaxBps < 618: the +1 s block (6.18 % tax) will be skipped, only +2 s (0.19 %) or later can fill');
   if (p.maxTaxBps > 1000) warnings.push('maxTaxBps > 1000 is looser than the video\'s 10 % tax protection');
   const sorted = [...p.takeProfits].sort((a, b) => a.pct - b.pct);
@@ -157,7 +168,24 @@ export function applyPresetAssignments(current: unknown, assignments: PresetAssi
     base.success ? (base.data as Record<string, unknown>) : ((current && typeof current === 'object' ? current : {}) as Record<string, unknown>),
   );
   const draft = clone(before);
-  for (const a of assignments) setPath(draft, a.path, clone(a.value));
+  for (const a of assignments) {
+    let value = clone(a.value);
+    const target = schemaAtPath(a.path);
+    // `trailing=off|none|null|false` on a nullable field stores null (disabled), not "use the default"
+    if (target.ok && isNullableField(target.schema) && (value === undefined || value === false || value === null)) value = null;
+    // a nested key under a null/missing object (trailing.dropPct=20 while trailing=off) re-creates it
+    // from the schema default first, so the other fields are not left undefined
+    for (let i = 1; i < a.path.length; i++) {
+      const prefix = a.path.slice(0, i);
+      const cur = getPath(draft, prefix);
+      if (cur !== null && cur !== undefined) continue;
+      const at = schemaAtPath(prefix);
+      const seeded = at.ok ? at.schema.safeParse(undefined) : null;
+      const seed = seeded?.success && seeded.data && typeof seeded.data === 'object' ? clone(seeded.data) : /^\d+$/.test(a.path[i]!) ? [] : {};
+      setPath(draft, prefix, seed);
+    }
+    setPath(draft, a.path, value);
+  }
 
   const parsed = PresetSchema.safeParse(draft);
   if (!parsed.success) return { ok: false, errors: issuesToStrings(parsed.error) };
@@ -186,6 +214,8 @@ export function presetLines(preset: unknown): string[] {
       }
     } else if (v && typeof v === 'object') {
       for (const [k, x] of Object.entries(v as Record<string, unknown>)) walk(x, prefix ? `${prefix}.${k}` : k);
+    } else if (v === null) {
+      lines.push(`${prefix}=off`);
     } else {
       lines.push(`${prefix}=${String(v)}`);
     }
@@ -196,6 +226,7 @@ export function presetLines(preset: unknown): string[] {
 
 export function fmtValue(v: unknown): string {
   if (v === undefined) return '(default)';
+  if (v === null) return 'off';
   if (Array.isArray(v) && v.every((x) => x && typeof x === 'object' && 'pct' in x)) {
     return (v as Array<{ pct: number; sellPct: number }>).map((x) => `${x.pct}:${x.sellPct}`).join(',');
   }
