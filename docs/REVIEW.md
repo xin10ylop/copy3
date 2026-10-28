@@ -54,3 +54,30 @@ Verdict before fixes: paper mode safe (cannot move funds) but crashable and
 optimistic; contract sound for its job; executor/position manager NOT ready for
 live until H1-H4, M1-M3 are fixed. Live-mode gate: all High and Medium rows
 "fixed" and re-reviewed.
+
+## Verification pass (same day) – new findings after the fixes
+
+All 17 original rows verified closed (M1, M4, L3 partial as noted below). Paper mode
+is safe to run unattended (no signing path exists in paper mode; crash guards hold).
+Live mode is blocked by the new rows marked **blocks live**.
+
+| # | Sev | Finding | Fix | Status |
+|---|---|---|---|---|
+| N1 | Med, blocks live | Live gate estimates gas on the newest launch, which may be ours (`AlreadyBought`), in its launch second (`TaxTooHigh`) or graduated → `process.exit(1)` before reconciliation; systemd crash-loops with a fresh position unmanaged | estimate on the newest unbought, zero-tax, non-graduated launch; run the gate after reconciliation and only block new entries | open |
+| N2 | Med, blocks live | `stuck` becomes permanent after ~9 s of transient failures (3 rounds, 3 s/6 s backoff); no retry after recovery | retry broadcast/unknown failures indefinitely with capped backoff; `stuck` only for on-chain reverts at minOut=0; `recheck()` re-arms stuck positions that still hold a balance | open |
+| N3 | Med-Low, blocks live | Rows aborted with members in flight are never reconciled; startup loads only pending/open rows → fill around a crash is orphaned | keep rows pending until the run ended, or load aborted rows with sent members | open |
+| N4 | Med | A stolen operator key can still drain the working balance via the thief's own real launches (sandwich with minOut=0 and a 10 % creator tax); README claims otherwise | on-chain rolling spend budget; keep the contract balance at a few × buyEth; correct README | open |
+| N5 | Med-Low, blocks live | Provisioned env/runbook are single-key (undoes M1): exits wait behind a burst's 15 s reconcile | refuse live with one key unless overridden; `EXECUTOR_PRIVATE_KEYS` in env template and RUNBOOK | open |
+| N6 | Low | Successful exit not booked if the phase changed during the await → PnL wrong, can trip daily loss | book `res.ok` before checking the phase | open |
+| N7 | Low | `onFinal` inserts a duplicate `snipes` row after `endRun` dropped the binding | update only, never insert | open |
+| N8 | Low | Paper mode leaks slots on graduation (`recheck` live-only) → stalls after MAX_CONCURRENT graduations | run recheck in paper too | open |
+| N9 | Low | Feed frame with a sequence jump < 50k poisons `lastBlock`; reconnects keep it (up to ~83 min blind) | bound the jump by elapsed time; reset head on stale reconnect | open |
+| N10 | Low | Reverted `launchTokenFor` spoofs to the real factory reserve concurrency slots until their receipt is read | reserve the slot after confirmation | open |
+| N11 | Low | `readSniper` reads `bought` and `balanceOf` at different blocks | read both at one block | open |
+| N12 | Low | `reconcileRow` declares a pending row "no buy" before the burst's deadline block | wait for the deadline block | open |
+| N13 | Low | `pollReserves` falls back to an unpinned snapshot when `getBlockNumber` fails | skip the tick instead | open |
+| N14 | Low | No launchAndBuy receipt fixture; the router-passes-real-deployer assumption is unverified (fails closed) | capture a fixture with LIVE=1 and test | open |
+| N15 | Low | Exit gas (incl. 50k treasury allowance) never estimated; `buyEth > maxQuoteIn` only warns | estimate once at startup; refuse the preset | open |
+| N16 | Low | Waiting for the receipt costs the first +1 s block for launches late in their second | accept the node's ws `TokenLaunched` log matched on tx hash + deployer | open |
+
+PoC scripts for every N row were produced by the reviewer (scratchpad `poc2/`).
