@@ -66,3 +66,70 @@ Too few to conclude; a multi-day dataset is being fetched.
 3. One day and n ≈ 40 OOS is not evidence of a durable edge. Next:
   3-day dataset (running), per-operator history, dump-signal exit, and the
   funding-trail fingerprint once the indexer has internal transfers.
+
+---
+
+# Backtest #2 – three days (2026-10-25 → 2026-10-28)
+
+Data: 3,734 ETH-paired Pons V2 launches over 69.4 h (2.4M blocks), every curve
+trade, 64,011 real block timestamps, ERC-20 transfers for the 1,435 tokens whose
+launch had non-deployer exemptions (198 launches with an observed exempt-wallet
+transfer-out = operator dump). Scripts in `scripts/backtest/`.
+Fix vs #1: `CurveBuy.fee` already contains the snipe tax (no double subtraction).
+
+Competition check: 1,079 launches had at least one taxed buy at +1 s; 176 launches
+had 8 or more buys in that second. "First in block" is therefore optimistic exactly
+on the launches bots care about; the "last" rows below bracket the other extreme.
+
+## Video preset (TP150, trailing 100/25, SL40, timeout 60), 0.07 ETH
+
+| Segment | n | win % | mean/trade | total ETH | +dump exit | if last in block |
+|---|---|---|---|---|---|---|
+| all launches | 3734 | 22 | −0.0014 | −5.40 | −5.25 | −0.0038 |
+| team wallet bought in launch second | 448 | 33 | **+0.0026 (+3.7 %)** | +1.16 | +1.18 | −0.0024 |
+| team buy ≥ 0.1 ETH | 268 | 46 | **+0.0058 (+8.3 %)** | +1.56 | +1.48 | −0.0009 |
+| dev bought, no team | 2609 | 23 | −0.0014 | −3.76 | −3.63 | −0.0038 |
+| nobody bought at launch | 677 | 7 | −0.0041 | −2.81 | −2.80 | −0.0050 |
+
+Dump timing: the first exempt-wallet transfer-out happens at a **median of 4 s**
+after launch (p10 4 s, p90 63 s). Most of the move is over by then; the trailing
+stop and the dump exit are what capture it.
+
+## Walk-forward (fit on all previous days, test on the next day), 0.07 ETH
+
+| Segment | test day | n | fitted preset | OOS mean | OOS total | video preset OOS |
+|---|---|---|---|---|---|---|
+| team | 10-27 | 170 | no TP, trail 50/20, no SL, t/o 30, dump exit | +0.0042 | +0.72 | +0.0030 |
+| team | 10-28 | 152 | no TP, trail 50/20, SL 40, t/o 60 | +0.0011 | +0.17 | +0.0008 |
+| team ≥ 0.1 | 10-27 | 95 | TP150, trail 50/20, SL 40, t/o 60 | +0.0041 | +0.39 | +0.0035 |
+| team ≥ 0.1 | 10-28 | 86 | no TP, trail 50/20, SL 40, t/o 60 | +0.0062 | +0.54 | +0.0062 |
+| all | 10-27 | 1223 | trail 50/20, SL 40, t/o 60, dump | +0.0025 | +3.01 | −0.0009 |
+| all | 10-28 | 1210 | trail 50/20, no SL, t/o 60, dump | +0.0000 | +0.05 | −0.0010 |
+
+Every team-segment fold is positive out of sample; the per-trade edge is 1-6 % of
+the buy size. The fitted preset is stable across folds: **no fixed take-profit,
+trailing stop armed at +50 % with a 20 % pull-back, 40 % stop loss, 60 s timeout,
+exit on exempt transfer-out**. These are now the defaults in `Preset`.
+
+## Operators (clusters by shared exempt wallets / deployer)
+
+2,654 clusters, 2,429 singletons. The largest operator launched 201 coins in
+62 h: +2.29 ETH total at 0.07 ETH per snipe (31 % win, median peak +43 %). Others:
+116 launches −0.78 ETH; 32 launches +0.28 ETH (59 % win); 19 launches +0.09 (74 %).
+Selecting operators with ≥ 3 prior launches, positive PnL and ≥ 40 % win rate and
+trading their next-day launches: +0.0029/trade (n=41) and +0.0044/trade (n=125).
+Restricting that to launches with a team buy was negative on both days (n=19, 47).
+Operator history helps, but the team-buy fingerprint and the operator's history
+are not additive on this sample.
+
+## What this means
+
+* Expectancy at 0.07 ETH on the team-buy fingerprint: ≈ +0.1 to +0.7 ETH per day
+  with 150-170 snipes/day, **if** we are first in the +1 s block. Losing the race
+  flips it negative, so the Ohio executor and the burst are the product.
+* Size: the 1-day sensitivity showed flat ROI up to 0.3 ETH (impact is modelled);
+  the operator's own exits and other bots are not modelled reacting to us.
+* Not yet modelled: gas (~0.00002 ETH per snipe, negligible), failed sells,
+  partial fills, our effect on the dump timing.
+* Next: run the sniper in paper mode in Ohio for a week with `PAPER_FILL=last`
+  as the pessimistic bracket, compare with these numbers, then size up.
