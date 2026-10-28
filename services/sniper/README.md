@@ -35,6 +35,11 @@ prove the launch, H1) and `getReserves` on the new curve, which is not waited on
 when the launch config's start reserves are known. Plays, armed candidates and settings are loaded
 at start and refreshed on `NOTIFY plays_changed / armed_changed / settings_changed`.
 
+A second entry point fires **later in the launch second**: launch-second plays
+(`trigger.launchSecond`, e.g. the seeded `team-buy-0.1`) are matched by the per-launch
+**launch-second ledger** as team buys land, then go through the same receipt → burst path. See
+[Launch-second fingerprint](#launch-second-fingerprint-triggerlaunchsecond).
+
 ## How the burst works
 
 The curve charges `snipeTax = 9900 >> ((elapsed·14)/3)` bps, where `elapsed = block.timestamp − launchedAt`
@@ -92,8 +97,10 @@ in whole seconds. That is 99 % in the launch second `T`, 6.18 % at `T+1`, 0.19 %
    CREATE-nonce predictor (it self-disables after two mismatches); it never replaces the receipt.
 
    **Live plays need a non-spoofable matcher:** `armedWallet` or `deployerIn` (both bound to the tx
-   signer / `TokenLaunched.deployer`). Plays that match only on `nameRegex`, `symbolRegex` or
-   `teamWalletsAny` (chosen by whoever launches) arm paper runs only.
+   signer / `TokenLaunched.deployer`), or a `launchSecond` rule that demands ETH (`minTeamBuyEth > 0`,
+   `minTeamBuyers ≥ 1` or `minDevBuyEth > 0`): it is bound to real curve buys, proven by CurveBuy
+   receipt logs of the receipt-proven curve before anything is signed. Plays that match only on
+   `nameRegex`, `symbolRegex` or `teamWalletsAny` (chosen by whoever launches) arm paper runs only.
 5. **minTokensOut.**
    - With `maxEntryMcapEth`: the output at the cap price, using the curve invariant `k = Q·T`. The
      buy then reverts on-chain if the launch-second team buys pushed the price past the cap.
@@ -210,13 +217,96 @@ keeps its `MAX_CONCURRENT` slot and shows in `/healthz` (`positions[].phase`) an
 - Unhandled rejections and uncaught exceptions are logged (`process_error` event) and the process
   keeps running; feed frames are validated and frame handling never throws.
 
+## Launch-second fingerprint (`trigger.launchSecond`)
+
+The always-on play. docs/BACKTEST.md #2: launches where a tax-exempt **non-deployer** ("team")
+wallet buys ≥ 0.1 ETH in the launch second returned **+0.0058 ETH (+8.3 %) per 0.07 ETH snipe**
+(n = 268, positive on every out-of-sample day); sniping every launch loses. No human has to name an
+operator: `pnpm --filter @hood/db seed` creates the play `team-buy-0.1`
+(`{ launchSecond: { minTeamBuyEth: 0.1 } }`, the backtested preset).
+
+```ts
+launchSecond?: {
+  minTeamBuyEth?: number; maxTeamBuyEth?: number;  // Σ quote-in of team buys in second T
+  minTeamBuyers?: number;                           // distinct team wallets that bought
+  minDevBuyEth?: number; maxDevBuyEth?: number;     // launchAndBuy quote + buys to the deployer in second T
+  requireNoDevBuy?: boolean;
+}
+deployerNotIn?: string[]     // blacklist: deployer or tx sender
+teamWalletsNotIn?: string[]  // blacklist: exemptions ∪ creatorFeeRecipient
+```
+
+- **Team buy** = a curve buy in a block whose timestamp equals the launch block's, whose
+  *recipient* (the snipe-tax exemption is per recipient) is in the launch's exempt set (deployer ∪
+  `creatorFeeRecipient` ∪ the receipt's `SnipeTaxExempted` logs) and is not the deployer, outside
+  the launch tx. **Dev buy** = the launchAndBuy quote (the launch tx's own CurveBuy) plus buys to the
+  deployer. Same classification as the indexer, so the backtest and the live trigger agree.
+- **Semantics.** `launchSecond` is always AND (as if in `require`); identity matchers keep their
+  OR/require semantics. It can stand alone only when it demands ETH (`launchSecondIsMatcher`).
+  The blacklists are AND filters for every play (the agent's nightly job maintains them on generic
+  plays).
+- **Ledger.** While at least one enabled play has `launchSecond`, every feed launch gets a
+  `LaunchSecondLedger` (`src/ledger.ts`). Each feed block of second T adds hints: direct
+  `curve.buy(quoteIn, minOut, recipient)` calls with `msg.value == quoteIn`, plus exempt outflows
+  (`sell` / `transfer` / `transferFrom` by an exempt wallet, sender recovered off the decide path).
+  Node `CurveBuy` / `CurveSell` / `Transfer` logs (ws) confirm buys and catch contract-routed ones.
+  The curve address is CREATE2, so feed txs of the second are buffered and replayed once the launch
+  receipt (polled for every launch, woken by the `TokenLaunched` ws log) or that log names it.
+- **Decision (µs).** Every ledger change re-runs `rules.evaluate(event, now, ledger.stats())`
+  (memory). A match schedules the burst for the T+1 boundary with `planBurst({ launchTs })`, exactly
+  like an immediate match. One run per launch. A match is refused when an exempt outflow was already
+  seen in the second and `abortIfExemptSellInLaunchBlock` is on.
+- **Before signing (H1).** After the launch receipt, the minimums are re-checked against
+  **confirmed** buys only: receipts of the pending hints are fetched until the play holds or
+  `boundary(T+2) − rtt`. A reverted buy, or one without a CurveBuy from the curve, never counts
+  (`launch_second_unconfirmed` counter, run aborted, play state untouched).
+- **Last moment.** The send guard re-checks the play (maximums against everything seen, e.g. a
+  later team buy above `maxTeamBuyEth`) and the exempt outflows right before the first member
+  (paper: before the simulated fill).
+- **Pricing.** `minTokensOut` is computed against the launch-config reserves **plus the ledger's
+  launch-second buys** (team buys move the price: AMLIL +49 %), not the pre-team price.
+- **Residual risk (accepted, it is the backtested game).** The operator really spent the ETH and
+  can dump on us right after the +1 s block; exits (dump exit on the first exempt transfer-out,
+  trailing 50/20, SL 40, 60 s timeout) are what the backtest measured. Not counted: exemptions
+  added after the launch (`exemptFromSnipeTax` in the launch second) and buys through the trade
+  router that the node's logs do not show before T+1. Like every play, a team buy late in the second
+  (> ~T+800 ms) is confirmed only after the T+1 boundary, so the burst starts late (still 6.18 % or
+  0.19 % tax, REVIEW N16).
+
+## Sizing and compounding (`preset.sizing`)
+
+```ts
+sizing: { mode: 'fixed' | 'bankroll', fraction: 0.25, minEth: 0.01, maxEth: 0.3 }   // default mode 'fixed'
+```
+
+- `fixed` buys `buyEth` (unchanged behaviour).
+- `bankroll` buys `clamp(bankroll × fraction / MAX_CONCURRENT, minEth, maxEth)`, **rounded down to
+  0.001 ETH** (`src/sizing.ts`). Live, the bankroll is the PonsSniper contract's ETH balance the
+  executor already caches for the L8 pre-check (memory, no RPC on the decide path; unknown → `minEth`).
+  Paper, it is `PAPER_BANKROLL_ETH` + all realised paper PnL in the DB − ETH tied up in open paper
+  runs, so paper compounding behaves like the contract would. The size used is the snipe row's
+  `quote_in`, and `decision.sizing` records the bankroll, clamp and rule.
+- **The edge does not depend on size**: snipe tax, fee and creator tax are proportional. Gas is not:
+  ~0.00004 ETH per burst plus the exit. At **0.01 ETH** (the practical floor) the expected
+  +0.0008 ETH per snipe pays ~6 % of it in gas; below that gas eats the edge.
+- **Compounding rule.** Start at 0.01 ETH with ~0.1 ETH in the contract; the size follows the
+  balance (0.1 × 0.25 / 3 = 0.008 → the 0.01 floor until the balance passes 0.12 ETH). For
+  proceeds to compound, set the contract's treasury to the contract itself (`setTreasury(sniper)`
+  from the owner); otherwise exits pay the owner and the bankroll only shrinks.
+- `maxEth` must not exceed the contract's `maxQuoteIn` (the startup gate warns: those snipes would
+  revert `QuoteTooLarge`).
+- **Daily loss limit as a share of the bankroll.** With `DAILY_LOSS_LIMIT_ETH` unset, the limit is
+  `DAILY_LOSS_LIMIT_PCT` (default 15 %) of the first bankroll figure of the UTC day (0.5 ETH until a
+  balance is known). `settings.daily_loss_limit_eth` / `daily_loss_limit_pct` override at runtime.
+
 ## Preset defaults
 
 From the 3-day walk-forward (`docs/BACKTEST.md`, Backtest #2):
 
 | Field | Default | Notes |
 |---|---|---|
-| `buyEth` | `0.07` | |
+| `buyEth` | `0.07` | the size in `fixed` sizing mode |
+| `sizing` | `{mode: 'fixed', fraction: 0.25, minEth: 0.01, maxEth: 0.3}` | `bankroll` compounds (see above) |
 | `maxTaxBps` | `1000` | ≤ `5000` (zod); the schedule only takes 9900/618/19/0, PonsSniper refuses ≥ 9900 |
 | `slippageBps` | `3000` | prefer `maxEntryMcapEth` (see minTokensOut) |
 | `burst` | `{startMs: −120, spacingMs: 15, count: 10}` | |
@@ -248,7 +338,9 @@ From the 3-day walk-forward (`docs/BACKTEST.md`, Backtest #2):
 | `SNIPER_CONTRACT` | – | live only; deployed PonsSniper address |
 | `LAUNCHERS` | – | extra launcher contracts (Pons whitelisted launchers) accepted besides the factory and the launch router |
 | `MAX_GAS_PRICE_GWEI` | `1` | global cap: blocks snipes when L2 gas price is above it, clamps every preset's `maxFeeGwei` and the gap fillers' fee |
-| `DAILY_LOSS_LIMIT_ETH` | `0.5` | realised live loss (UTC day) that stops new snipes (checked at decide time and right before the first send) |
+| `DAILY_LOSS_LIMIT_ETH` | – | fixed realised live loss (UTC day) that stops new snipes (checked at decide time and right before the first send); unset = `DAILY_LOSS_LIMIT_PCT` |
+| `DAILY_LOSS_LIMIT_PCT` | `15` | daily loss limit as % of the bankroll (contract ETH balance) at the start of the UTC day, when `DAILY_LOSS_LIMIT_ETH` is unset |
+| `PAPER_BANKROLL_ETH` | `0.1` | paper mode: starting bankroll for `sizing.mode = 'bankroll'`; grows with realised paper PnL |
 | `MAX_CONCURRENT` | `3` | pending + open snipes (incl. graduated/stuck positions) |
 | `RTT_MS` | `0` | fixed RTT to the sequencer; `0` = measured against the first send endpoint |
 | `DEADLINE_BLOCKS` | `40` | L2 blocks after the launch block after which members revert with `Expired()` (~4 s) |
@@ -277,7 +369,7 @@ DB `settings` keys read at start and on `settings_changed`:
 - `kill_switch`: `true`, `"on"`, `"true"`, `1`, `{"on":true}`, `{"enabled":true}` or `{"killed":true,…}`
   (the shapes the telegram bot writes) block every new snipe — at decide time and again right
   before the first member is sent (reviewer L2).
-- `daily_loss_limit_eth` and `max_concurrent` override the env values.
+- `daily_loss_limit_eth`, `daily_loss_limit_pct` and `max_concurrent` override the env values.
 
 ## Paper mode
 
@@ -382,8 +474,9 @@ warning; balance pre-checks block bursts (L8).
    - the deployer uses CREATE2.
 
    Re-run `pnpm --filter @hood/core test` with `LIVE=1` on the executor host.
-2. Run the DB migrations: `pnpm db:migrate`. Insert the play with `enabled=false`. Its trigger must
-   use `deployerIn` or `armedWallet` (live plays need a non-spoofable matcher).
+2. Run the DB migrations: `pnpm db:migrate`, then `pnpm --filter @hood/db seed` (the generic
+   `team-buy-0.1` play, enabled). Other plays: insert with `enabled=false`. A live trigger must use
+   `deployerIn`, `armedWallet` or a `launchSecond` rule that demands ETH (non-spoofable matcher).
 3. Keys: a **cold owner** (hardware wallet / Safe, never on the host) and, on the Ohio host, one
    exit key plus one burst key per concurrent snipe (`EXECUTOR_PRIVATE_KEYS=exit,burst1,burst2,…`
    in an env file with `chmod 600`). Fund each hot key with about 0.01 ETH for gas.
@@ -432,8 +525,17 @@ right before the first send). Open positions keep being managed and exited.
 
 - **Detector:** replays the 40 captured frames, runs the real launch tx built from fixture fields,
   and rejects spoofed launches (calldata to a non-launcher, reverted / foreign-deployer receipts).
-- **Rules:** a table test for every trigger field and the `require` AND-set; live plays need
-  `deployerIn`/`armedWallet`.
+- **Rules:** a table test for every trigger field (including every `launchSecond` field, the hint
+  vs confirm stages and the `deployerNotIn` / `teamWalletsNotIn` blacklists) and the `require`
+  AND-set; live plays need `deployerIn`/`armedWallet`/an ETH-demanding `launchSecond`.
+- **Launch second** (`test/launch-second.test.ts`): synthetic feed blocks — launch at T, a 0.19 ETH
+  team buy in the block at T+300 ms → burst planned for the T+1 boundary; 0.06 + 0.05 crossing the
+  threshold as the ledger grows; below the threshold, non-exempt buyers, a reverted team buy
+  (refused before signing), a blacklisted deployer and an exempt transfer-out never fire; paper
+  fill with bankroll sizing; ledger unit tests (classification, hint/log de-dup, launchAndBuy,
+  reserves after the team buys).
+- **Sizing** (`test/sizing.test.ts`): fixed vs bankroll, clamps, 0.001 ETH rounding, unknown
+  bankroll, paper bankroll growth and compounding, the bankroll-percentage daily loss limit.
 - **Executor:** fake clock and endpoints; checks count, spacing, nonces, raw tx contents,
   idempotent reconciliation, separate exit/burst keys, re-send, gap filling, the last-moment kill
   switch and the balance pre-checks.

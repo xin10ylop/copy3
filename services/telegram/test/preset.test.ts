@@ -106,6 +106,11 @@ describe('applyPresetAssignments', () => {
     expect(applyPresetAssignments({}, assign('maxTaxBps=9900'))).toMatchObject({ ok: false, errors: [expect.stringMatching(/^maxTaxBps: .*5000/)] });
     expect(applyPresetAssignments({}, assign('maxTaxBps=5000'))).toMatchObject({ ok: true, warnings: [expect.stringContaining('looser than')] });
     expect(applyPresetAssignments({}, assign('buyEth=2'), { maxBuyEth: 1 })).toMatchObject({ ok: false, errors: [expect.stringContaining('TELEGRAM_MAX_BUY_ETH')] });
+    // bankroll sizing: the chat cap bounds sizing.maxEth too
+    const sized = applyPresetAssignments({}, assign('sizing.mode=bankroll', 'sizing.fraction=0.5'));
+    expect(sized).toMatchObject({ ok: true, preset: { sizing: { mode: 'bankroll', fraction: 0.5, minEth: 0.01, maxEth: 0.3 } } });
+    expect(applyPresetAssignments({}, assign('sizing.mode=bankroll', 'sizing.maxEth=2'), { maxBuyEth: 1 })).toMatchObject({ ok: false, errors: [expect.stringMatching(/^sizing\.maxEth 2 .*TELEGRAM_MAX_BUY_ETH/)] });
+    expect(applyPresetAssignments({}, assign('sizing.minEth=0.5', 'sizing.maxEth=0.1'))).toMatchObject({ ok: false, errors: [expect.stringContaining('sizing.minEth 0.5 must be <= sizing.maxEth 0.1')] });
     expect(applyPresetAssignments({}, assign('burst.count=500'))).toMatchObject({ ok: false, errors: [expect.stringContaining('burst.count')] });
     expect(applyPresetAssignments({}, assign('trailing.dropPct=0'))).toMatchObject({ ok: false });
   });

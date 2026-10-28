@@ -82,6 +82,34 @@ the reason this project exists.
 cd /opt/hoodsniper && sudo -u hood infra/compose.sh ps -a         # migrate: exited (0)
 sudo -u hood infra/compose.sh exec postgres psql -U hood -d hood -c '\dt'
 ```
+Seed the always-on layer (idempotent; re-run after every deploy, it never overwrites a play or a
+setting that exists):
+```bash
+sudo -u hood infra/compose.sh run --rm migrate pnpm --filter @hood/db seed
+# or from a checkout: DATABASE_URL=postgres://… pnpm --filter @hood/db seed
+```
+It creates:
+- operator `generic` (active) and play **`team-buy-0.1`, enabled**: `{ launchSecond: { minTeamBuyEth: 0.1 } }`
+  (a tax-exempt non-deployer wallet bought ≥ 0.1 ETH in the launch second; Backtest #2: +8 % per
+  snipe, positive on every out-of-sample day) with the backtested preset, `stopAfter` unlimited and
+  `firstBuyOnly: false` (MAX_CONCURRENT and the daily loss limit are the caps);
+- play `team-buy-0.05`, disabled (broader, not backtested on its own);
+- `settings.kill_switch` = off and `settings.auto_approve` (below), only if absent.
+
+"Enabled" is harmless while the executor runs `EXECUTION_MODE=paper` (the default): enabled plays
+then produce paper snipes only. They trade real money once you switch to live in step 8.
+
+`settings.auto_approve` decides whether a play the scout proposes waits for your Approve button:
+```json
+{"enabled": true, "minCoins": 10, "minExpectancyEth": 0.002, "minWinRate": 0.35, "maxConcurrentPlays": 20}
+```
+A proposal is enabled automatically (`play_auto_approved` in Telegram) when its backtest has at
+least `minCoins` simulated snipes, an expectancy ≥ `minExpectancyEth` per snipe and a win rate ≥
+`minWinRate`, and fewer than `maxConcurrentPlays` plays are enabled. Anything else arrives as a card
+with Approve/Reject as before. Turn it off with
+`… psql -c "update settings set value = jsonb_set(value, '{enabled}', 'false') where key = 'auto_approve'"`.
+Only scout proposals are auto-approved; `/play <ca>` results always wait for you.
+
 Set the ETH/USD rate used for USD columns, then update it when the price moves a lot:
 ```bash
 sudo -u hood infra/compose.sh exec postgres psql -U hood -d hood -c \
@@ -103,7 +131,14 @@ few days of chain.
 ## 4. Start the services
 
 `hood-stack` already started nitro, postgres, indexer, tracker, agent (`serve`: scout every
-`SCOUT_INTERVAL_MIN`) and telegram. After editing `.env`:
+`SCOUT_INTERVAL_MIN`, and the nightly job at `NIGHTLY_HOUR_UTC`, default 03:00 UTC) and telegram.
+The nightly job re-backtests every enabled play over the last `REFIT_DAYS` (3) of indexed launches,
+writes a refit preset when it beats the current one by more than `REFIT_MARGIN_ETH` (needs
+`REFIT_MIN_COINS` = 20 simulated snipes), disables a play whose realised expectancy over its last
+30 snipes (paper or live, at least 10) or whose refit expectancy is ≤ 0, and blacklists operators
+whose last 5 matching launches all lost (`deployerNotIn` / `teamWalletsNotIn` on the generic plays).
+Each change arrives in Telegram (`play_refit`, `play_auto_disabled`, `operator_blacklisted`). Run it
+by hand with `infra/compose.sh exec agent pnpm --filter @hood/agent start nightly`. After editing `.env`:
 ```bash
 sudo systemctl reload hood-stack          # compose up -d --build
 sudo -u hood infra/compose.sh ps          # every service running, healthy
@@ -189,6 +224,16 @@ First close the open items in RESEARCH §7 (`buy`/`sell` argument order, contrac
      with `FUND_ETH=0.5` during deploy.
    - Because proceeds go to the owner, the contract balance shrinks with every buy. Top it up from
      the cold wallet. Daily ops (§9) shows how.
+   - **Small bankroll, compounding.** Start at 0.01 ETH with ~0.1 ETH in the contract; the size
+     follows the balance. Set `sizing` on the play (`/preset <id> sizing.mode=bankroll`, or edit the
+     preset: `{"mode":"bankroll","fraction":0.25,"minEth":0.01,"maxEth":0.3}`): each buy is
+     `contract balance × 0.25 / MAX_CONCURRENT`, clamped to 0.01–0.3 ETH, rounded down to 0.001 ETH.
+     Have the owner call `setTreasury(<PonsSniper address>)` so exit proceeds stay in the contract
+     and compound (otherwise they go to the owner and the bankroll only shrinks). Leave
+     `DAILY_LOSS_LIMIT_ETH` unset: the daily loss limit is then `DAILY_LOSS_LIMIT_PCT` (15 %) of the
+     balance at the start of the UTC day. 0.01 ETH is the floor: gas (~0.00004 ETH per burst plus the
+     exit) is ~6 % of the expected +0.0008 ETH there; the tax and fees scale with size, so the edge
+     does not. Keep `maxEth` ≤ the contract's `maxQuoteIn`.
 5. Put `SNIPER_CONTRACT=0x…` in `.env.executor`, check `DATABASE_URL` and `NODE_*` (WireGuard
    addresses), then `sudo systemctl restart hood-sniper && journalctl -u hood-sniper -f`.
 
@@ -211,8 +256,10 @@ first `T+1` block's pre-trade reserves with the real 618 bps tax and 1 % fee. No
 
 ## 8. Go live with a small buyEth
 
-1. `/preset <id> buyEth=0.01`, keep `MAX_CONCURRENT=1`, and set `DAILY_LOSS_LIMIT_ETH=0.1` in
-   `.env.executor`.
+1. `/preset <id> buyEth=0.01` (or bankroll sizing with ~0.1 ETH in the contract, which buys the
+   0.01 ETH floor until the balance grows; paper-test it first with `PAPER_BANKROLL_ETH=0.1`), keep
+   `MAX_CONCURRENT=1`, and set `DAILY_LOSS_LIMIT_ETH=0.1` in `.env.executor` (or leave it unset for
+   15 % of the bankroll).
 2. Set `EXECUTION_MODE=live` in `.env.executor`, then `sudo systemctl restart hood-sniper`.
 3. Read the first fills. `tax paid … (6.18%)` and `+1 s after launch` mean the burst hit the first
    taxed second. `0.19 %` means it landed at `T+2`, which is late: tune `burst.startMs` /
@@ -226,7 +273,7 @@ first `T+1` block's pre-trade reserves with the real 618 bps tax and 1 % fee. No
 | When | What |
 |---|---|
 | Every morning | Read the daily summary (sent at `TELEGRAM_DAILY_SUMMARY_HOUR`), `/status`, `/pnl 1`, `/positions`. |
-| Daily | Glance at `/plays` and `/armed`, and approve or reject proposed plays. Health alerts arrive in Telegram from `hood-healthcheck.timer` (Chicago) and `hood-executor-healthcheck.timer` (Ohio). |
+| Daily | Glance at `/plays` and `/armed`, and approve or reject the proposed plays that `auto_approve` left for you. Read the nightly `play_refit` / `play_auto_disabled` / `operator_blacklisted` messages; re-enable a play with `/play_on <id>` only if you disagree. Health alerts arrive in Telegram from `hood-healthcheck.timer` (Chicago) and `hood-executor-healthcheck.timer` (Ohio). |
 | Daily | Update `settings.eth_usd` if ETH moved more than ~5 % (USD columns only). |
 | Weekly | **Profits.** Proceeds already sit in the cold owner wallet. Refill the contract's working balance from it, and record the realized PnL for taxes (`/pnl 7`, the `snipes` table). If you deployed with the hot key as owner, sweep it now: `PonsSniper.sweepEth(cold, 0)` from the owner. |
 | Weekly | `infra/backup.sh --list`, copy the newest dump off the box (rclone/rsync), and run `df -h /data`. |

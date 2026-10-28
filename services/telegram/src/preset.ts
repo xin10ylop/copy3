@@ -134,6 +134,9 @@ function sanity(p: Preset, limits: PresetLimits): { errors: string[]; warnings: 
   const errors: string[] = [];
   const warnings: string[] = [];
   if (p.buyEth > limits.maxBuyEth) errors.push(`buyEth ${p.buyEth} is above the chat limit of ${limits.maxBuyEth} ETH (TELEGRAM_MAX_BUY_ETH)`);
+  if (p.sizing.mode === 'bankroll' && p.sizing.maxEth > limits.maxBuyEth)
+    errors.push(`sizing.maxEth ${p.sizing.maxEth} is above the chat limit of ${limits.maxBuyEth} ETH (TELEGRAM_MAX_BUY_ETH)`);
+  if (p.sizing.minEth > p.sizing.maxEth) errors.push(`sizing.minEth ${p.sizing.minEth} must be <= sizing.maxEth ${p.sizing.maxEth}`);
   if (p.slippageBps > 9900) errors.push('slippageBps must be <= 9900');
   if (p.burst.count > 50) errors.push('burst.count must be <= 50');
   if (p.burst.spacingMs > 500) errors.push('burst.spacingMs must be <= 500');
