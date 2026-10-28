@@ -9,13 +9,17 @@
  *    the newest recent launch we have NOT bought, whose snipe tax is 0 (launch block ≥ 3 s old)
  *    and that has not graduated; a few candidates are tried (N1);
  *  - N15: the exit (`exitAll`, incl. the treasury forwarding allowance) is estimated on the same
- *    curve with a state override that gives the contract a balance; above the gas limit → fail.
- * `LiveGate` runs the checks after the startup reconciliation and keeps retrying while they fail.
+ *    curve with a state override that gives the contract a balance; above the gas limit → fail;
+ *  - NEW-4: the contract's spend budget cannot cover the largest preset buy (every such snipe
+ *    would revert SpendLimitExceeded) → fail; budget switched off → warning.
+ * `LiveGate` runs the checks after the startup reconciliation and keeps retrying while they fail;
+ * while they pass it re-reads the contract config every GATE_REFRESH_MS (NEW-8), so maxQuoteIn,
+ * the spend budget, the owner and the operators used at decide time are never older than that.
  */
 import { sniperAbi } from '@hood/contracts';
 import { PONS_V2 } from '@hood/core';
 import { encodeFunctionData, formatEther, parseEther, type Address } from 'viem';
-import { erc20HoldingOverride, type ChainClient, type RecentLaunch } from './chain.js';
+import { erc20HoldingOverride, type ChainClient, type RecentLaunch, type SpendBudgetState } from './chain.js';
 import type { Logger } from './log.js';
 
 /** gas PonsSniper forwards with the exit proceeds (PROCEEDS_GAS in the contract) */
@@ -32,8 +36,10 @@ export interface StartupCheckInput {
   exitFrom?: Address;
   /** smallest gasLimit among the enabled presets (default 300k) */
   gasLimit: number;
-  /** largest buy among the enabled presets (buyEth, or sizing.maxEth in bankroll mode) */
+  /** largest FIXED buy among the enabled presets (`buyEth`; refused at decide time above maxQuoteIn) */
   maxBuyEth?: number;
+  /** largest `sizing.maxEth` among the enabled bankroll presets (clamped to maxQuoteIn, NEW-6) */
+  maxBankrollEth?: number;
   factory?: Address;
   allowHotOwner?: boolean;
   gasCheck?: boolean;
@@ -50,6 +56,8 @@ export interface StartupCheckResult {
   exitGasEstimate: bigint | null;
   /** the contract's per-snipe cap (refuse presets above it at decide time — N15) */
   maxQuoteIn: bigint | null;
+  /** the contract's spend budget (NEW-4); null when it could not be read */
+  spend?: SpendBudgetState | null;
   /** curve the estimates ran on */
   estimatedOn: RecentLaunch | null;
 }
@@ -60,6 +68,7 @@ export async function liveStartupChecks(i: StartupCheckInput): Promise<StartupCh
   let gasEstimate: bigint | null = null;
   let exitGasEstimate: bigint | null = null;
   let maxQuoteIn: bigint | null = null;
+  let spend: SpendBudgetState | null = null;
   let estimatedOn: RecentLaunch | null = null;
   const keys = i.keys.map((k) => k.toLowerCase() as Address);
   try {
@@ -77,6 +86,22 @@ export async function liveStartupChecks(i: StartupCheckInput): Promise<StartupCh
     });
     if (i.maxBuyEth !== undefined && parseEther(String(i.maxBuyEth)) > cfg.maxQuoteIn)
       warnings.push(`a preset buys up to ${i.maxBuyEth} ETH but the contract's maxQuoteIn is ${formatEther(cfg.maxQuoteIn)} ETH: those plays are refused at decide time (N15)`);
+    if (i.maxBankrollEth !== undefined && parseEther(String(i.maxBankrollEth)) > cfg.maxQuoteIn)
+      warnings.push(`a bankroll preset sizes up to ${i.maxBankrollEth} ETH but the contract's maxQuoteIn is ${formatEther(cfg.maxQuoteIn)} ETH: its sizes are clamped to maxQuoteIn (NEW-6)`);
+    // NEW-4: nothing read the budget before — exhausted, every member reverted SpendLimitExceeded silently
+    spend = cfg.spend ?? null;
+    if (spend) {
+      const fixed = i.maxBuyEth !== undefined ? parseEther(String(i.maxBuyEth)) : 0n;
+      const bank = i.maxBankrollEth !== undefined ? parseEther(String(i.maxBankrollEth)) : 0n;
+      const bankCapped = bank > cfg.maxQuoteIn ? cfg.maxQuoteIn : bank;
+      const largest = fixed > bankCapped ? fixed : bankCapped;
+      if (spend.window === 0)
+        warnings.push(`NEW-4: the contract's spend budget is OFF (disableSpendLimit): a stolen operator key is bounded only by maxQuoteIn per snipe and the contract balance`);
+      else if (largest > 0n && spend.maxSpend < largest)
+        errors.push(
+          `NEW-4: the contract's spend budget ${formatEther(spend.maxSpend)} ETH per ${spend.window} s is below the largest preset buy ${formatEther(largest)} ETH: every such snipe would revert SpendLimitExceeded (owner: setSpendLimit)`,
+        );
+    }
   } catch (e) {
     errors.push(`reading the PonsSniper config failed: ${(e as Error).message}`);
   }
@@ -102,7 +127,7 @@ export async function liveStartupChecks(i: StartupCheckInput): Promise<StartupCh
           skipped.push(`${c.curve}: already bought by us`);
           continue;
         }
-        const data = encodeFunctionData({ abi: sniperAbi, functionName: 'snipe', args: [c.curve, c.token, parseEther('0.0001'), 0n, 1000, BigInt(head + 10_000)] });
+        const data = encodeFunctionData({ abi: sniperAbi, functionName: 'snipe', args: [c.curve, c.token, parseEther('0.0001'), 0n, 1000, BigInt(head + 10_000), BigInt(headTs + 3600)] });
         try {
           gasEstimate = await i.chain.estimateGas({ from: i.estimateFrom, to: i.sniper, data });
           estimatedOn = c;
@@ -143,16 +168,24 @@ export async function liveStartupChecks(i: StartupCheckInput): Promise<StartupCh
       }
     }
   }
-  return { ok: errors.length === 0, errors, warnings, gasEstimate, exitGasEstimate, maxQuoteIn, estimatedOn };
+  return { ok: errors.length === 0, errors, warnings, gasEstimate, exitGasEstimate, maxQuoteIn, spend, estimatedOn };
 }
 
 export interface LiveGateOptions {
   check: () => Promise<StartupCheckResult>;
-  /** every result (block / unblock entries, alerts) */
+  /**
+   * NEW-8: the light re-check run every `refreshMs` while the gate passes — the contract config
+   * (owner, factory, operators, maxQuoteIn, spend budget) without the gas estimates
+   * (`liveStartupChecks({ …, gasCheck: false })`). Default: no refresh.
+   */
+  refresh?: () => Promise<StartupCheckResult>;
+  /** every result (block / unblock entries, alerts, contract limits for the decide path) */
   onResult: (r: StartupCheckResult) => void;
   logger: Logger;
   /** retry while failing. Default 60 s. */
   retryMs?: number;
+  /** GATE_REFRESH_MS: re-read the contract config this often while passing. Default 60 s. */
+  refreshMs?: number;
 }
 
 /**
@@ -179,14 +212,50 @@ export class LiveGate {
     if (!r.ok) this.o.logger.error({ errors: r.errors }, 'live gate failed: new entries blocked, retrying');
     else this.o.logger.info({ gasEstimate: r.gasEstimate?.toString(), exitGasEstimate: r.exitGasEstimate?.toString() }, 'live gate passed');
     this.o.onResult(r);
-    if (!r.ok && !this.stopped) {
-      this.timer = setTimeout(() => {
-        this.timer = null;
-        void this.run();
-      }, this.o.retryMs ?? 60_000);
-      this.timer.unref?.();
-    }
+    this.schedule(r.ok);
     return r;
+  }
+
+  /**
+   * NEW-8: while passing, re-read the contract config. A changed config that fails (operator
+   * revoked, budget below the largest buy, hot owner …) blocks entries and falls back to the full
+   * check; a read that merely failed (RPC) keeps the previous limits and state (the contract
+   * enforces them anyway) and is retried at the next refresh.
+   */
+  async refreshNow(): Promise<StartupCheckResult | null> {
+    if (!this.o.refresh) return null;
+    let r: StartupCheckResult;
+    try {
+      r = await this.o.refresh();
+    } catch (e) {
+      r = { ok: false, errors: [`refresh crashed: ${(e as Error).message}`], warnings: [], gasEstimate: null, exitGasEstimate: null, maxQuoteIn: null, estimatedOn: null };
+    }
+    if (r.maxQuoteIn === null) {
+      this.o.logger.warn({ errors: r.errors }, 'live gate refresh: contract config not readable; keeping the previous limits');
+      this.schedule(true);
+      return r;
+    }
+    const merged: StartupCheckResult = { ...r, gasEstimate: this.last?.gasEstimate ?? null, exitGasEstimate: this.last?.exitGasEstimate ?? null, estimatedOn: this.last?.estimatedOn ?? null };
+    if (!r.ok) this.o.logger.error({ errors: r.errors }, 'live gate refresh failed: new entries blocked');
+    this.last = merged;
+    this.o.onResult(merged);
+    this.schedule(r.ok);
+    return merged;
+  }
+
+  private schedule(passing: boolean): void {
+    if (this.stopped) return;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    if (passing && !this.o.refresh) return;
+    this.timer = setTimeout(
+      () => {
+        this.timer = null;
+        void (passing ? this.refreshNow() : this.run());
+      },
+      passing ? (this.o.refreshMs ?? 60_000) : (this.o.retryMs ?? 60_000),
+    );
+    this.timer.unref?.();
   }
 
   stop(): void {

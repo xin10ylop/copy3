@@ -109,7 +109,7 @@ describe('LiveExecutor burst', () => {
     expect(b.sent).toHaveLength(10); // fan-out, even though this endpoint errors
     expect(r.burst.every((m) => m.sends.length === 2 && m.sends.some((s) => !s.ok && s.error === 'boom'))).toBe(true);
 
-    // every raw tx: EIP-1559, chain 4663, to the sniper, snipe(curve, token, quoteIn, minOut, maxTax, deadline)
+    // every raw tx: EIP-1559, chain 4663, to the sniper, snipe(curve, token, quoteIn, minOut, maxTax, deadline, deadlineTs)
     for (const [i, m] of r.burst.entries()) {
       expect(m.hash).toBe(keccak256(m.raw));
       const tx = parseTransaction(m.raw);
@@ -118,7 +118,7 @@ describe('LiveExecutor burst', () => {
       expect(await recoverTransactionAddress({ serializedTransaction: m.raw as `0x02${string}` })).toBe(account.address);
       const call = decodeFunctionData({ abi: sniperAbi, data: tx.data! });
       expect(call.functionName).toBe('snipe');
-      expect(call.args).toEqual([expect.stringMatching(new RegExp(LAUNCH.curve, 'i')), expect.stringMatching(new RegExp(LAUNCH.token, 'i')), parseEther('0.07'), 123_456n, 1000, BigInt(LAUNCH.block + 40)]);
+      expect(call.args).toEqual([expect.stringMatching(new RegExp(LAUNCH.curve, 'i')), expect.stringMatching(new RegExp(LAUNCH.token, 'i')), parseEther('0.07'), 123_456n, 1000, BigInt(LAUNCH.block + 40), BigInt(LAUNCH.ts + 3)]);
     }
 
     // receipts: members 0-2 landed in T blocks (TaxTooHigh), 3 bought, 4-8 AlreadyBought, 9 dropped

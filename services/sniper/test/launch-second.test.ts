@@ -4,7 +4,7 @@
  * schedules the burst for the T+1 boundary. Team buys must be confirmed by a CurveBuy receipt log
  * before anything is signed (live), and the play is re-checked right before the first send.
  */
-import { QUOTE_TOKENS, SequencerClock, curveAbi, decodedTxFromRpc, tokenAbi, type DecodedTx, type FeedBlock, type Reserves } from '@hood/core';
+import { CURVE_FEE_BPS, QUOTE_TOKENS, SequencerClock, TOPICS, curveAbi, decodedTxFromRpc, quoteBuy, snipeTaxWeiFor, tokenAbi, type DecodedTx, type FeedBlock, type Reserves } from '@hood/core';
 import { encodeFunctionData, parseEther, type Address, type Hex } from 'viem';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ReceiptLite } from '../src/chain.js';
@@ -85,6 +85,21 @@ function transferTx(from: Address, to: Address): DecodedTx {
     nonce: n,
     input: encodeFunctionData({ abi: tokenAbi, functionName: 'transfer', args: [to, 10n ** 24n] }),
   });
+}
+
+/** Receipt of a hinted buy with the EXACT CurveBuy numbers the curve would emit from `before` (untaxed). */
+function exactBuyReceipt(tx: DecodedTx, block: number, before: Reserves, creatorTaxBps: number): ReceiptLite {
+  const recipient = `0x${tx.input.slice(-40)}`;
+  const tokens = quoteBuy(before, tx.value, CURVE_FEE_BPS, creatorTaxBps, 0n);
+  const fee = (tx.value * BigInt(CURVE_FEE_BPS)) / 10_000n;
+  const tax = (tx.value * BigInt(creatorTaxBps)) / 10_000n;
+  return {
+    transactionHash: tx.hash,
+    status: 'success',
+    blockNumber: block,
+    gasUsed: 120_000n,
+    logs: [curveTradeLog({ curve: LAUNCH.curve, side: 'buy', trader: recipient, recipient, quote: tx.value, tokens, fee, tax, block, txHash: tx.hash, logIndex: 0 })],
+  };
 }
 
 /** Receipt of a hinted buy: success with its CurveBuy log, or reverted (no log). */
@@ -427,14 +442,91 @@ describe('LaunchSecondLedger (unit)', () => {
     expect(lg.stats().confirmed).toEqual({ teamBuyEth: 0, teamBuyers: 0, devBuyEth: 0.3 });
   });
 
-  it('reservesAfter applies the launch-second buys (team untaxed) to the post-launch reserves', () => {
+  it('reservesAfter applies the confirmed launch-second buys (team untaxed) to the post-launch reserves', () => {
     const lg = new LaunchSecondLedger(detected());
     lg.setAddresses(LAUNCH.token, LAUNCH.curve);
-    lg.ingestTx(curveBuyTx(0.38), LAUNCH.block + 1);
+    const tx = curveBuyTx(0.38);
+    lg.ingestTx(tx, LAUNCH.block + 1);
+    lg.applyReceipt(exactBuyReceipt(tx, LAUNCH.block + 1, INITIAL, 200));
     const r = lg.reservesAfter(INITIAL, 200);
     expect(r.quote).toBe(INITIAL.quote + parseEther('0.38') - parseEther('0.0038') - parseEther('0.0076'));
-    expect(r.token).toBeLessThan(INITIAL.token);
+    expect(r.token).toBe(INITIAL.token - quoteBuy(INITIAL, parseEther('0.38'), CURVE_FEE_BPS, 200, 0n));
     const priceUp = (Number(r.quote) / Number(r.token)) / (Number(INITIAL.quote) / Number(INITIAL.token)) - 1;
     expect(priceUp).toBeGreaterThan(0.4); // AMLIL-like +45 %: minTokensOut must be computed after it
+  });
+
+  it('NEW-1: a pending feed hint never prices — reservesAfter / priceMovingBuys use confirmed CurveBuy logs only', () => {
+    const lg = new LaunchSecondLedger(detected());
+    lg.setAddresses(LAUNCH.token, LAUNCH.curve);
+    // the deployer's fake: a feed-visible 3 ETH "team buy" with minOut = max (reverts, costs gas only)
+    const fake = curveBuyTx(3);
+    expect(lg.ingestTx(fake, LAUNCH.block + 1)).toBe('buy');
+    expect(lg.stats().seen.teamBuyEth).toBe(3); // the µs hint stage may still match on it …
+    expect(lg.priceMovingBuys).toBe(0); // … but it never moves the price
+    expect(lg.reservesAfter(INITIAL, 0)).toEqual(INITIAL);
+    // a real, confirmed team buy prices with its exact CurveBuy numbers
+    const real = curveBuyTx(0.15);
+    lg.ingestTx(real, LAUNCH.block + 1);
+    lg.applyReceipt(exactBuyReceipt(real, LAUNCH.block + 1, INITIAL, 0));
+    expect(lg.priceMovingBuys).toBe(1);
+    expect(lg.reservesAfter(INITIAL, 0).quote).toBe(INITIAL.quote + parseEther('0.15') - parseEther('0.0015'));
+    // the fake's receipt shows the revert: refuted, still nothing from it
+    lg.applyReceipt(buyReceipt(fake, LAUNCH.block + 2, 'reverted'));
+    expect(lg.stats().seen.teamBuyEth).toBeCloseTo(0.15, 12);
+    expect(lg.priceMovingBuys).toBe(1);
+  });
+
+  it('NEW-1: a buy that paid the 99 % launch-second tax is not a team buy when the wallet is exempted later in the second (CurveBuy.fee, else log order)', () => {
+    for (const withFee of [true, false]) {
+      const lg = new LaunchSecondLedger(detected());
+      lg.setAddresses(LAUNCH.token, LAUNCH.curve);
+      const W = '0x0000000000000000000000000000000000000a11';
+      const q = parseEther('0.2');
+      // block +1: W buys while NOT exempt → fee = 1 % + 99 % snipe tax (net into the pool ≈ 0)
+      const taxed = curveTradeLog({ curve: LAUNCH.curve, side: 'buy', trader: W, recipient: W, quote: q, tokens: 10n ** 20n, fee: q / 100n + (q * 9900n) / 10_000n, tax: 0n, block: LAUNCH.block + 1, txHash: `0x${'b1'.repeat(32)}`, logIndex: 1 });
+      lg.ingestLog(withFee ? taxed : { ...taxed, data: taxed.data.slice(0, 2 + 64) }); // a log without the fee word: order decides
+      // block +2: the deployer exempts W (exemptFromSnipeTax) — after the buy
+      lg.ingestLog({ address: LAUNCH.curve, topics: [TOPICS.SnipeTaxExempted, `0x${'0'.repeat(24)}${W.slice(2)}`], data: '0x', blockNumber: LAUNCH.block + 2, transactionHash: `0x${'e1'.repeat(32)}`, logIndex: 0 });
+      expect(lg.isExempt(W)).toBe(true); // later buys of W are team buys …
+      expect(lg.stats().confirmed.teamBuyEth).toBe(0); // … this one paid the tax
+      expect(lg.snapshot().buys).toEqual([expect.objectContaining({ kind: 'other', status: 'confirmed' })]);
+      // and it moved the price by its real net (≈ 0), not as an untaxed 0.2 ETH buy
+      const r = lg.reservesAfter(INITIAL, 0);
+      expect(Number(r.quote - INITIAL.quote) / 1e18).toBeLessThan(0.0021);
+      // a buy by W AFTER the exemption is a team buy
+      const after = curveTradeLog({ curve: LAUNCH.curve, side: 'buy', trader: W, recipient: W, quote: q, tokens: 10n ** 25n, fee: q / 100n, tax: 0n, block: LAUNCH.block + 3, txHash: `0x${'b2'.repeat(32)}`, logIndex: 0 });
+      lg.ingestLog(withFee ? after : { ...after, data: after.data.slice(0, 2 + 64) });
+      expect(lg.stats().confirmed.teamBuyEth).toBeCloseTo(0.2, 12);
+    }
+  });
+});
+
+describe('NEW-1: launch-second minTokensOut is priced on confirmed buys only (reviewer PoC A)', () => {
+  /** decision with or without a pending, reverting 3 ETH fake "team buy" next to the real 0.15 ETH one */
+  async function decide(withFake: boolean): Promise<SnipeOrder> {
+    const h = harness();
+    await h.sniper.start();
+    h.warm();
+    const real = curveBuyTx(0.15);
+    h.chain.receipts.set(real.hash, exactBuyReceipt(real, h.blockAt(3), INITIAL, 0));
+    const fake = curveBuyTx(3); // minOut = max on chain: reverts; its receipt is not there yet
+    h.launchSecond(new Map([[3, [real]], ...(withFake ? ([[4, [fake]]] as [number, DecodedTx[]][]) : [])]), 0, 4);
+    await waitFor(() => h.scripted!.orders.length === 1);
+    const o = h.scripted!.orders[0]!;
+    if (withFake) expect(h.sniper.ledger(LAUNCH.txHash)!.stats().pending).toBe(1); // still pending when we signed
+    h.chain.receipts.set(fake.hash, buyReceipt(fake, h.blockAt(5), 'reverted'));
+    h.scripted!.resolveFill!(null);
+    return o;
+  }
+
+  it('a reverting feed-visible fake buy pending at signing time cannot loosen minTokensOut (30 % stays 30 %)', async () => {
+    const honest = await decide(false);
+    const attacked = await decide(true);
+    expect(attacked.run.minTokensOut).toBe(honest.run.minTokensOut);
+    expect(attacked.run.notes.join()).toMatch(/reserves: launch config \+ 1 launch-second buy\(s\) from the ledger/);
+    // the tolerated slippage against the true post-second price is the preset's 3000 bps
+    const realR = { quote: INITIAL.quote + parseEther('0.15') - parseEther('0.0015'), token: INITIAL.token - quoteBuy(INITIAL, parseEther('0.15'), CURVE_FEE_BPS, 0, 0n) };
+    const expected = quoteBuy(realR, attacked.run.quoteIn, CURVE_FEE_BPS, 0, snipeTaxWeiFor(attacked.run.quoteIn, 618));
+    expect(1 - Number(attacked.run.minTokensOut) / Number(expected)).toBeCloseTo(0.3, 6);
   });
 });

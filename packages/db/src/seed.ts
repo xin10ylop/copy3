@@ -49,14 +49,27 @@ export const DEFAULT_AUTO_APPROVE: AutoApprovePolicy = {
 export const KILL_SWITCH_OFF = { on: false, reason: null, by: 'seed', at: null } as const;
 
 /**
+ * Entry cap of the generic plays (ETH of market cap): 2.5 × the 1.68 ETH start mcap of launch
+ * config 0. It is enforced on chain through minTokensOut computed from the curve invariant
+ * k = Q·T (services/sniper pricing.planMinOut), which no buy — real, fake or merely announced in
+ * the feed — can move: a buy above it reverts. Reference: the +1 s entry on the video's coin was
+ * ≈ 2.8 ETH mcap and AMLIL's team buys lifted the price ~49 % (≈ 2.5 ETH) before +1 s, so honest
+ * team-buy launches stay well inside it. Reviewer round 3, NEW-1.
+ */
+export const GENERIC_MAX_ENTRY_MCAP_ETH = 4.2;
+
+/**
  * The backtested preset (Preset defaults = Backtest #2 walk-forward: no fixed TP, trailing 50/20,
- * SL 40 %, timeout 60 s, exit on the first exempt transfer-out) with the two risk fields a generic
+ * SL 40 %, timeout 60 s, exit on the first exempt transfer-out) with the risk fields a generic
  * play needs to work every day: `stopAfter` effectively unlimited (MAX_CONCURRENT and the daily
- * loss limit are the real caps) and `firstBuyOnly: false` (the backtest traded every launch of a
- * repeat deployer, e.g. the operator with 201 launches in 62 h).
+ * loss limit are the real caps), `firstBuyOnly: false` (the backtest traded every launch of a
+ * repeat deployer, e.g. the operator with 201 launches in 62 h) and the k-based entry cap
+ * `maxEntryMcapEth` (NEW-1: slippage alone is priced against the ledger's view of the launch
+ * second; the cap is not). Existing plays are never rewritten by the seed: on a database seeded
+ * before this cap, set it with `/preset <id> maxEntryMcapEth=4.2`.
  */
 export function genericPreset(): Preset {
-  return parsePreset({ stopAfter: 1_000_000, firstBuyOnly: false });
+  return parsePreset({ stopAfter: 1_000_000, firstBuyOnly: false, maxEntryMcapEth: GENERIC_MAX_ENTRY_MCAP_ETH });
 }
 
 export interface SeedPlay {

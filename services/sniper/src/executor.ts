@@ -6,9 +6,12 @@
  * seen, statuses + nonce settlement complete in the background.
  *
  * Keys (reviewer M1). Every key is a PonsSniper operator with its own nonce sequence:
- *  - `accounts[0]` is the EXIT key: exits never queue behind a burst's nonces;
- *  - `accounts[1..]` are BURST slots: one concurrent burst per slot (a burst holds its slot from
- *    signing until its nonces are settled), so concurrent bursts never share a sequence;
+ *  - `accounts[0 .. exitKeys-1]` are EXIT keys (EXIT_KEYS, default 1): exits never queue behind
+ *    a burst's nonces. One exit key serves exits strictly FIFO (each exit holds it until its
+ *    receipt or its timeout, ≤ EXIT_RECEIPT_TIMEOUT_MS); with n exit keys concurrent exits go to
+ *    a free key first, else round-robin (NEW-9);
+ *  - the remaining accounts are BURST slots: one concurrent burst per slot (a burst holds its slot
+ *    from signing until its nonces are settled), so concurrent bursts never share a sequence;
  *  - a single account is shared by exits and bursts (serialised; not recommended for live).
  * A member that no endpoint accepted is re-sent once (same raw tx, same nonce) to every endpoint;
  * after the burst (or an exit) every nonce the key broadcast but the chain did not consume is
@@ -135,6 +138,8 @@ export class ExecutorKey {
   readonly nonces = new NonceManager();
   /** a burst holds the slot from signing until its nonces are settled */
   inBurst = false;
+  /** exits queued on / running with this key (NEW-9: pick a free exit key first) */
+  pendingExits = 0;
   balanceWei: bigint | null = null;
   private tail: Promise<unknown> = Promise.resolve();
 
@@ -159,8 +164,10 @@ export class ExecutorKey {
 }
 
 export interface LiveExecutorOptions {
-  /** operator accounts: [0] = exit key, [1..] = one burst slot each; a single account is shared */
+  /** operator accounts: [0 .. exitKeys-1] = exit keys, the rest = one burst slot each; a single account is shared */
   accounts?: LocalAccount[];
+  /** EXIT_KEYS: how many of the first accounts serve exits (round-robin). Default 1; at least one burst key remains. */
+  exitKeys?: number;
   /** legacy single account (= `accounts: [account]`) */
   account?: LocalAccount;
   sniper: Address;
@@ -219,6 +226,14 @@ export function decodeSniped(
   return null;
 }
 
+/** Seconds after the launch second a burst member may still buy (tax is 0 from T+3). NEW-3. */
+export const SNIPE_DEADLINE_SECONDS = 3;
+
+/** `snipe(…, deadlineTs)`: the latest block timestamp a member may buy in (launch ts + 3). */
+export function snipeDeadlineTs(run: Pick<SnipeRun, 'launch' | 'deadlineTs'>): number {
+  return run.deadlineTs ?? run.launch.ts + SNIPE_DEADLINE_SECONDS;
+}
+
 export function snipeTaxFromLogs(logs: RawLog[], curve: Address): bigint {
   for (const l of logs) {
     if (l.address.toLowerCase() === curve.toLowerCase() && l.topics[0] === TOPICS.SnipeTaxCharged) return BigInt(l.data);
@@ -229,8 +244,12 @@ export function snipeTaxFromLogs(logs: RawLog[], curve: Address): bigint {
 export class LiveExecutor implements ExecutionBackend {
   readonly mode = 'live' as const;
   readonly keys: ExecutorKey[];
+  /** the first exit key (health, gate estimates) */
   readonly exitKey: ExecutorKey;
+  /** NEW-9: every exit key (EXIT_KEYS) */
+  readonly exitKeys: ExecutorKey[];
   readonly burstKeys: ExecutorKey[];
+  private nextExit = 0;
   /** PonsSniper ETH balance (cached, refreshed off the hot path) */
   contractBalanceWei: bigint | null = null;
   private readonly cancels = new Map<string, (() => void)[]>();
@@ -245,11 +264,14 @@ export class LiveExecutor implements ExecutionBackend {
       const k = new ExecutorKey(accts[0]!, 'shared');
       this.keys = [k];
       this.exitKey = k;
+      this.exitKeys = [k];
       this.burstKeys = [k];
     } else {
-      this.keys = accts.map((a, i) => new ExecutorKey(a, i === 0 ? 'exit' : 'burst'));
-      this.exitKey = this.keys[0]!;
-      this.burstKeys = this.keys.slice(1);
+      const n = Math.max(1, Math.min(accts.length - 1, Math.floor(o.exitKeys ?? 1)));
+      this.keys = accts.map((a, i) => new ExecutorKey(a, i < n ? 'exit' : 'burst'));
+      this.exitKeys = this.keys.slice(0, n);
+      this.exitKey = this.exitKeys[0]!;
+      this.burstKeys = this.keys.slice(n);
     }
   }
 
@@ -306,6 +328,32 @@ export class LiveExecutor implements ExecutionBackend {
     return this.burstKeys.find((k) => !k.inBurst);
   }
 
+  /**
+   * NEW-9: the exit key for the next exit — a key with no exit queued or running (and gas, when
+   * another one has it), scanning round-robin from the last pick; all busy → plain round-robin.
+   * With one exit key every exit queues behind the previous one (FIFO).
+   */
+  pickExitKey(): ExecutorKey {
+    const ks = this.exitKeys;
+    const funded = ks.filter((k) => k.balanceWei === null || k.balanceWei >= this.minGas);
+    const pool = funded.length ? funded : ks;
+    for (let i = 0; i < ks.length; i++) {
+      const k = ks[(this.nextExit + i) % ks.length]!;
+      if (pool.includes(k) && k.pendingExits === 0) {
+        this.nextExit = (this.nextExit + i + 1) % ks.length;
+        return k;
+      }
+    }
+    for (let i = 0; i < ks.length; i++) {
+      const k = ks[(this.nextExit + i) % ks.length]!;
+      if (pool.includes(k)) {
+        this.nextExit = (this.nextExit + i + 1) % ks.length;
+        return k;
+      }
+    }
+    return ks[0]!;
+  }
+
   /** Sizing: the same cached contract balance the L8 pre-check uses (null until the first read). */
   bankrollWei(): bigint | null {
     return this.contractBalanceWei;
@@ -322,8 +370,13 @@ export class LiveExecutor implements ExecutionBackend {
     if (!key) reasons.push(`no free burst key (${this.burstKeys.length} slot(s) busy)`);
     else if (key.balanceWei !== null && key.balanceWei < need)
       lowBalance.push(`burst key ${key.address} gas balance ${formatEther(key.balanceWei)} ETH < ${formatEther(need)} ETH`);
-    if (this.exitKey !== key && this.exitKey.balanceWei !== null && this.exitKey.balanceWei < need)
-      lowBalance.push(`exit key ${this.exitKey.address} gas balance ${formatEther(this.exitKey.balanceWei)} ETH < ${formatEther(need)} ETH (positions could not be exited)`);
+    // positions must stay exitable: refuse the burst when NO exit key has the gas for an exit
+    const exitKeys = this.exitKeys.filter((k) => k !== key);
+    const lowExit = exitKeys.filter((k) => k.balanceWei !== null && k.balanceWei < need);
+    if (exitKeys.length > 0 && lowExit.length === exitKeys.length)
+      lowBalance.push(
+        ...lowExit.map((k) => `exit key ${k.address} gas balance ${formatEther(k.balanceWei!)} ETH < ${formatEther(need)} ETH (positions could not be exited)`),
+      );
     if (lowBalance.length) this.alert('low_balance', 'preflight', { reasons: lowBalance });
     return [...reasons, ...lowBalance];
   }
@@ -350,7 +403,8 @@ export class LiveExecutor implements ExecutionBackend {
     return encodeFunctionData({
       abi: sniperAbi,
       functionName: 'snipe',
-      args: [order.curve, order.token, run.quoteIn, run.minTokensOut, run.maxTaxBps, BigInt(run.deadlineBlock)],
+      // NEW-3: wall-clock deadline next to the block deadline (a stalled sequencer advances time, not blocks)
+      args: [order.curve, order.token, run.quoteIn, run.minTokensOut, run.maxTaxBps, BigInt(run.deadlineBlock), BigInt(snipeDeadlineTs(run))],
     });
   }
 
@@ -643,7 +697,8 @@ export class LiveExecutor implements ExecutionBackend {
   async exit(order: ExitOrder): Promise<ExitResult> {
     this.stats.exits++;
     if (!order.all && order.tokensIn <= 0n) return { ok: false, tokensIn: 0n, quoteOut: 0n, error: 'zero-size exit refused (L1)' };
-    const key = this.exitKey;
+    const key = this.pickExitKey();
+    key.pendingExits++;
     return key.lock(async () => {
       if (key.nonces.value === null) key.nonces.set(await this.o.chain.getTransactionCount(key.address, 'pending'));
       const [nonce] = key.nonces.take(1);
@@ -696,6 +751,8 @@ export class LiveExecutor implements ExecutionBackend {
         await this.settle(key).catch(() => undefined);
         void this.refreshBalances().catch(() => undefined);
       }
+    }).finally(() => {
+      key.pendingExits--;
     });
   }
 

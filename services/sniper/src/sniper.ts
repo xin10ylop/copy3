@@ -30,14 +30,15 @@ import {
   type FeedBlock,
   type LaunchEvent,
   type LaunchKind,
+  type Preset,
   type RawLog,
   type Reserves,
   type SequencerClock,
 } from '@hood/core';
-import { parseEther, type Address, type Hex } from 'viem';
-import type { ChainClient } from './chain.js';
+import { formatEther, parseEther, type Address, type Hex } from 'viem';
+import type { ChainClient, SnipedLog, SpendBudgetState } from './chain.js';
 import { LaunchDetector, verifyLaunchReceipt, type ReceiptVerdict } from './detector.js';
-import { decodeSniped, snipeTaxFromLogs, type ExecutionBackend } from './executor.js';
+import { SNIPE_DEADLINE_SECONDS, decodeSniped, snipeTaxFromLogs, type ExecutionBackend } from './executor.js';
 import type { HealthState } from './health.js';
 import { LEDGER_SELECTORS, LaunchSecondLedger, SEL_SELL, SEL_TRANSFER, SEL_TRANSFER_FROM, outflowFrom } from './ledger.js';
 import type { Logger } from './log.js';
@@ -47,7 +48,8 @@ import { Recorder } from './recorder.js';
 import { Risk } from './risk.js';
 import { Rules } from './rules.js';
 import type { Scheduler } from './scheduler.js';
-import { PaperBankroll, sizeBuy } from './sizing.js';
+import { PaperBankroll, SIZE_STEP_WEI, sizeBuy } from './sizing.js';
+import { ContractLimits } from './limits.js';
 import type { ActiveSnipe, ChangeChannel, SniperStore } from './store.js';
 import type { Decision, DetectedLaunch, Fill, SnipeRun } from './types.js';
 
@@ -93,10 +95,26 @@ export interface SniperOptions {
   maxExitBackoffMs?: number;
   /** re-arm a stuck position this long after it got stuck (N2). Default 5 min. */
   stuckRearmMs?: number;
+  /** NEW-2: re-read settings (kill switch) this often whatever NOTIFY delivered. Default 10 s. */
+  settingsReloadMs?: number;
+  /** NEW-2: re-read plays and armed candidates this often. Default 60 s. */
+  playsReloadMs?: number;
+  /** keep `feed_blocks` rows this many days (pruned hourly from the reconcile timer); 0 = keep all. Default 7. */
+  feedBlocksRetentionDays?: number;
+  /** NEW-3: startup sweep of the contract's Sniped events — first run looks back this many blocks; 0 = off. Default 864 000 (~1 day). */
+  sweepLookbackBlocks?: number;
+  /** NEW-4/6 paper mode: the contract caps live would have (live reads them from the chain via the gate) */
+  paperLimits?: { maxQuoteIn: bigint; maxSpend: bigint; spendWindow: number };
 }
+
+/** NEW-4: alert at most this often for the same refusal type */
+const ALERT_EVERY_MS = 10 * 60_000;
 
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** Paper defaults = the deploy defaults (maxQuoteIn 0.3, budget 4 × per 3600 s). */
+export const DEFAULT_PAPER_LIMITS = { maxQuoteIn: parseEther('0.3'), maxSpend: parseEther('1.2'), spendWindow: 3600 } as const;
 
 type RecoverResult = Fill | null | 'unknown';
 
@@ -144,8 +162,18 @@ export class Sniper {
   private unsubs: (() => void | Promise<void>)[] = [];
   private seq = 0;
   private statsLoaded = false;
-  /** PonsSniper.maxQuoteIn (live gate): presets that could buy more are refused (N15) */
-  private contractMaxQuoteIn: bigint | null = null;
+  /**
+   * PonsSniper.maxQuoteIn and the spend budget (N15, NEW-4/6): live from the gate (refreshed every
+   * GATE_REFRESH_MS), paper from `paperLimits`. Bankroll sizes are clamped to them; a fixed buyEth
+   * above maxQuoteIn and a budget below quoteIn are refused at decide time.
+   */
+  readonly limits: ContractLimits;
+  private readonly lastAlertAt = new Map<string, number>();
+  /** runs whose no-fill check is being settled (timer and reconcile tick never overlap) */
+  private readonly settling = new Set<string>();
+  private lastFeedPrune = 0;
+  /** NEW-3: the startup orphan sweep (tests await it) */
+  sweeping: Promise<number> = Promise.resolve(0);
   private readonly startedAt = Date.now();
 
   constructor(private readonly o: SniperOptions) {
@@ -158,6 +186,11 @@ export class Sniper {
       maxGasPriceGwei: o.maxGasPriceGwei ?? 1,
     });
     this.paperBank = o.mode === 'paper' ? new PaperBankroll(parseEther(String(o.paperBankrollEth ?? 0.1))) : null;
+    const pl = o.paperLimits ?? DEFAULT_PAPER_LIMITS;
+    this.limits =
+      o.mode === 'paper'
+        ? new ContractLimits({ maxQuoteIn: pl.maxQuoteIn, spend: { maxSpend: pl.maxSpend, window: pl.spendWindow, level: 0n, updatedAt: 0 } })
+        : new ContractLimits();
     this.detector = o.detector ?? new LaunchDetector();
     this.recorder = new Recorder(o.store, o.logger, { recordFeedBlocks: o.recordFeedBlocks ?? true });
     this.positions = new Positions({
@@ -193,9 +226,17 @@ export class Sniper {
     });
   }
 
-  /** Contract limits learnt by the live gate (N15). */
-  setContractLimits(l: { maxQuoteIn: bigint | null }): void {
-    this.contractMaxQuoteIn = l.maxQuoteIn;
+  /** Contract limits learnt by the live gate (N15, NEW-4): maxQuoteIn and the spend budget. */
+  setContractLimits(l: { maxQuoteIn: bigint | null; spend?: SpendBudgetState | null }): void {
+    this.limits.set(l);
+  }
+
+  /** An alert that repeats at most every ALERT_EVERY_MS per type. */
+  private alertThrottled(type: string, payload: Record<string, unknown>, level: 'warn' | 'error' = 'error'): void {
+    const now = Date.now();
+    if ((this.lastAlertAt.get(type) ?? -Infinity) + ALERT_EVERY_MS > now) return;
+    this.lastAlertAt.set(type, now);
+    this.alert(type, payload, level);
   }
 
   /** Bankroll for sizing: the cached contract ETH balance (live) or the paper bankroll. Memory-only. */
@@ -241,10 +282,23 @@ export class Sniper {
     this.feedBankroll();
     this.statsLoaded = true;
     this.o.logger.info({ plays: plays.length, armed: armed.length, positions: this.positions.open.length, unresolved: this.unresolvedRows.size }, 'state loaded');
-    const off = await store.onChange((c, p) => {
-      this.onChange(c, p).catch((e: unknown) => this.error(`refresh on ${c} failed`, e));
-    });
+    const off = await store.onChange(
+      (c, p) => {
+        this.onChange(c, p).catch((e: unknown) => this.error(`refresh on ${c} failed`, e));
+      },
+      // NEW-2: the LISTEN connection (re)connected — NOTIFYs sent while it was down are lost for good
+      () => {
+        this.reloadConfig('all', 'listen (re)connected').catch((e: unknown) => this.error('config reload on reconnect failed', e));
+      },
+    );
     this.unsubs.push(off);
+    // NEW-3: tokens the contract bought that no row manages (e.g. a member that landed after its
+    // run was written off) become positions again; in the background, after the reconciliation
+    this.sweeping = this.sweepOrphans().catch((e: unknown) => {
+      this.error('startup orphan sweep failed', e);
+      this.alert('orphan_sweep_failed', { err: (e as Error).message }, 'warn');
+      return 0;
+    });
     if (this.detector.predictionMode === 'nonce') {
       try {
         this.detector.seedNonce(await this.o.chain.getTransactionCount(this.detector.launchDeployer as Address, 'latest'));
@@ -280,6 +334,25 @@ export class Sniper {
     every(this.o.reservesPollMs ?? 500, () => this.pollReserves(), 'reserves poll');
     every(250, () => this.positions.tick(), 'positions tick');
     every(this.o.reconcileMs ?? 30_000, () => this.reconcileTick(), 'reconcile');
+    // NEW-2: never rely on NOTIFY alone (a kill switch written during a reconnect is not replayed)
+    every(this.o.settingsReloadMs ?? 10_000, () => this.reloadConfig('settings', 'periodic'), 'settings reload');
+    every(this.o.playsReloadMs ?? 60_000, () => this.reloadConfig('all', 'periodic'), 'plays reload');
+  }
+
+  /**
+   * NEW-2: re-read the config from the store — settings only (kill switch, limits: every 10 s) or
+   * plays + armed candidates + settings (every 60 s and on every LISTEN (re)connect).
+   */
+  async reloadConfig(scope: 'settings' | 'all', why: string): Promise<void> {
+    const { store } = this.o;
+    const wasKilled = this.risk.killSwitch;
+    if (scope === 'all') {
+      const [plays, armed, settings] = await Promise.all([store.loadPlays(), store.loadArmed(), store.loadSettings()]);
+      this.rules.setPlays(plays);
+      this.rules.setArmed(armed);
+      this.risk.setSettings(settings);
+    } else this.risk.setSettings(await store.loadSettings());
+    if (this.risk.killSwitch !== wasKilled) this.o.logger.warn({ killSwitch: this.risk.killSwitch, why }, 'kill switch changed (picked up by a reload, not a NOTIFY)');
   }
 
   async stop(): Promise<void> {
@@ -666,7 +739,15 @@ export class Sniper {
         if (r) {
           const v = verifyLaunchReceipt(r, l, this.detector.factory);
           if (!v.ok) {
-            this.alert('launch_receipt_mismatch', { key: run.key, tx: l.txHash, reason: v.reason }, 'error');
+            const filled = this.positions.get(run.key) !== undefined;
+            this.alert('launch_receipt_mismatch', { key: run.key, tx: l.txHash, reason: v.reason, filled }, 'error');
+            if (filled) {
+              // NEW-7: we already hold the token of a launch the receipt does not prove: get out
+              run.notes.push(`launch receipt contradicts the TokenLaunched log after the fill (${v.reason}): exiting`);
+              this.positions.forceExit(run.key, 'launch_receipt_mismatch');
+              return;
+            }
+            run.abortExit = 'launch_receipt_mismatch'; // a member still in flight that fills exits at once
             this.abortRun(run, `launch receipt contradicts the TokenLaunched log: ${v.reason}`);
             return;
           }
@@ -686,7 +767,14 @@ export class Sniper {
   // ------------------------------------------------------------------ decide + execute
   private newRun(l: DetectedLaunch, d: Decision): SnipeRun {
     // Preset.sizing: fixed buyEth, or a share of the bankroll (cached balance, memory only)
-    const sizing = sizeBuy(d.preset, d.preset.sizing?.mode === 'bankroll' ? this.bankrollWei() : null, this.risk.maxConcurrent);
+    let sizing = sizeBuy(d.preset, d.preset.sizing?.mode === 'bankroll' ? this.bankrollWei() : null, this.risk.maxConcurrent);
+    // NEW-6: a bankroll size is clamped to what the contract takes now — min(maxEth, maxQuoteIn,
+    // remaining spend budget) — instead of refusing the whole play
+    const cap = sizing.mode === 'bankroll' ? this.limits.cap() : null;
+    if (cap !== null && sizing.quoteIn > cap) {
+      const stepped = cap - (cap % SIZE_STEP_WEI);
+      sizing = { ...sizing, quoteIn: stepped, clamped: 'contract', note: `${sizing.note} → clamped to the contract cap ${formatEther(cap)} ETH (maxQuoteIn / spend budget)` };
+    }
     const quoteIn = sizing.quoteIn;
     const maxTaxBps = Math.max(0, Math.min(MAX_TAX_BPS, Math.floor(d.preset.maxTaxBps)));
     const run: SnipeRun = {
@@ -702,6 +790,7 @@ export class Sniper {
       minTokensOut: 0n,
       maxTaxBps,
       deadlineBlock: l.block + (this.o.deadlineBlocks ?? 40),
+      deadlineTs: l.ts + SNIPE_DEADLINE_SECONDS,
       burst: [],
       notes: [],
       sizing,
@@ -737,11 +826,21 @@ export class Sniper {
     const run = this.newRun(l, d);
     if (ledger) run.ledger = ledger;
     const verdict = this.risk.preCheck(d, l);
-    // N15: a preset that can buy more than the contract's maxQuoteIn would only revert QuoteTooLarge
-    const presetMaxEth = d.preset.sizing?.mode === 'bankroll' ? d.preset.sizing.maxEth : d.preset.buyEth;
-    if (this.contractMaxQuoteIn !== null && (parseEther(String(presetMaxEth)) > this.contractMaxQuoteIn || run.quoteIn > this.contractMaxQuoteIn)) {
+    // N15 / NEW-4 / NEW-6: what the contract would refuse (QuoteTooLarge, SpendLimitExceeded) is refused here
+    const lim = this.limitsCheck(run, d.preset);
+    if (lim.reasons.length) {
       verdict.ok = false;
-      verdict.reasons.push(`preset buys up to ${presetMaxEth} ETH > contract maxQuoteIn ${Number(this.contractMaxQuoteIn) / 1e18} ETH (preset refused)`);
+      verdict.reasons.push(...lim.reasons);
+      if (lim.budgetExhausted) {
+        const b = this.limits.budget;
+        this.alertThrottled('spend_budget_exhausted', {
+          key: run.key,
+          quoteInEth: formatEther(run.quoteIn),
+          availableEth: formatEther(this.limits.available() ?? 0n),
+          ...(b ? { maxSpendEth: formatEther(b.maxSpend), windowSec: b.window } : {}),
+          mode: this.o.mode,
+        });
+      }
     }
     this.lastDecideUs = (performance.now() - t0) * 1000;
     this.counters.decisions!++;
@@ -777,6 +876,37 @@ export class Sniper {
       this.endRun(run, 'failed', `error: ${(e as Error).message}`);
     }
     return run;
+  }
+
+  /**
+   * N15 / NEW-4 / NEW-6 (memory only): a FIXED buyEth above maxQuoteIn is refused (the preset can
+   * never buy); a bankroll size was already clamped to the caps, and is refused only when that left
+   * it below `minEth`; a remaining spend budget below quoteIn is refused (`spend_budget_exhausted`).
+   */
+  private limitsCheck(run: SnipeRun, p: Preset): { reasons: string[]; budgetExhausted: boolean } {
+    const reasons: string[] = [];
+    let budgetExhausted = false;
+    const mq = this.limits.maxQuoteIn;
+    const bankroll = p.sizing?.mode === 'bankroll';
+    if (!bankroll && mq !== null && run.quoteIn > mq) reasons.push(`preset buys up to ${p.buyEth} ETH > contract maxQuoteIn ${formatEther(mq)} ETH (preset refused)`);
+    const avail = this.limits.available();
+    if (bankroll && run.sizing?.clamped === 'contract' && run.quoteIn < parseEther(String(p.sizing.minEth))) {
+      reasons.push(`bankroll size clamped to the contract cap ${formatEther(run.quoteIn)} ETH < minEth ${p.sizing.minEth}`);
+      budgetExhausted = avail !== null && (mq === null || avail < mq);
+    } else if (avail !== null && avail < run.quoteIn) {
+      const b = this.limits.budget!;
+      reasons.push(`spend budget exhausted: ${formatEther(avail)} ETH left < quoteIn ${formatEther(run.quoteIn)} ETH (${formatEther(b.maxSpend)} ETH per ${b.window} s, refilling)`);
+      budgetExhausted = true;
+    }
+    return { reasons, budgetExhausted };
+  }
+
+  /** Paper twin of the live L8 contract-balance pre-check: the simulated contract balance must cover quoteIn. */
+  private paperPreflight(run: SnipeRun): string[] {
+    const bank = this.paperBank;
+    if (!bank) return [];
+    const free = bank.freeWeiExcluding(run.key);
+    return free < run.quoteIn ? [`paper: contract balance ${formatEther(free)} ETH < quoteIn ${formatEther(run.quoteIn)} ETH`] : [];
   }
 
   /** A run ends without a position: release its slot exactly once. */
@@ -945,7 +1075,7 @@ export class Sniper {
       this.endRun(run, 'aborted', `risk: ${sc.reasons.join('; ')}`);
       return;
     }
-    const pf = this.o.backend.preflight?.({ quoteIn: run.quoteIn, gasLimit: p.gasLimit, maxFeeGwei: this.risk.maxFeeGwei(p) }) ?? [];
+    const pf = this.o.backend.preflight?.({ quoteIn: run.quoteIn, gasLimit: p.gasLimit, maxFeeGwei: this.risk.maxFeeGwei(p) }) ?? this.paperPreflight(run);
     if (pf.length) {
       if (pf.some((r) => r.includes('balance'))) this.alert('low_balance', { key: run.key, reasons: pf }, 'error');
       this.endRun(run, 'aborted', `preflight: ${pf.join('; ')}`);
@@ -975,20 +1105,68 @@ export class Sniper {
       return;
     }
     if (this.o.mode === 'live' && run.burst.some((m) => m.status !== 'skipped' && m.status !== 'planned')) {
-      const rec = await this.recoverFill(run);
-      if (rec === 'unknown') {
-        run.notes.push('UNRESOLVED: no fill seen and the chain could not be read; retrying');
-        this.unresolvedRuns.set(run.key, run);
-        this.alert('snipe_unresolved', { key: run.key, token, curve }, 'error');
-        return;
-      }
-      if (rec) {
-        this.onFill(run, rec);
-        return;
-      }
+      const v = await this.settleNoFill(run);
+      if (v !== 'no_buy') return; // filled, or kept unresolved (slot held) and retried
     }
     // (status is mutated by abortRun while we await: read it through a function, not narrowed)
     this.endRun(run, 'failed', statusOf(run) === 'aborted' ? 'no fill after the abort' : 'no burst member bought');
+  }
+
+  /**
+   * H3 + NEW-3: the burst reported no fill. "No buy" is final only when the contract's state was
+   * read at a block PAST `deadlineBlock` (members expire there; the chain head is read BEFORE
+   * bought()/balanceOf(), so a member landing in between cannot be missed). Until then — a stalled
+   * sequencer, a backlog — the run stays unresolved with its MAX_CONCURRENT slot held and is
+   * retried (soon, and by the reconcile timer); an unreadable chain likewise (`snipe_unresolved`).
+   */
+  private async settleNoFill(run: SnipeRun): Promise<'filled' | 'pending' | 'no_buy'> {
+    const first = !this.unresolvedRuns.has(run.key);
+    const head = await this.o.chain.getBlockNumber().catch(() => null);
+    const rec = await this.recoverFill(run);
+    if (rec === 'unknown') {
+      if (first) {
+        run.notes.push('UNRESOLVED: no fill seen and the chain could not be read; retrying');
+        this.alert('snipe_unresolved', { key: run.key, token: run.launch.token, curve: run.launch.curve }, 'error');
+      }
+      this.unresolvedRuns.set(run.key, run);
+      return 'pending';
+    }
+    if (rec) {
+      this.unresolvedRuns.delete(run.key);
+      this.onFill(run, rec);
+      return 'filled';
+    }
+    if (head === null || head <= run.deadlineBlock) {
+      if (first) {
+        run.notes.push(`no fill seen yet but the chain head (${head ?? 'unknown'}) has not passed the deadline block ${run.deadlineBlock}: run kept (slot held) until it has (NEW-3)`);
+        this.o.logger.info({ key: run.key, head, deadlineBlock: run.deadlineBlock }, 'no fill yet; waiting for the burst deadline');
+      }
+      this.unresolvedRuns.set(run.key, run);
+      this.retrySoon(run, head);
+      return 'pending';
+    }
+    this.unresolvedRuns.delete(run.key);
+    return 'no_buy';
+  }
+
+  /** NEW-3: re-check a run waiting for its deadline block about when the head should pass it. */
+  private retrySoon(run: SnipeRun, head: number | null): void {
+    const ms = Math.min(10_000, Math.max(500, ((head === null ? 10 : run.deadlineBlock - head) + 1) * 100 + 300));
+    const t = setTimeout(() => {
+      void this.retryUnresolved(run).catch((e: unknown) => this.error(`unresolved run ${run.key}`, e));
+    }, ms);
+    t.unref?.();
+  }
+
+  private async retryUnresolved(run: SnipeRun): Promise<void> {
+    if (!this.unresolvedRuns.has(run.key) || this.settling.has(run.key) || run.ended) return;
+    this.settling.add(run.key);
+    try {
+      const v = await this.settleNoFill(run);
+      if (v === 'no_buy') this.endRun(run, 'failed', `no burst member bought (chain read past the deadline block ${run.deadlineBlock})`);
+    } finally {
+      this.settling.delete(run.key);
+    }
   }
 
   /** Any fill opens a position; a fill on an aborted run exits at once (H2). */
@@ -998,6 +1176,7 @@ export class Sniper {
     run.status = 'open';
     this.unresolvedRuns.delete(run.key);
     this.counters.fills!++;
+    this.limits.charge(fill.quoteIn); // NEW-4: our own buy used spend budget (the next chain read replaces the estimate)
     if (fill.recovered) this.counters.fills_recovered!++;
     // team set: the launch's exemptions plus any wallet exempted later in the launch second
     const team = [...new Set([...run.launch.event.exemptions.map((x) => x.toLowerCase()), ...(run.ledger?.exemptions ?? [])])];
@@ -1012,7 +1191,7 @@ export class Sniper {
       this.counters.fills_after_abort!++;
       run.notes.push(`filled after the abort (member already in flight): exiting immediately`);
       this.alert('fill_after_abort', { key: run.key, token: pos.token, why: abortedFor }, 'error');
-      this.positions.forceExit(run.key, 'exempt_dump');
+      this.positions.forceExit(run.key, run.abortExit ?? 'exempt_dump');
     }
   }
 
@@ -1130,14 +1309,109 @@ export class Sniper {
         /* next tick */
       }
     }
-    for (const run of [...this.unresolvedRuns.values()]) {
-      const rec = await this.recoverFill(run);
-      if (rec === 'unknown') continue;
-      this.unresolvedRuns.delete(run.key);
-      if (rec) this.onFill(run, rec);
-      else this.endRun(run, 'failed', 'no burst member bought (chain checked)');
-    }
+    for (const run of [...this.unresolvedRuns.values()]) await this.retryUnresolved(run);
     await this.positions.recheck();
+    await this.pruneFeedBlocks();
+  }
+
+  /** `feed_blocks` retention (FEED_BLOCKS_RETENTION_DAYS, default 7): at most hourly, from the reconcile timer. */
+  async pruneFeedBlocks(now = Date.now()): Promise<number> {
+    const days = this.o.feedBlocksRetentionDays ?? 7;
+    if (days <= 0 || now - this.lastFeedPrune < 3_600_000) return 0;
+    this.lastFeedPrune = now;
+    const n = await this.o.store.pruneFeedBlocks(new Date(now - days * 86_400_000));
+    if (n > 0) this.o.logger.info({ deleted: n, days }, 'feed_blocks pruned');
+    return n;
+  }
+
+  // ------------------------------------------------------------------ startup orphan sweep (NEW-3)
+  /**
+   * Every token the contract bought (`Sniped` events since the stored checkpoint; the first run
+   * looks back `sweepLookbackBlocks`) that still has a balance but is not managed — no position,
+   * no unresolved run or row — becomes a position again (`orphan_position_recovered`, error). Its
+   * newest failed/aborted row is reused (its preset, its notes); otherwise a new row is written.
+   * The checkpoint advances only when every token could be read.
+   */
+  async sweepOrphans(): Promise<number> {
+    const sniper = this.o.sniperContract;
+    const lookback = this.o.sweepLookbackBlocks ?? 864_000;
+    if (this.o.mode !== 'live' || !sniper || lookback <= 0) return 0;
+    const key = `sniped_sweep:${sniper.toLowerCase()}`;
+    const head = await this.o.chain.getBlockNumber();
+    const cp = await this.o.store.getCursor(key);
+    const from = cp !== null ? cp + 1 : Math.max(0, head - lookback);
+    if (from > head) return 0;
+    const latest = new Map<string, SnipedLog>();
+    for (const ev of await this.o.chain.snipedLogs(sniper, from, head)) latest.set(ev.token.toLowerCase(), ev);
+    let recovered = 0;
+    let complete = true;
+    for (const ev of latest.values()) {
+      if (this.managesToken(ev.token)) continue;
+      try {
+        const h = await this.o.chain.readSniper(sniper, ev.token);
+        if (h.balance <= 0n || this.managesToken(ev.token)) continue;
+        await this.adoptOrphan(ev, h.balance);
+        recovered++;
+      } catch (e) {
+        complete = false;
+        this.error(`orphan sweep: ${ev.token} could not be read`, e);
+      }
+    }
+    if (complete) await this.o.store.setCursor(key, head);
+    this.o.logger.info({ from, head, sniped: latest.size, recovered, complete }, 'startup orphan sweep done');
+    return recovered;
+  }
+
+  /** A position, a run (in flight or unresolved) or an unresolved startup row already covers `token`. */
+  private managesToken(token: string): boolean {
+    const t = token.toLowerCase();
+    if (this.positions.open.some((p) => p.token.toLowerCase() === t)) return true;
+    if ([...this.runs.values()].some((r) => r.launch.token?.toLowerCase() === t)) return true;
+    return [...this.unresolvedRows.values()].some((r) => r.token.toLowerCase() === t);
+  }
+
+  private async adoptOrphan(ev: SnipedLog, balance: bigint): Promise<void> {
+    const rows = await this.o.store.findSnipesByToken(ev.token, 'live');
+    const prev = rows[0];
+    const reusable = prev && (prev.status === 'failed' || prev.status === 'aborted') ? prev : undefined;
+    const ts = this.blockTs.get(ev.block) ?? (await this.o.chain.getBlockTimestamp(ev.block).catch(() => 0));
+    const fromRow = reusable ? decisionOf(reusable) : null;
+    const dec: StoredDecision = fromRow ?? {
+      playName: 'orphan (startup sweep)',
+      preset: {},
+      reasons: [`orphan recovered by the startup sweep: Sniped at block ${ev.block} (${ev.txHash})`],
+      event: { deployer: ZERO as Address, name: '', symbol: '', launchKind: 'launchToken', exemptions: [], creatorFeeRecipient: ZERO as Address, creatorTaxBps: 0, devBuyQuoteIn: 0n, pairToken: ZERO as Address, launchConfigId: 0n },
+      block: Math.max(0, ev.block - 1),
+      ts: ts > 0 ? ts - 1 : 0,
+      txHash: ev.txHash,
+      deadlineBlock: 0,
+    };
+    // a closed row whose cost was booked already: the leftover is free (cost 0); no row: the buy's own cost
+    const cost = reusable ? (reusable.quoteIn ?? ev.quoteIn) : prev ? 0n : ev.quoteIn;
+    const row: ActiveSnipe = reusable
+      ? { ...reusable, curve: reusable.curve || ev.curve, quoteIn: cost, tokensOut: reusable.tokensOut ?? ev.tokensOut, buyBlock: reusable.buyBlock ?? ev.block }
+      : {
+          id: 0,
+          playId: 0,
+          token: ev.token,
+          curve: ev.curve,
+          mode: 'live',
+          status: 'open',
+          decidedAt: new Date(ts > 0 ? ts * 1000 : Date.now()),
+          decision: null,
+          quoteIn: cost,
+          tokensOut: ev.tokensOut,
+          entryPrice: cost > 0n && ev.tokensOut > 0n ? Number(cost) / Number(ev.tokensOut) : null,
+          buyBlock: ev.block,
+          sells: [],
+        };
+    const sells = reusable ? salesOf(reusable.sells) : [];
+    this.rebuild(row, dec, balance, sells, sells.reduce((a, s) => a + s.quoteOut, 0n), 'orphan');
+    this.alert(
+      'orphan_position_recovered',
+      { token: ev.token, curve: ev.curve, balance: balance.toString(), snipedBlock: ev.block, tx: ev.txHash, previousRow: prev?.id ?? null, previousStatus: prev?.status ?? null },
+      'error',
+    );
   }
 
   private async markRow(row: ActiveSnipe, status: 'failed' | 'closed', note: string, realizedPnlEth?: number): Promise<void> {
@@ -1170,6 +1444,8 @@ export class Sniper {
       this.alert('stale_snipe_failed', { snipeId: row.id, reason: 'no token' });
       return;
     }
+    // NEW-3: the head BEFORE bought()/balanceOf(): only a read past the deadline block proves "no buy"
+    const head = dec && dec.deadlineBlock > 0 ? await this.o.chain.getBlockNumber() : null;
     const h = await this.o.chain.readSniper(this.o.sniperContract, token); // throws → unresolved, retried
     if (h.balance > 0n) {
       if (!dec) throw new Error(`row ${row.id}: decision JSON unreadable`);
@@ -1183,17 +1459,14 @@ export class Sniper {
       this.alert('position_closed_externally', { snipeId: row.id, token, realizedEth: pnl }, 'error');
       return;
     }
-    // N12: members of an unfinished burst may still land until the deadline block
-    if (dec && dec.deadlineBlock > 0) {
-      const head = await this.o.chain.getBlockNumber();
-      if (head < dec.deadlineBlock) throw new NotFinalYet(`chain head ${head} < burst deadline ${dec.deadlineBlock}`);
-    }
+    // N12 / NEW-3: members of an unfinished burst may still land up to the deadline block
+    if (dec && head !== null && head <= dec.deadlineBlock) throw new NotFinalYet(`chain head ${head} ≤ burst deadline ${dec.deadlineBlock}`);
     await this.markRow(row, 'failed', `reconciled at startup: chain shows no buy (bought=false) — stale ${row.status} row`);
     this.alert('stale_snipe_failed', { snipeId: row.id, token, status: row.status });
   }
 
   /** Re-create the run + position of a row from chain state (tokens held = `balance`). */
-  private rebuild(row: ActiveSnipe, dec: StoredDecision, balance: bigint, sells: SaleRecord[], realized: bigint): void {
+  private rebuild(row: ActiveSnipe, dec: StoredDecision, balance: bigint, sells: SaleRecord[], realized: bigint, how: 'startup' | 'orphan' = 'startup'): void {
     const token = row.token.toLowerCase() as Address;
     const curve = row.curve.toLowerCase() as Address;
     const play = parsePlay({ id: row.playId, name: dec.playName, enabled: true, trigger: {}, preset: dec.preset });
@@ -1214,7 +1487,7 @@ export class Sniper {
     const tokensOut = row.tokensOut ?? balance;
     const run: SnipeRun = {
       id: row.id,
-      key: `restored:${row.id}`,
+      key: row.id > 0 ? `restored:${row.id}` : `orphan:${token}`,
       mode: this.o.mode,
       playId: row.playId,
       launch,
@@ -1226,7 +1499,11 @@ export class Sniper {
       maxTaxBps: Math.min(MAX_TAX_BPS, preset.maxTaxBps),
       deadlineBlock: dec.block + (this.o.deadlineBlocks ?? 40),
       burst: [],
-      notes: [`rebuilt at startup from chain state (balance ${balance})`],
+      notes: [
+        how === 'orphan'
+          ? `orphan recovered by the startup sweep (balance ${balance}; previous row status ${row.id > 0 ? row.status : 'none'}) (NEW-3)`
+          : `rebuilt at startup from chain state (balance ${balance})`,
+      ],
       confirmed: true,
       slot: true,
     };
@@ -1242,7 +1519,7 @@ export class Sniper {
     };
     run.fill = fill;
     this.curveTax.set(curve, event.creatorTaxBps);
-    this.recorder.adopt(run);
+    if (row.id > 0) this.recorder.adopt(run); // no row (orphan): the first write inserts one
     this.runs.set(run.key, run);
     this.risk.adoptPosition(run.playId, token, event.deployer);
     this.paperBank?.commit(run.key, quoteIn);
@@ -1254,8 +1531,8 @@ export class Sniper {
       tpHit: sells.filter((s) => /^tp\d+$/.test(s.reason)).length,
     });
     this.counters.positions_rebuilt!++;
-    this.recorder.snipe(run, pos, 'snipe_update');
-    this.alert('position_rebuilt', { snipeId: row.id, token, balance: balance.toString(), previousStatus: row.status }, row.status === 'pending' ? 'error' : 'warn');
+    this.recorder.snipe(run, pos, how === 'orphan' ? 'snipe_recovered' : 'snipe_update');
+    if (how === 'startup') this.alert('position_rebuilt', { snipeId: row.id, token, balance: balance.toString(), previousStatus: row.status }, row.status === 'pending' ? 'error' : 'warn');
     this.seedReserves(pos, undefined);
   }
 

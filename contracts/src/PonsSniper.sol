@@ -27,9 +27,11 @@ interface IArbSys {
 ///         (default: the current owner); if the receiver cannot take ETH they stay here and
 ///         the owner sweeps them with `sweepEth` — an exit never reverts because of the receiver.
 ///         Operator keys are hot: they can only buy real Pons curves (verified against the
-///         immutable factory), at most `maxQuoteIn` per token, once per token, at most
-///         `maxSpendPerWindow` per rolling `spendWindow` seconds in total, and they can only
-///         sell into those curves; they cannot move ETH or tokens anywhere else.
+///         immutable factory), at most `maxQuoteIn` per token, once per token, within a
+///         decaying spend budget (at most `maxSpendPerWindow` at once, refilling at
+///         `maxSpendPerWindow / spendWindow` per second), only until the burst's block AND
+///         wall-clock deadlines, and they can only sell into those curves; they cannot move ETH
+///         or tokens anywhere else.
 contract PonsSniper {
     // ---------------------------------------------------------------- errors / events
     error NotOwner();
@@ -45,6 +47,7 @@ contract PonsSniper {
     error UnknownCurve();
     error NotPendingOwner();
     error SpendLimitExceeded(uint256 spent, uint256 quoteIn, uint256 maxSpend);
+    error InvalidSpendWindow();
 
     event Sniped(address indexed token, address indexed curve, uint256 quoteIn, uint256 tokensOut, uint256 taxBps);
     event Exited(address indexed token, address indexed curve, uint256 tokensIn, uint256 quoteOut);
@@ -53,6 +56,7 @@ contract PonsSniper {
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event MaxQuoteInSet(uint256 maxQuoteIn);
     event SpendLimitSet(uint256 maxSpendPerWindow, uint256 spendWindow);
+    event SpendLimitDisabled();
     event TreasurySet(address indexed treasury);
     event ProceedsSent(address indexed to, uint256 amount);
     event ProceedsHeld(address indexed to, uint256 amount);
@@ -73,13 +77,17 @@ contract PonsSniper {
     // ---------------------------------------------------------------- storage
     address public owner; // packed with maxQuoteIn (one slot)
     uint96 public maxQuoteIn;
-    /// @dev N4: a stolen operator key can buy a curve it controls (its own real Pons launch) and
-    ///      sandwich it; per snipe that costs at most maxQuoteIn, and this budget caps the total
-    ///      buy volume per window. `spendWindow == 0` disables the budget (owner's explicit choice).
+    /// @dev N4 / NEW-5: a stolen operator key can buy a curve it controls (its own real Pons
+    ///      launch) and sandwich it; per snipe that costs at most maxQuoteIn, and this DECAYING
+    ///      budget (a leaky bucket) caps the total: `spendLevel` drains at
+    ///      `maxSpendPerWindow / spendWindow` wei per second and a buy must keep it at or below
+    ///      `maxSpendPerWindow`. So at most `maxSpendPerWindow` can be bought at once and at most
+    ///      `maxSpendPerWindow × (1 + t / spendWindow)` in ANY interval of t seconds (no 2× burst
+    ///      across a window boundary). `spendWindow == 0` only via `disableSpendLimit()`.
     uint96 public maxSpendPerWindow; // packed with spendWindow (one slot)
     uint32 public spendWindow;
-    uint64 public windowStart; // packed with spentInWindow (one slot)
-    uint96 public spentInWindow;
+    uint64 public spendUpdatedAt; // packed with spendLevel (one slot)
+    uint96 public spendLevel;
     address public pendingOwner;
     /// @dev receiver of exit proceeds; address(0) = the current owner, address(this) = keep here
     address payable public treasury;
@@ -92,11 +100,13 @@ contract PonsSniper {
 
     constructor(address owner_, address operator_, address factory_, uint96 maxQuoteIn_, uint96 maxSpendPerWindow_, uint32 spendWindow_) {
         if (owner_ == address(0) || factory_ == address(0)) revert ZeroAddress();
+        if (spendWindow_ == 0) revert InvalidSpendWindow(); // "off" is an explicit disableSpendLimit()
         owner = owner_;
         factory = factory_;
         maxQuoteIn = maxQuoteIn_;
         maxSpendPerWindow = maxSpendPerWindow_;
         spendWindow = spendWindow_;
+        spendUpdatedAt = uint64(block.timestamp);
         emit OwnershipTransferred(address(0), owner_);
         emit MaxQuoteInSet(maxQuoteIn_);
         emit SpendLimitSet(maxSpendPerWindow_, spendWindow_);
@@ -123,18 +133,21 @@ contract PonsSniper {
 
     // ---------------------------------------------------------------- hot path
     /// @notice Buy `token` on `curve` once, only if the snipe tax for this contract is ≤ maxTaxBps.
-    /// @dev Check order keeps revert paths cheap: deadline, tax cap, auth, bought, tax; the buy
-    ///      path then checks maxQuoteIn, the rolling spend budget and that `curve` is the
-    ///      factory's curve for `token`.
+    /// @dev Check order keeps revert paths cheap: deadlines, tax cap, auth, bought, tax; the buy
+    ///      path then checks maxQuoteIn, the spend budget and that `curve` is the factory's curve
+    ///      for `token`. NEW-3: `deadlineTs` (wall clock, the executor passes launch ts + 3) stops a
+    ///      member held back by a stalled sequencer from buying long after the launch: while no
+    ///      blocks are produced the L2 block number does not advance, the timestamp does.
     function snipe(
         address curve,
         address token,
         uint256 quoteIn,
         uint256 minTokensOut,
         uint16 maxTaxBps,
-        uint64 deadlineBlock
+        uint64 deadlineBlock,
+        uint64 deadlineTs
     ) external payable {
-        if (_blockNumber() > deadlineBlock) revert Expired();
+        if (block.timestamp > deadlineTs || _blockNumber() > deadlineBlock) revert Expired();
         if (maxTaxBps >= TAX_CAP_LIMIT) revert MaxTaxTooHigh();
         // operators first: the burst key is an operator, so the common case costs one SLOAD
         if (!operators[msg.sender] && msg.sender != owner) revert NotOperator();
@@ -179,11 +192,33 @@ contract PonsSniper {
         emit TreasurySet(t);
     }
 
-    /// @notice Rolling buy budget: at most `maxSpend` wei of quoteIn per `window` seconds (0 = off).
+    /// @notice Decaying buy budget: at most `maxSpend` wei of quoteIn at once, refilling at
+    ///         `maxSpend / window` per second. `window` must be > 0 (`setSpendLimit(0, 1)` is the
+    ///         buy stop; turning the budget off is the separate `disableSpendLimit()`). The level
+    ///         spent so far is carried over (decayed under the old parameters; 0 if it was off).
     function setSpendLimit(uint96 maxSpend, uint32 window) external onlyOwner {
+        if (window == 0) revert InvalidSpendWindow();
+        uint256 w = spendWindow;
+        spendLevel = uint96(w == 0 ? 0 : _decayedLevel(w, maxSpendPerWindow));
+        spendUpdatedAt = uint64(block.timestamp);
         maxSpendPerWindow = maxSpend;
         spendWindow = window;
         emit SpendLimitSet(maxSpend, window);
+    }
+
+    /// @notice Turn the spend budget OFF (explicit; `setSpendLimit` re-enables it).
+    function disableSpendLimit() external onlyOwner {
+        spendWindow = 0;
+        emit SpendLimitDisabled();
+    }
+
+    /// @notice What `snipe` may still spend right now (type(uint256).max when the budget is off).
+    function spendAvailable() external view returns (uint256) {
+        uint256 w = spendWindow;
+        if (w == 0) return type(uint256).max;
+        uint256 limit = maxSpendPerWindow;
+        uint256 level = _decayedLevel(w, limit);
+        return level >= limit ? 0 : limit - level;
     }
 
     function setMaxQuoteIn(uint96 v) external onlyOwner {
@@ -263,21 +298,23 @@ contract PonsSniper {
         else emit ProceedsHeld(to, amount);
     }
 
-    /// @dev N4: charge `quoteIn` against the rolling window budget (a new window starts when the
-    ///      current one is `spendWindow` seconds old).
+    /// @dev N4 / NEW-5: charge `quoteIn` against the decaying budget. Before adding, the level
+    ///      drains by `limit × elapsed / window` (floored at 0), so the bound holds continuously.
     function _spend(uint256 quoteIn) internal {
         uint256 window = spendWindow;
         if (window == 0) return;
-        uint256 start = windowStart;
-        uint256 spent = spentInWindow;
-        if (block.timestamp >= start + window) {
-            start = block.timestamp;
-            spent = 0;
-        }
         uint256 limit = maxSpendPerWindow;
-        if (spent + quoteIn > limit) revert SpendLimitExceeded(spent, quoteIn, limit);
-        windowStart = uint64(start);
-        spentInWindow = uint96(spent + quoteIn);
+        uint256 level = _decayedLevel(window, limit);
+        if (level + quoteIn > limit) revert SpendLimitExceeded(level, quoteIn, limit);
+        spendLevel = uint96(level + quoteIn);
+        spendUpdatedAt = uint64(block.timestamp);
+    }
+
+    /// @dev `spendLevel` drained for the time since `spendUpdatedAt` (limit ≤ 2^96, elapsed ≤ 2^64: no overflow).
+    function _decayedLevel(uint256 window, uint256 limit) internal view returns (uint256) {
+        uint256 level = spendLevel;
+        uint256 leak = (limit * (block.timestamp - spendUpdatedAt)) / window;
+        return level > leak ? level - leak : 0;
     }
 
     /// @dev `curve` must be the factory's curve for `token` (a hot operator key cannot point the

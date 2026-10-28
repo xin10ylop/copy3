@@ -38,7 +38,8 @@ export interface ActiveSnipe {
   token: string;
   curve: string;
   mode: 'live' | 'paper';
-  status: 'pending' | 'open' | 'aborted';
+  /** pending / open / aborted from `loadActiveSnipes`; any status from `findSnipesByToken` */
+  status: SnipeRecord['status'];
   decidedAt: Date;
   decision: unknown;
   quoteIn: bigint | null;
@@ -79,12 +80,24 @@ export interface SniperStore {
   /** risk aggregates for ONE mode (paper runs never affect live limits and vice versa) */
   loadSnipeStats(since: Date, mode: 'live' | 'paper'): Promise<SnipeStats>;
   loadActiveSnipes(mode: 'live' | 'paper'): Promise<ActiveSnipe[]>;
-  onChange(cb: (channel: ChangeChannel, payload: string) => void): Promise<() => Promise<void>>;
+  /**
+   * NOTIFY subscription. `onConnect` runs on every (re)connect of the LISTEN connection: postgres.js
+   * re-LISTENs after a reconnect but never replays what was NOTIFYed meanwhile, so the caller
+   * reloads its state there (NEW-2).
+   */
+  onChange(cb: (channel: ChangeChannel, payload: string) => void, onConnect?: () => void): Promise<() => Promise<void>>;
   insertSnipe(s: SnipeRecord): Promise<number>;
   updateSnipe(id: number, patch: Partial<SnipeRecord>): Promise<void>;
   insertEvent(e: EventRecord): Promise<void>;
   notifySnipeEvent(payload: string): Promise<void>;
   insertFeedBlocks(rows: FeedBlockRow[]): Promise<void>;
+  /** delete feed_blocks rows older than `before` (FEED_BLOCKS_RETENTION_DAYS); returns how many */
+  pruneFeedBlocks(before: Date): Promise<number>;
+  /** every row of `token` in this mode, newest first (startup orphan sweep, NEW-3) */
+  findSnipesByToken(token: string, mode: 'live' | 'paper'): Promise<ActiveSnipe[]>;
+  /** a persisted block cursor (e.g. the Sniped-event sweep checkpoint); null = never set */
+  getCursor(key: string): Promise<number | null>;
+  setCursor(key: string, block: number): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -102,6 +115,7 @@ export class MemoryStore implements SniperStore {
   events: EventRecord[] = [];
   notifications: string[] = [];
   feedBlocks: FeedBlockRow[] = [];
+  cursors = new Map<string, number>();
   private nextId = 1;
   private listeners: ((c: ChangeChannel, p: string) => void)[] = [];
 
@@ -142,33 +156,55 @@ export class MemoryStore implements SniperStore {
       playDeployers: [...deployers.values()],
     };
   }
+  private static active(id: number, s: SnipeRecord): ActiveSnipe {
+    return {
+      id,
+      playId: s.playId,
+      token: s.token,
+      curve: s.curve,
+      mode: s.mode,
+      status: s.status as ActiveSnipe['status'],
+      decidedAt: s.decidedAt,
+      decision: s.decision,
+      quoteIn: s.quoteIn ?? null,
+      tokensOut: s.tokensOut ?? null,
+      entryPrice: s.entryPrice ?? null,
+      buyBlock: s.buyBlock ?? null,
+      sells: s.sells,
+    };
+  }
   async loadActiveSnipes(mode: 'live' | 'paper'): Promise<ActiveSnipe[]> {
     return [...this.snipes.entries()]
       .filter(([, s]) => s.mode === mode && (s.status === 'pending' || s.status === 'open' || (s.status === 'aborted' && inFlight(s.burst))))
-      .map(([id, s]) => ({
-        id,
-        playId: s.playId,
-        token: s.token,
-        curve: s.curve,
-        mode: s.mode,
-        status: s.status as ActiveSnipe['status'],
-        decidedAt: s.decidedAt,
-        decision: s.decision,
-        quoteIn: s.quoteIn ?? null,
-        tokensOut: s.tokensOut ?? null,
-        entryPrice: s.entryPrice ?? null,
-        buyBlock: s.buyBlock ?? null,
-        sells: s.sells,
-      }));
+      .map(([id, s]) => MemoryStore.active(id, s));
   }
-  async onChange(cb: (channel: ChangeChannel, payload: string) => void): Promise<() => Promise<void>> {
+  async findSnipesByToken(token: string, mode: 'live' | 'paper'): Promise<ActiveSnipe[]> {
+    return [...this.snipes.entries()]
+      .filter(([, s]) => s.mode === mode && s.token.toLowerCase() === token.toLowerCase())
+      .sort(([a], [b]) => b - a)
+      .map(([id, s]) => MemoryStore.active(id, s));
+  }
+  /** test helper: the LISTEN connection (re)connected */
+  reconnect(): void {
+    for (const c of this.connectListeners) c();
+  }
+  private connectListeners: (() => void)[] = [];
+  /** test helper: drop NOTIFYs (a LISTEN connection that is down) */
+  dropNotifications = false;
+  async onChange(cb: (channel: ChangeChannel, payload: string) => void, onConnect?: () => void): Promise<() => Promise<void>> {
     this.listeners.push(cb);
+    if (onConnect) {
+      this.connectListeners.push(onConnect);
+      onConnect(); // postgres.js calls onlisten once the first LISTEN is up, too
+    }
     return async () => {
       this.listeners = this.listeners.filter((l) => l !== cb);
+      if (onConnect) this.connectListeners = this.connectListeners.filter((l) => l !== onConnect);
     };
   }
   /** test helper: simulate NOTIFY */
   emitChange(channel: ChangeChannel, payload = ''): void {
+    if (this.dropNotifications) return;
     for (const l of this.listeners) l(channel, payload);
   }
   async insertSnipe(s: SnipeRecord): Promise<number> {
@@ -189,6 +225,17 @@ export class MemoryStore implements SniperStore {
   async insertFeedBlocks(rows: FeedBlockRow[]): Promise<void> {
     this.feedBlocks.push(...rows);
     if (this.feedBlocks.length > 10_000) this.feedBlocks.splice(0, this.feedBlocks.length - 10_000);
+  }
+  async pruneFeedBlocks(before: Date): Promise<number> {
+    const n = this.feedBlocks.length;
+    this.feedBlocks = this.feedBlocks.filter((r) => r.ts * 1000 >= before.getTime());
+    return n - this.feedBlocks.length;
+  }
+  async getCursor(key: string): Promise<number | null> {
+    return this.cursors.get(key) ?? null;
+  }
+  async setCursor(key: string, block: number): Promise<void> {
+    this.cursors.set(key, block);
   }
   async close(): Promise<void> {}
 }

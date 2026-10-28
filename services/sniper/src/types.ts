@@ -2,6 +2,7 @@
 import type { LaunchEvent, Play, Preset, Reserves } from '@hood/core';
 import type { Address, Hex } from 'viem';
 import type { LaunchSecondLedger } from './ledger.js';
+import type { ExitReason } from './position-logic.js';
 import type { SizeDecision } from './sizing.js';
 
 /** A launch seen on the feed (or recovered from a TokenLaunched log in fallback mode). */
@@ -114,6 +115,8 @@ export interface SnipeRun {
   minTokensOut: bigint;
   maxTaxBps: number;
   deadlineBlock: number;
+  /** NEW-3: latest block timestamp a member may buy in (`snipe` reverts `Expired` after it); default launch ts + 3 */
+  deadlineTs?: number;
   plan?: { times: number[]; boundaryMs: number; latestMs: number; droppedPast: number; clipped: number; rttMs: number };
   burst: BurstMember[];
   fill?: Fill;
@@ -122,6 +125,8 @@ export interface SnipeRun {
   confirmed?: boolean;
   /** why the run was aborted while members were possibly in flight (H2: a later fill exits at once) */
   abortReason?: string;
+  /** exit reason for a fill that lands after the abort (default `exempt_dump`; NEW-7: `launch_receipt_mismatch`) */
+  abortExit?: ExitReason;
   /** risk slot released / run finished (guards double accounting) */
   ended?: boolean;
   /** the burst passed the last kill-switch / daily-loss check right before its first send (L2) */

@@ -18,6 +18,15 @@
  * SnipeTaxExempted) is a *team* buy; anything else is a taxed buy (99 % tax, ignored).
  * A hint is replaced by the logs of its tx once seen; a hint whose receipt failed (or shows no
  * CurveBuy from the curve) is refuted and never counts again.
+ *
+ * NEW-1 (reviewer round 3): feed hints are UNCONFIRMED — anyone can put a feed-visible
+ * `curve.buy(3 ETH, minOut = max)` that reverts (gas only). Hints therefore only ever WAKE the
+ * confirmation and drive the µs hint-stage match; they never price: `reservesAfter` and
+ * `priceMovingBuys` use confirmed CurveBuy logs only (their exact quoteIn / tokensOut / fee /
+ * creator tax). A confirmed buy is classified taxed vs untaxed by `CurveBuy.fee` (which includes
+ * the snipe tax: ≈ 1 % of quoteIn untaxed, ≈ 100 % in the launch second) — a wallet exempted
+ * AFTER it bought (`exemptFromSnipeTax` later in the second) is not a team buy for that buy. A log
+ * without a fee word falls back to the exemption order (block, logIndex).
  */
 import { CURVE_FEE_BPS, SELECTORS, TOPICS, quoteBuy, snipeTaxWeiFor, type DecodedTx, type RawLog, type Reserves } from '@hood/core';
 import type { Address, Hex } from 'viem';
@@ -47,7 +56,19 @@ export interface LedgerBuy {
   logIndex: number;
   source: 'feed' | 'log' | 'calldata';
   status: BuyStatus;
+  /** CurveBuy data (confirmed logs with all four words): exact pool deltas and the tax verdict */
+  tokensOut?: bigint;
+  /** CurveBuy.fee: curve fee + snipe tax (RESEARCH §8) */
+  fee?: bigint;
+  /** CurveBuy.tax: creator tax */
+  creatorTax?: bigint;
 }
+
+/**
+ * A confirmed buy whose fee exceeds this share of quoteIn paid a snipe tax (the curve fee is 1 %;
+ * the launch-second tax 99 %, +1 s 6.18 %). NEW-1.
+ */
+export const TAXED_FEE_BPS = 500n;
 
 export interface LedgerOut {
   txHash: string;
@@ -67,6 +88,8 @@ export class LaunchSecondLedger {
   private exempt: Set<string>;
   /** wallets exempted after the launch tx (SnipeTaxExempted in a later block of the second) */
   private readonly addedExempt = new Set<string>();
+  /** NEW-1: where (block, logIndex) each later exemption landed — a buy before it was taxed */
+  private readonly exemptedAt = new Map<string, { block: number; logIndex: number }>();
   /** waiters woken on every change (confirmation loops plan the burst the moment a log lands) */
   private waiters: (() => void)[] = [];
   /** feed hints by tx hash (one direct buy per tx) */
@@ -226,14 +249,20 @@ export class LaunchSecondLedger {
     const block = log.blockNumber === null || log.blockNumber === undefined ? this.launch.block : Number(log.blockNumber);
     const logIndex = log.logIndex === null || log.logIndex === undefined ? 0 : Number(log.logIndex);
     if (addr === this.curve && t0 === TOPICS.CurveBuy) {
-      const quoteIn = BigInt(`0x${log.data.slice(2, 66) || '0'}`);
-      return this.confirmBuy(hash, topicAddr(log.topics[2]), quoteIn, block, logIndex);
+      const w = (i: number): bigint | undefined => {
+        const hex = log.data.slice(2 + i * 64, 2 + (i + 1) * 64);
+        return hex.length === 64 ? BigInt(`0x${hex}`) : undefined;
+      };
+      const full = w(3) !== undefined;
+      return this.confirmBuy(hash, topicAddr(log.topics[2]), w(0) ?? 0n, block, logIndex, full ? { tokensOut: w(1)!, fee: w(2)!, creatorTax: w(3)! } : undefined);
     }
     if (addr === this.curve && t0 === TOPICS.SnipeTaxExempted) {
       // exemptFromSnipeTax during the launch second (deployer-only on the curve): a team wallet
+      // for the buys AFTER this log (NEW-1: an earlier buy paid the tax)
       const account = topicAddr(log.topics[1]);
       if (account === ZERO || this.exempt.has(account)) return false;
       this.addedExempt.add(account);
+      this.exemptedAt.set(account, { block, logIndex });
       this.exempt.add(account);
       return true;
     }
@@ -250,12 +279,19 @@ export class LaunchSecondLedger {
     return false;
   }
 
-  private confirmBuy(hash: string, recipient: string, quoteIn: bigint, block: number, logIndex: number): boolean {
+  private confirmBuy(
+    hash: string,
+    recipient: string,
+    quoteIn: bigint,
+    block: number,
+    logIndex: number,
+    data?: { tokensOut: bigint; fee: bigint; creatorTax: bigint },
+  ): boolean {
     const key = `${hash}:${logIndex}`;
     if (this.logs.has(key)) return false;
     this.loggedTx.add(hash);
     this.hints.delete(hash);
-    this.logs.set(key, { txHash: hash, recipient, quoteIn, block, logIndex, source: 'log', status: 'confirmed' });
+    this.logs.set(key, { txHash: hash, recipient, quoteIn, block, logIndex, source: 'log', status: 'confirmed', ...(data ?? {}) });
     return true;
   }
 
@@ -290,7 +326,20 @@ export class LaunchSecondLedger {
     return [...this.hints.values()].filter((h) => h.status === 'seen' && this.kindOf(h) !== 'other').map((h) => h.txHash as Hex);
   }
 
+  /**
+   * NEW-1: did this buy pay a snipe tax? Confirmed logs: by `CurveBuy.fee` (it includes the snipe
+   * tax). Without a fee word: by exemption order — a recipient exempted later in the second (at a
+   * later (block, logIndex)) was still taxed for this buy. Hints: unknown (false; they never price).
+   */
+  private paidSnipeTax(b: LedgerBuy): boolean {
+    if (b.status !== 'confirmed') return false;
+    if (b.fee !== undefined) return b.fee * 10_000n > b.quoteIn * TAXED_FEE_BPS;
+    const at = this.exemptedAt.get(b.recipient);
+    return at !== undefined && (b.block < at.block || (b.block === at.block && b.logIndex < at.logIndex));
+  }
+
   private kindOf(b: LedgerBuy): 'dev' | 'team' | 'other' {
+    if (this.paidSnipeTax(b)) return 'other';
     if (b.txHash === this.launchTx || b.recipient === this.deployer) return 'dev';
     return this.exempt.has(b.recipient) ? 'team' : 'other';
   }
@@ -329,31 +378,42 @@ export class LaunchSecondLedger {
     return [...this.outs.values()];
   }
 
+  /** NEW-1: the buys that price — CONFIRMED CurveBuy logs other than the launch tx's own, in chain order. */
+  private pricedBuys(): LedgerBuy[] {
+    return [...this.logs.values()].filter((b) => b.txHash !== this.launchTx).sort((a, b) => a.block - b.block || a.logIndex - b.logIndex);
+  }
+
   /**
-   * Curve reserves after the launch second as far as the ledger knows: `afterLaunch` (config start
-   * + the launchAndBuy dev buy) plus every other seen buy in block order — exempt buys untaxed,
-   * other buys at the 99 % launch-second snipe tax. This is the price our +1 s buy meets, so
-   * minTokensOut is computed against it (team buys move the price; AMLIL +49 %).
+   * Curve reserves after the launch second as far as the CHAIN has shown: `afterLaunch` (config
+   * start + the launchAndBuy dev buy) plus every CONFIRMED CurveBuy log of the second in chain
+   * order, applied with its exact numbers (quote += quoteIn − fee − creator tax, tokens −=
+   * tokensOut; fee includes the snipe tax). A log without the full data is applied by the curve
+   * formula, taxed (99 %) or not by `paidSnipeTax`. Feed hints never count (NEW-1): a reverting
+   * fake buy cannot loosen minTokensOut. This is the price our +1 s buy meets (team buys move the
+   * price; AMLIL +49 %).
    */
   reservesAfter(afterLaunch: Reserves, creatorTaxBps: number, feeBps = CURVE_FEE_BPS): Reserves {
     let r = afterLaunch;
-    const buys = this.all()
-      .filter((b) => b.txHash !== this.launchTx && (b.status === 'confirmed' || this.kindOf(b) !== 'other'))
-      .sort((a, b) => a.block - b.block || a.logIndex - b.logIndex);
-    for (const b of buys) {
-      const exempt = this.kindOf(b) !== 'other';
-      const snipeTax = exempt ? 0n : snipeTaxWeiFor(b.quoteIn, 9900);
-      const out = quoteBuy(r, b.quoteIn, feeBps, creatorTaxBps, snipeTax);
-      const net = b.quoteIn - (b.quoteIn * BigInt(feeBps)) / 10_000n - (b.quoteIn * BigInt(creatorTaxBps)) / 10_000n - snipeTax;
-      if (net <= 0n || out <= 0n) continue;
+    for (const b of this.pricedBuys()) {
+      let net: bigint;
+      let out: bigint;
+      if (b.tokensOut !== undefined && b.fee !== undefined && b.creatorTax !== undefined) {
+        net = b.quoteIn - b.fee - b.creatorTax;
+        out = b.tokensOut;
+      } else {
+        const snipeTax = this.paidSnipeTax(b) || this.kindOf(b) === 'other' ? snipeTaxWeiFor(b.quoteIn, 9900) : 0n;
+        out = quoteBuy(r, b.quoteIn, feeBps, creatorTaxBps, snipeTax);
+        net = b.quoteIn - (b.quoteIn * BigInt(feeBps)) / 10_000n - (b.quoteIn * BigInt(creatorTaxBps)) / 10_000n - snipeTax;
+      }
+      if (net <= 0n || out <= 0n || out >= r.token) continue;
       r = { quote: r.quote + net, token: r.token - out };
     }
     return r;
   }
 
-  /** Buys other than the launch tx's own that `reservesAfter` applies; 0 = nothing moved the price yet. */
+  /** Confirmed buys (other than the launch tx's own) that `reservesAfter` applies; 0 = nothing proven moved the price. */
   get priceMovingBuys(): number {
-    return this.all().filter((b) => b.txHash !== this.launchTx && (b.status === 'confirmed' || this.kindOf(b) !== 'other')).length;
+    return this.pricedBuys().length;
   }
 
   /** Compact JSON for the snipe record. */

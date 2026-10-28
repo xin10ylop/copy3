@@ -1,7 +1,7 @@
 import { TOPICS, type RawLog, type Reserves, type RpcTxLike } from '@hood/core';
 import type { Address, Hex } from 'viem';
 import type { StateOverride } from 'viem';
-import type { ChainClient, ReceiptLite, RecentLaunch, SniperConfigState, SniperHolding } from '../../src/chain.js';
+import type { ChainClient, ReceiptLite, RecentLaunch, SnipedLog, SniperConfigState, SniperHolding } from '../../src/chain.js';
 import type { RawSender, SendResult } from '../../src/rpc.js';
 
 export class FakeChain implements ChainClient {
@@ -73,6 +73,14 @@ export class FakeChain implements ChainClient {
   }
   async recentLaunches(_lookback: number, limit: number): Promise<RecentLaunch[]> {
     return this.recents.slice(0, limit);
+  }
+  /** PonsSniper Sniped events (startup orphan sweep) */
+  sniped: SnipedLog[] = [];
+  snipedRanges: [number, number][] = [];
+  async snipedLogs(_sniper: Address, from: number, to: number): Promise<SnipedLog[]> {
+    this.calls.push(`snipedLogs:${from}:${to}`);
+    this.snipedRanges.push([from, to]);
+    return this.sniped.filter((l) => l.block >= from && l.block <= to);
   }
   async readSniperConfig(_s: Address, keys: readonly Address[]): Promise<SniperConfigState> {
     if (!this.sniperConfig) throw new Error('no contract');

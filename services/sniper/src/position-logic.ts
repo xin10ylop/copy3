@@ -21,7 +21,7 @@ export interface PositionState {
   exemptOutflowPct: number;
 }
 
-export type ExitReason = 'exempt_dump' | 'stop_loss' | 'trailing' | 'timeout' | `tp${number}`;
+export type ExitReason = 'exempt_dump' | 'launch_receipt_mismatch' | 'stop_loss' | 'trailing' | 'timeout' | `tp${number}`;
 
 export interface ExitSignal {
   reason: ExitReason;

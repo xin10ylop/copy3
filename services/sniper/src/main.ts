@@ -61,6 +61,7 @@ async function main(): Promise<void> {
       receiptPollMs: cfg.BURST_RECEIPT_POLL_MS,
       exitReceiptTimeoutMs: cfg.EXIT_RECEIPT_TIMEOUT_MS,
       minGasBalanceWei: parseEther(String(cfg.MIN_GAS_BALANCE_ETH)),
+      exitKeys: cfg.EXIT_KEYS,
       fillerMaxFeeGwei: cfg.MAX_GAS_PRICE_GWEI,
       // N7: member statuses are final — update the run's row, never insert a second one
       onFinal: (run) => sniper?.recorder.update(run, sniper.positions.get(run.key), 'burst_final'),
@@ -106,6 +107,15 @@ async function main(): Promise<void> {
     exitBackoffMs: cfg.EXIT_BACKOFF_MS,
     maxExitBackoffMs: cfg.EXIT_MAX_BACKOFF_MS,
     stuckRearmMs: cfg.STUCK_REARM_MS,
+    settingsReloadMs: cfg.SETTINGS_RELOAD_MS,
+    playsReloadMs: cfg.PLAYS_RELOAD_MS,
+    feedBlocksRetentionDays: cfg.FEED_BLOCKS_RETENTION_DAYS,
+    sweepLookbackBlocks: cfg.SWEEP_LOOKBACK_BLOCKS,
+    paperLimits: {
+      maxQuoteIn: parseEther(String(cfg.PAPER_MAX_QUOTE_IN_ETH)),
+      maxSpend: parseEther(String(cfg.PAPER_MAX_SPEND_PER_WINDOW_ETH ?? cfg.PAPER_MAX_QUOTE_IN_ETH * 4)),
+      spendWindow: cfg.PAPER_SPEND_WINDOW_SEC,
+    },
     ...(sniperContract && cfg.EXECUTION_MODE === 'live' ? { sniperContract } : {}),
     nonce: () => live?.nonces.value ?? null,
   });
@@ -117,27 +127,34 @@ async function main(): Promise<void> {
   await s.start();
   if (live) {
     const exec = live;
+    const gateInput = async (gasCheck: boolean): Promise<Parameters<typeof liveStartupChecks>[0]> => {
+      const plays = (await store.loadPlays()).filter((p) => p.enabled);
+      const fixed = plays.filter((p) => p.preset.sizing.mode !== 'bankroll').map((p) => p.preset.buyEth);
+      const bankroll = plays.filter((p) => p.preset.sizing.mode === 'bankroll').map((p) => p.preset.sizing.maxEth);
+      return {
+        chain,
+        sniper: sniperContract!,
+        keys: exec.keys.map((k) => k.address),
+        estimateFrom: exec.burstKeys[0]!.address,
+        exitFrom: exec.exitKey.address,
+        gasLimit: plays.length ? Math.min(...plays.map((p) => p.preset.gasLimit)) : 300_000,
+        // fixed presets above maxQuoteIn are refused; bankroll sizes are clamped to it (NEW-6)
+        ...(fixed.length ? { maxBuyEth: Math.max(...fixed) } : {}),
+        ...(bankroll.length ? { maxBankrollEth: Math.max(...bankroll) } : {}),
+        allowHotOwner: cfg.ALLOW_HOT_OWNER,
+        gasCheck,
+        lookbackBlocks: cfg.GAS_CHECK_LOOKBACK_BLOCKS,
+      };
+    };
     gate = new LiveGate({
       logger,
       retryMs: cfg.GATE_RETRY_MS,
-      check: async () => {
-        const plays = (await store.loadPlays()).filter((p) => p.enabled);
-        return liveStartupChecks({
-          chain,
-          sniper: sniperContract!,
-          keys: exec.keys.map((k) => k.address),
-          estimateFrom: exec.burstKeys[0]!.address,
-          exitFrom: exec.exitKey.address,
-          gasLimit: plays.length ? Math.min(...plays.map((p) => p.preset.gasLimit)) : 300_000,
-          // bankroll sizing can buy up to sizing.maxEth
-          ...(plays.length ? { maxBuyEth: Math.max(...plays.map((p) => (p.preset.sizing.mode === 'bankroll' ? p.preset.sizing.maxEth : p.preset.buyEth))) } : {}),
-          allowHotOwner: cfg.ALLOW_HOT_OWNER,
-          gasCheck: cfg.GAS_CHECK,
-          lookbackBlocks: cfg.GAS_CHECK_LOOKBACK_BLOCKS,
-        });
-      },
+      refreshMs: cfg.GATE_REFRESH_MS,
+      check: async () => liveStartupChecks(await gateInput(cfg.GAS_CHECK)),
+      // NEW-8: the contract config (maxQuoteIn, spend budget, owner, operators) is re-read while passing
+      refresh: async () => liveStartupChecks(await gateInput(false)),
       onResult: (r) => {
-        s.setContractLimits({ maxQuoteIn: r.maxQuoteIn });
+        if (r.maxQuoteIn !== null) s.setContractLimits({ maxQuoteIn: r.maxQuoteIn, spend: r.spend ?? null });
         if (r.ok) s.risk.blockEntries(null);
         else {
           s.risk.blockEntries(`live gate: ${r.errors.join('; ')}`);

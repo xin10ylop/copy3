@@ -11,7 +11,7 @@
 import { CURVE_FEE_BPS, quoteBuy, quoteSell, snipeTaxBps, snipeTaxWeiFor, type FeedBlock, type Reserves } from '@hood/core';
 import type { Address } from 'viem';
 import type { ChainClient } from './chain.js';
-import type { ExecutionBackend, ExitOrder, ExitResult, SnipeOrder } from './executor.js';
+import { snipeDeadlineTs, type ExecutionBackend, type ExitOrder, type ExitResult, type SnipeOrder } from './executor.js';
 import type { Logger } from './log.js';
 import type { Fill } from './types.js';
 
@@ -81,8 +81,10 @@ export class PaperExecutor implements ExecutionBackend {
         }
         run.sendCleared = true;
       }
-      if (tax > run.maxTaxBps || b.block > run.deadlineBlock) {
-        if (elapsed >= 3 || b.block > run.deadlineBlock) {
+      // NEW-3: the contract also refuses blocks after the wall-clock deadline (launch ts + 3)
+      const expired = b.block > run.deadlineBlock || b.timestamp > snipeDeadlineTs(run);
+      if (tax > run.maxTaxBps || expired) {
+        if (elapsed >= 3 || expired) {
           this.pending.delete(key);
           this.stats.misses++;
           run.notes.push(`paper: no eligible block (tax ${tax} > max ${run.maxTaxBps} or past deadline)`);

@@ -100,6 +100,24 @@ export const ConfigSchema = z
     ALLOW_SINGLE_KEY: bool(false),
     /** retry the live gate this often while it fails (new entries blocked meanwhile, N1) */
     GATE_RETRY_MS: num(60_000),
+    /** NEW-8: while the gate passes, re-read the contract config (owner, operators, maxQuoteIn, spend budget) this often */
+    GATE_REFRESH_MS: num(60_000),
+    /** NEW-9: the first n executor keys serve exits (round-robin, a free key first); the rest are burst keys */
+    EXIT_KEYS: z.coerce.number().int().min(1).default(1),
+    /** NEW-2: re-read settings (kill switch) this often, whatever NOTIFY delivered */
+    SETTINGS_RELOAD_MS: num(10_000),
+    /** NEW-2: re-read plays and armed candidates this often */
+    PLAYS_RELOAD_MS: num(60_000),
+    /** keep feed_blocks rows this many days (pruned hourly); 0 = keep everything */
+    FEED_BLOCKS_RETENTION_DAYS: num(7),
+    /** NEW-3: startup sweep of the contract's Sniped events; the first run looks back this many blocks (0 = off) */
+    SWEEP_LOOKBACK_BLOCKS: num(864_000),
+    /** NEW-4/6 paper mode: the contract caps live would enforce (defaults = the deploy defaults) */
+    PAPER_MAX_QUOTE_IN_ETH: z.coerce.number().positive().default(0.3),
+    /** paper spend budget per PAPER_SPEND_WINDOW_SEC; unset = 4 × PAPER_MAX_QUOTE_IN_ETH */
+    PAPER_MAX_SPEND_PER_WINDOW_ETH: optNum,
+    /** paper spend window (s); 0 = budget off (like disableSpendLimit) */
+    PAPER_SPEND_WINDOW_SEC: z.coerce.number().int().min(0).default(3600),
   })
   .superRefine((c, ctx) => {
     if (c.EXECUTION_MODE === 'live') {
@@ -108,6 +126,8 @@ export const ConfigSchema = z
         ctx.addIssue({ code: 'custom', path: ['EXECUTOR_PRIVATE_KEYS'], message: 'live mode needs 0x-prefixed 32-byte keys (EXECUTOR_PRIVATE_KEYS, first = exit key)' });
       if (new Set(keys.map((k) => k.toLowerCase())).size !== keys.length)
         ctx.addIssue({ code: 'custom', path: ['EXECUTOR_PRIVATE_KEYS'], message: 'duplicate executor key' });
+      if (keys.length > 1 && c.EXIT_KEYS >= keys.length)
+        ctx.addIssue({ code: 'custom', path: ['EXIT_KEYS'], message: `EXIT_KEYS=${c.EXIT_KEYS} leaves no burst key among ${keys.length} executor keys` });
       if (keys.length === 1 && !c.ALLOW_SINGLE_KEY)
         ctx.addIssue({
           code: 'custom',

@@ -25,8 +25,8 @@ export interface SizeDecision {
   mode: 'fixed' | 'bankroll';
   /** bankroll the size was computed from (ETH), null when unknown or in fixed mode */
   bankrollEth: number | null;
-  /** 'min' / 'max' when the clamp applied */
-  clamped: 'min' | 'max' | null;
+  /** 'min' / 'max' when the preset clamp applied; 'contract' when maxQuoteIn / the spend budget capped it (NEW-6) */
+  clamped: 'min' | 'max' | 'contract' | null;
   note: string;
 }
 
@@ -101,6 +101,12 @@ export class PaperBankroll {
 
   get realizedEth(): number {
     return eth(this.realizedWei);
+  }
+
+  /** What the simulated contract holds for `key`'s buy: everything not committed to OTHER runs (paper L8). */
+  freeWeiExcluding(key: string): bigint {
+    const b = this.startWei + this.realizedWei - this.committedWei + (this.committed.get(key) ?? 0n);
+    return b > 0n ? b : 0n;
   }
 
   get committedWei(): bigint {

@@ -14,7 +14,9 @@
  *  - positions (incl. ones rebuilt at startup) hold their slot until closed.
  *  - `sendCheck()` (kill switch, daily loss) runs at decide time AND right before the first send.
  *
- * Daily loss limit (realised live PnL of the UTC day): `settings.daily_loss_limit_eth`, else
+ * Daily loss limit (realised PnL of the UTC day, of THIS mode — paper accumulates its own paper
+ * PnL exactly like live, so a paper run stops at the limit the same way; the aggregates are
+ * loaded per mode, L5): `settings.daily_loss_limit_eth`, else
  * DAILY_LOSS_LIMIT_ETH, else a percentage (`settings.daily_loss_limit_pct`, else
  * DAILY_LOSS_LIMIT_PCT, default 15 %) of the bankroll at the start of the day (the first bankroll
  * figure seen that UTC day: contract ETH balance live, paper bankroll in paper mode). Until a
@@ -241,15 +243,16 @@ export class Risk {
     if (deployer) this.playDeployers.add(`${playId}:${deployer.toLowerCase()}`);
   }
 
-  /** Realized PnL of a position closed without a slot here (reconciled after startup). Live only. */
+  /** Realized PnL of a position closed without a slot here (reconciled after startup). */
   bookRealized(pnlEth: number): void {
     this.rollDay();
-    if (this.opts.mode === 'live') this.realizedTodayEth += pnlEth;
+    this.realizedTodayEth += pnlEth;
   }
 
+  /** A position closed: free its slot and book its PnL toward this mode's daily loss (paper too). */
   onPositionClosed(pnlEth: number): void {
     this.rollDay();
     this.openCount = Math.max(0, this.openCount - 1);
-    if (this.opts.mode === 'live') this.realizedTodayEth += pnlEth;
+    this.realizedTodayEth += pnlEth;
   }
 }

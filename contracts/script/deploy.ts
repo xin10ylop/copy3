@@ -6,14 +6,24 @@
  *   OWNER=0x…                       REQUIRED cold owner (sweeps, admin) — must differ from every hot key
  *   OPERATORS=0x…,0x…               exit key + burst keys (the addresses of the sniper's EXECUTOR_PRIVATE_KEYS).
  *                                   Default: every key of EXECUTOR_PRIVATE_KEYS (else the deployer)
- *   [MAX_QUOTE_IN_ETH=0.2]          per-snipe cap enforced on-chain (owner can change it)
+ *   [MAX_QUOTE_IN_ETH=0.3]          per-snipe cap enforced on-chain (owner can change it). The default
+ *                                   equals the preset default `sizing.maxEth`; the sniper clamps
+ *                                   bankroll sizes to it anyway (NEW-6)
  *   [MAX_SPEND_PER_WINDOW_ETH=4×MAX_QUOTE_IN_ETH] [SPEND_WINDOW_SEC=3600]
- *                                   rolling buy budget (N4: bounds what a stolen operator key can
- *                                   lose via its own launches); SPEND_WINDOW_SEC=0 disables it
+ *                                   decaying buy budget (N4 / NEW-5: at most MAX_SPEND at once,
+ *                                   refilling at MAX_SPEND / SPEND_WINDOW_SEC per second; bounds what a
+ *                                   stolen operator key can lose via its own launches).
+ *                                   SPEND_WINDOW_SEC must be ≥ 1; to turn the budget off the OWNER
+ *                                   sends disableSpendLimit() after the deploy (explicit, NEW-5)
  *   [TREASURY=0x…]                  receiver of exit proceeds (default: the owner; printed as owner calldata)
  *   [FACTORY=0x7ed5…]               PonsV2LaunchFactory (default from @hood/core)
- *   [RPC_URL=https://rpc.mainnet.chain.robinhood.com] [FUND_ETH=0.2] [DRY_RUN=1]
- *   pnpm --filter @hood/contracts deploy
+ *   [RPC_URL=https://rpc.mainnet.chain.robinhood.com] [DRY_RUN=1]
+ *   [FUND_ETH=…]                    send this much ETH from the deployer to the contract after the
+ *                                   deploy. No default: unset = no funding (fund from the cold owner)
+ *   pnpm --filter @hood/contracts run deploy
+ *
+ * After the deploy the script reads back owner, operators[0], factory, arbBlockNumbers,
+ * maxQuoteIn, maxSpendPerWindow and spendWindow and fails if any differs from what was asked.
  *
  * The constructor makes the FIRST operator; the others are added with setOperator, which only
  * the owner can call — so with a cold OWNER this script prints the setOperator calldata for the
@@ -67,10 +77,13 @@ if (operators.some((o) => o.toLowerCase() === owner.toLowerCase()) || owner.toLo
 const factory = (process.env.FACTORY ?? PONS_V2_FACTORY) as Address;
 const treasury = process.env.TREASURY as Address | undefined;
 if (treasury !== undefined && !isAddress(treasury)) throw new Error('TREASURY must be an address');
-const maxQuoteIn = parseEther(process.env.MAX_QUOTE_IN_ETH ?? '0.2');
+const maxQuoteIn = parseEther(process.env.MAX_QUOTE_IN_ETH ?? '0.3');
 const maxSpend = process.env.MAX_SPEND_PER_WINDOW_ETH ? parseEther(process.env.MAX_SPEND_PER_WINDOW_ETH) : maxQuoteIn * 4n;
 const spendWindow = Number(process.env.SPEND_WINDOW_SEC ?? '3600');
-if (!Number.isInteger(spendWindow) || spendWindow < 0 || spendWindow > 2 ** 32 - 1) throw new Error('SPEND_WINDOW_SEC must be a uint32');
+if (!Number.isInteger(spendWindow) || spendWindow < 1 || spendWindow > 2 ** 32 - 1)
+  throw new Error('SPEND_WINDOW_SEC must be a uint32 ≥ 1 (the constructor refuses 0; the owner turns the budget off with disableSpendLimit())');
+if (maxSpend < maxQuoteIn) throw new Error(`MAX_SPEND_PER_WINDOW_ETH must be ≥ MAX_QUOTE_IN_ETH (a smaller budget refuses every full-size snipe)`);
+const fundEth = process.env.FUND_ETH; // no default: unset = the contract is funded later from the cold owner
 
 const publicClient = createPublicClient({ chain: robinhood, transport: http(rpcUrl) });
 const wallet = createWalletClient({ account, chain: robinhood, transport: http(rpcUrl) });
@@ -88,13 +101,26 @@ async function main(): Promise<void> {
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
   if (receipt.status !== 'success' || !receipt.contractAddress) throw new Error(`deploy failed: ${hash}`);
   const address = receipt.contractAddress;
-  const [o, isOp, arb, f] = await Promise.all([
+  const [o, isOp, arb, f, mq, ms, sw] = await Promise.all([
     publicClient.readContract({ address, abi: sniperAbi, functionName: 'owner' }),
     publicClient.readContract({ address, abi: sniperAbi, functionName: 'operators', args: [operators[0]!] }),
     publicClient.readContract({ address, abi: sniperAbi, functionName: 'arbBlockNumbers' }),
     publicClient.readContract({ address, abi: sniperAbi, functionName: 'factory' }),
+    publicClient.readContract({ address, abi: sniperAbi, functionName: 'maxQuoteIn' }),
+    publicClient.readContract({ address, abi: sniperAbi, functionName: 'maxSpendPerWindow' }),
+    publicClient.readContract({ address, abi: sniperAbi, functionName: 'spendWindow' }),
   ]);
-  if (o.toLowerCase() !== owner!.toLowerCase() || !isOp || !arb || f.toLowerCase() !== factory.toLowerCase()) throw new Error('post-deploy check failed');
+  const failed = [
+    o.toLowerCase() !== owner!.toLowerCase() && `owner ${o} ≠ ${owner}`,
+    !isOp && `operators(${operators[0]}) is false`,
+    !arb && 'arbBlockNumbers() is false (deadlines would use L1 block numbers)',
+    f.toLowerCase() !== factory.toLowerCase() && `factory ${f} ≠ ${factory}`,
+    BigInt(mq) !== maxQuoteIn && `maxQuoteIn ${mq} ≠ ${maxQuoteIn}`,
+    BigInt(ms) !== maxSpend && `maxSpendPerWindow ${ms} ≠ ${maxSpend}`,
+    Number(sw) !== spendWindow && `spendWindow ${sw} ≠ ${spendWindow}`,
+  ].filter(Boolean);
+  if (failed.length) throw new Error(`post-deploy check failed: ${failed.join('; ')}`);
+  console.log(`verified: owner, operator ${operators[0]}, factory, arbBlockNumbers, maxQuoteIn ${mq}, spend budget ${ms} per ${sw}s`);
 
   for (const op of operators.slice(1)) {
     const data = encodeFunctionData({ abi: sniperAbi, functionName: 'setOperator', args: [op, true] });
@@ -104,12 +130,11 @@ async function main(): Promise<void> {
     const data = encodeFunctionData({ abi: sniperAbi, functionName: 'setTreasury', args: [treasury] });
     console.log(`owner must send: to=${address} data=${data}   # setTreasury(${treasury})`);
   }
-  const fund = process.env.FUND_ETH;
-  if (fund) {
-    const tx = await wallet.sendTransaction({ to: address, value: parseEther(fund) });
+  if (fundEth) {
+    const tx = await wallet.sendTransaction({ to: address, value: parseEther(fundEth) });
     await publicClient.waitForTransactionReceipt({ hash: tx });
-    console.log(`funded ${fund} ETH (${tx})`);
-  }
+    console.log(`funded ${fundEth} ETH (${tx})`);
+  } else console.log('not funded (FUND_ETH unset): send the working balance from the cold owner');
   console.log(`SNIPER_CONTRACT=${address.toLowerCase()}`);
 }
 

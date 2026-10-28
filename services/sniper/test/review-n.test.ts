@@ -397,6 +397,7 @@ describe('N7: the executor onFinal never inserts a second row', () => {
     expect(run.burst.map((m) => m.status)).toEqual(['sent', 'sent', 'sent']);
     for (const m of run.burst.slice(0, 2)) chain.receipts.set(m.hash.toLowerCase(), { transactionHash: m.hash, status: 'reverted', blockNumber: LAUNCH.block + 1, gasUsed: 37_000n, logs: [] });
     chain.nonces.set(BURST.address.toLowerCase(), 102); // the third member was dropped: settle fills nonce 102
+    chain.blockNumber = run.deadlineBlock + 1; // NEW-3: the no-fill verdict is read past the deadline block
     await waitFor(() => finals.length === 1 && !ex.burstKeys[0]!.inBurst, 5000);
     await sleep(10);
     await h.sniper.recorder.idle();

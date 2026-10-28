@@ -27,6 +27,7 @@ export function snipeRecord(run: SnipeRun, p?: PositionEntry): SnipeRecord {
           minTokensOut: run.minTokensOut,
           maxTaxBps: run.maxTaxBps,
           deadlineBlock: run.deadlineBlock,
+          deadlineTs: run.deadlineTs,
           // H1: only receipt-confirmed launches count for firstBuyOnly / token cap after a restart
           confirmed: run.confirmed === true,
           signer: run.signer,

@@ -1,7 +1,7 @@
 import { PlayTriggerSchema, PresetSchema, parsePreset } from '@hood/core';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { listEnabledPlays, setSetting, getSetting } from '../src/helpers.js';
-import { DEFAULT_AUTO_APPROVE, GENERIC_OPERATOR, KILL_SWITCH_OFF, seed } from '../src/seed.js';
+import { DEFAULT_AUTO_APPROVE, GENERIC_MAX_ENTRY_MCAP_ETH, GENERIC_OPERATOR, KILL_SWITCH_OFF, genericPreset, seed } from '../src/seed.js';
 import { makeTestDb, reset, type TestDb } from './pglite.js';
 
 let db: TestDb;
@@ -33,13 +33,21 @@ describe('seed (generic fingerprint plays + settings)', () => {
     expect(PlayTriggerSchema.parse(plays[1]!.trigger).launchSecond).toEqual({ minTeamBuyEth: 0.05 });
     // the preset is the backtested default (docs/BACKTEST.md #2) plus the generic-play risk fields
     const preset = PresetSchema.parse(plays[0]!.preset);
-    expect(preset).toEqual({ ...parsePreset({}), stopAfter: 1_000_000, firstBuyOnly: false });
+    expect(preset).toEqual({ ...parsePreset({}), stopAfter: 1_000_000, firstBuyOnly: false, maxEntryMcapEth: GENERIC_MAX_ENTRY_MCAP_ETH });
     expect(preset).toMatchObject({ takeProfits: [], trailing: { activatePct: 50, dropPct: 20 }, stopLossPct: 40, timeoutSec: 60, exitIfExemptSellsPct: 0 });
     expect(plays[0]!.stats.source).toBe('backtest#2');
     expect((await listEnabledPlays(db.sql)).map((p) => p.name)).toEqual(['team-buy-0.1']);
 
     expect(await getSetting(db.sql, 'kill_switch')).toEqual(KILL_SWITCH_OFF);
     expect(await getSetting(db.sql, 'auto_approve')).toEqual(DEFAULT_AUTO_APPROVE);
+  });
+
+  it('NEW-1: the generic presets carry the k-based entry cap maxEntryMcapEth = 4.2 ETH (2.5 × the 1.68 ETH start mcap)', async () => {
+    expect(GENERIC_MAX_ENTRY_MCAP_ETH).toBeCloseTo(2.5 * 1.68, 12);
+    expect(genericPreset().maxEntryMcapEth).toBe(4.2);
+    await seed(db.sql);
+    const rows = await db.sql.query<{ name: string; preset: unknown }>('SELECT name, preset FROM plays ORDER BY id');
+    for (const r of rows) expect(PresetSchema.parse(r.preset).maxEntryMcapEth).toBe(4.2);
   });
 
   it('is idempotent by play name and never overwrites tuned plays or existing settings', async () => {

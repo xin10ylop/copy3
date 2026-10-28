@@ -10,8 +10,12 @@ export interface Sql {
   exec(text: string): Promise<void>;
   /** Run `fn` inside a transaction; the passed Sql is transaction-scoped. */
   begin<T>(fn: (tx: Sql) => Promise<T>): Promise<T>;
-  /** LISTEN on a channel; resolves to an unsubscribe function. */
-  listen(channel: string, cb: (payload: string) => void): Promise<() => Promise<void>>;
+  /**
+   * LISTEN on a channel; resolves to an unsubscribe function. `onlisten` runs every time the
+   * LISTEN is (re)established — postgres.js re-LISTENs after a reconnect but does not replay the
+   * notifications sent meanwhile, so callers reload their state there.
+   */
+  listen(channel: string, cb: (payload: string) => void, onlisten?: () => void): Promise<() => Promise<void>>;
   /** NOTIFY a channel with a text payload. */
   notify(channel: string, payload: string): Promise<void>;
   /** Close the underlying connection(s). */
@@ -27,7 +31,7 @@ export interface PostgresClient {
     params?: readonly unknown[],
   ): Promise<readonly Row[]> & { simple(): Promise<readonly Row[]> };
   begin<T>(fn: (sql: PostgresClient) => Promise<T>): Promise<T>;
-  listen(channel: string, onnotify: (payload: string) => void): Promise<{ unlisten: () => Promise<void> }>;
+  listen(channel: string, onnotify: (payload: string) => void, onlisten?: () => void): Promise<{ unlisten: () => Promise<void> }>;
   notify(channel: string, payload: string): Promise<unknown>;
   end(opts?: { timeout?: number }): Promise<void>;
 }
@@ -46,8 +50,8 @@ export function fromPostgres(client: PostgresClient): Sql {
     begin<T>(fn: (tx: Sql) => Promise<T>): Promise<T> {
       return c.begin((inner) => fn(wrap(inner)));
     },
-    async listen(channel, cb) {
-      const sub = await c.listen(channel, cb);
+    async listen(channel, cb, onlisten) {
+      const sub = await c.listen(channel, cb, onlisten);
       return () => sub.unlisten();
     },
     async notify(channel, payload) {
@@ -111,8 +115,10 @@ export function fromPglite(db: PgliteClient): Sql {
     begin<T>(fn: (tx: Sql) => Promise<T>): Promise<T> {
       return db.transaction((tx) => fn(txWrap(tx)));
     },
-    async listen(channel, cb) {
-      return db.listen(channel, cb);
+    async listen(channel, cb, onlisten) {
+      const off = await db.listen(channel, cb);
+      onlisten?.(); // in-process: connected once, never reconnects
+      return off;
     },
     async notify(channel, payload) {
       await db.query('SELECT pg_notify($1, $2)', [channel, payload]);

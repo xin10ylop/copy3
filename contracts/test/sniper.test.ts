@@ -32,6 +32,8 @@ let gasBurner: Artifact;
 let ALL_ABI: Abi;
 const MAX_QUOTE_IN = parseEther('0.5');
 const MAX_SPEND = parseEther('2');
+/** wall-clock deadline far beyond every block timestamp a test sets (NEW-3 tests use their own) */
+const FAR_TS = LAUNCH_TS + 1_000_000n;
 const gas: Record<string, bigint> = {};
 
 beforeAll(() => {
@@ -81,11 +83,11 @@ describe('PonsSniper (in-process EVM, Cancun)', () => {
   let sniper: Hex;
   let factory: Hex;
 
-  const snipeData = (o: { quoteIn?: bigint; minOut?: bigint; maxTax?: number; deadline?: bigint } = {}): Hex =>
+  const snipeData = (o: { quoteIn?: bigint; minOut?: bigint; maxTax?: number; deadline?: bigint; deadlineTs?: bigint } = {}): Hex =>
     encodeFunctionData({
       abi: sniperAbi,
       functionName: 'snipe',
-      args: [curve, token, o.quoteIn ?? parseEther('0.035'), o.minOut ?? 0n, o.maxTax ?? 1000, o.deadline ?? 1_000n],
+      args: [curve, token, o.quoteIn ?? parseEther('0.035'), o.minOut ?? 0n, o.maxTax ?? 1000, o.deadline ?? 1_000n, o.deadlineTs ?? FAR_TS],
     });
 
   const read = async (to: Hex, abi: Abi, functionName: string, args: unknown[] = []): Promise<unknown> =>
@@ -263,7 +265,7 @@ describe('PonsSniper (in-process EVM, Cancun)', () => {
     const d = await chain.send(owner, { data: encodeDeployData({ abi: drainer.abi, bytecode: drainer.bytecode, args: [thief.address] }) });
     const fake = d.createdAddress!;
     const bal = await chain.balance(sniper);
-    const data = (c: Hex, t: Hex, q: bigint): Hex => encodeFunctionData({ abi: sniperAbi, functionName: 'snipe', args: [c, t, q, 0n, 1000, 1000n] });
+    const data = (c: Hex, t: Hex, q: bigint): Hex => encodeFunctionData({ abi: sniperAbi, functionName: 'snipe', args: [c, t, q, 0n, 1000, 1000n, FAR_TS] });
     expect(revertName(await chain.send(operator, { to: sniper, data: data(fake, fake, parseEther('0.4')) }))).toBe('UnknownCurve()');
     expect(revertName(await chain.send(operator, { to: sniper, data: data(fake, token, parseEther('0.4')) }))).toBe('UnknownCurve()');
     expect(await chain.balance(sniper)).toBe(bal);
@@ -278,7 +280,7 @@ describe('PonsSniper (in-process EVM, Cancun)', () => {
     expect((await chain.send(operator, { to: sniper, data: data(curve, token, parseEther('0.6')) })).ok).toBe(true);
   });
 
-  it('N4: a rolling spend budget caps what operator keys can buy per window (stolen-key sandwich on its own launches)', async () => {
+  it('N4: a spend budget caps what operator keys can buy per window (stolen-key sandwich on its own launches)', async () => {
     const d = (functionName: string, args: unknown[] = []): Hex => encodeFunctionData({ abi: sniperAbi as Abi, functionName, args });
     // the thief's own REAL launches: registered by the factory, so the curve check passes
     const curves: { curve: Hex; token: Hex }[] = [];
@@ -293,20 +295,94 @@ describe('PonsSniper (in-process EVM, Cancun)', () => {
     expect((await chain.send(owner, { to: sniper, data: d('setSpendLimit', [parseEther('1'), 3600]) })).ok).toBe(true);
     expect((await read(sniper, sniperAbi as Abi, 'maxSpendPerWindow')) as bigint).toBe(parseEther('1'));
     const q = parseEther('0.4');
-    const snipe = (i: number): Hex => d('snipe', [curves[i]!.curve, curves[i]!.token, q, 0n, 1000, 1000n]);
+    const snipe = (i: number): Hex => d('snipe', [curves[i]!.curve, curves[i]!.token, q, 0n, 1000, 1000n, FAR_TS]);
     chain.setBlock(101n, LAUNCH_TS + 10n);
     expect((await chain.send(operator, { to: sniper, data: snipe(0) })).ok).toBe(true);
     expect((await chain.send(operator, { to: sniper, data: snipe(1) })).ok).toBe(true);
     // 0.8 spent: the third 0.4 would exceed the 1 ETH budget of this window
     expect(revertName(await chain.send(operator, { to: sniper, data: snipe(2) }))).toBe(`SpendLimitExceeded(${parseEther('0.8')},${q},${parseEther('1')})`);
-    expect(await read(sniper, sniperAbi as Abi, 'spentInWindow')).toBe(parseEther('0.8'));
-    // a reverted buy does not consume budget; a new window resets it
+    expect(await read(sniper, sniperAbi as Abi, 'spendLevel')).toBe(parseEther('0.8'));
+    // a reverted buy does not consume budget; a whole window later the level has drained to 0
     chain.setBlock(102n, LAUNCH_TS + 10n + 3600n);
     expect((await chain.send(operator, { to: sniper, data: snipe(2) })).ok).toBe(true);
-    expect(await read(sniper, sniperAbi as Abi, 'spentInWindow')).toBe(q);
-    // window 0 = budget off (explicit owner choice)
-    expect((await chain.send(owner, { to: sniper, data: d('setSpendLimit', [0n, 0]) })).ok).toBe(true);
+    expect(await read(sniper, sniperAbi as Abi, 'spendLevel')).toBe(q);
+  });
+
+  /** `n` real (factory-registered) launches, each buyable once */
+  const launches = async (n: number): Promise<{ curve: Hex; token: Hex }[]> => {
+    const out: { curve: Hex; token: Hex }[] = [];
+    for (let i = 0; i < n; i++) {
+      const c = await chain.send(stranger, { data: encodeDeployData({ abi: mock.abi, bytecode: mock.bytecode, args: [PHANTOM, SUPPLY, 0n, LAUNCH_TS] }) });
+      const t = (await read(c.createdAddress!, mock.abi, 'token')) as Hex;
+      await chain.send(owner, { to: factory, data: encodeFunctionData({ abi: factoryArt.abi, functionName: 'register', args: [t, c.createdAddress!] }) });
+      out.push({ curve: c.createdAddress!, token: t });
+    }
+    return out;
+  };
+
+  it('NEW-5: the spend budget decays continuously (no 2× burst across a window boundary); window 0 is invalid, "off" is an explicit disableSpendLimit()', async () => {
+    const d = (functionName: string, args: unknown[] = []): Hex => encodeFunctionData({ abi: sniperAbi as Abi, functionName, args });
+    const cs = await launches(7);
+    await chain.send(owner, { to: sniper, value: parseEther('5') });
+    const B = parseEther('1');
+    expect((await chain.send(owner, { to: sniper, data: d('setSpendLimit', [B, 3600]) })).ok).toBe(true);
+    const snipe = (i: number, q: bigint): Hex => d('snipe', [cs[i]!.curve, cs[i]!.token, q, 0n, 1000, 10_000n, FAR_TS]);
+    const available = async (): Promise<bigint> => (await read(sniper, sniperAbi as Abi, 'spendAvailable')) as bigint;
+    // reviewer PoC E: the tumbling window let 0.5 + 0.3 at t0+3599 and 0.5 + 0.5 at t0+3600/3601 through (1.8 ETH in 2 s)
+    const t0 = LAUNCH_TS + 10n;
+    chain.setBlock(100n, t0);
+    expect((await chain.send(operator, { to: sniper, data: snipe(0, parseEther('0.2')) })).ok).toBe(true);
+    chain.setBlock(101n, t0 + 3599n);
+    expect((await chain.send(operator, { to: sniper, data: snipe(1, parseEther('0.5')) })).ok).toBe(true);
+    expect((await chain.send(operator, { to: sniper, data: snipe(2, parseEther('0.3')) })).ok).toBe(true);
+    expect(await available()).toBe(parseEther('0.2'));
+    chain.setBlock(103n, t0 + 3600n);
+    const level = parseEther('0.8') - B / 3600n; // drained for one second
+    expect(revertName(await chain.send(operator, { to: sniper, data: snipe(3, parseEther('0.5')) }))).toBe(`SpendLimitExceeded(${level},${parseEther('0.5')},${B})`);
+    chain.setBlock(104n, t0 + 3601n);
+    expect(revertName(await chain.send(operator, { to: sniper, data: snipe(3, parseEther('0.5')) }))).toMatch(/^SpendLimitExceeded\(/);
+    // the bound holds continuously: half a window later half the budget is back, not all of it
+    chain.setBlock(105n, t0 + 3599n + 1800n);
+    expect(await available()).toBe(parseEther('0.7'));
+    expect((await chain.send(operator, { to: sniper, data: snipe(3, parseEther('0.5')) })).ok).toBe(true);
+    expect(revertName(await chain.send(operator, { to: sniper, data: snipe(4, parseEther('0.25')) }))).toMatch(/^SpendLimitExceeded\(/);
+    expect((await chain.send(operator, { to: sniper, data: snipe(4, parseEther('0.2')) })).ok).toBe(true);
+    expect(await available()).toBe(0n);
+    // window 0 is no longer "off" (one keystroke from the buy stop (0, 1)): it is refused
+    expect(revertName(await chain.send(owner, { to: sniper, data: d('setSpendLimit', [0n, 0]) }))).toBe('InvalidSpendWindow()');
+    // the buy stop: (0, 1) refuses every buy, exits still work
+    expect((await chain.send(owner, { to: sniper, data: d('setSpendLimit', [0n, 1]) })).ok).toBe(true);
+    chain.setBlock(106n, t0 + 9000n);
+    expect(revertName(await chain.send(operator, { to: sniper, data: snipe(5, parseEther('0.01')) }))).toMatch(/^SpendLimitExceeded\(.*,0\)$/);
+    expect((await chain.send(operator, { to: sniper, data: d('exitAll', [cs[0]!.curve, cs[0]!.token, 0n]) })).ok).toBe(true);
+    // "off" is explicit and owner-only
+    expect(revertName(await chain.send(operator, { to: sniper, data: d('disableSpendLimit') }))).toBe('NotOwner()');
+    const off = await chain.send(owner, { to: sniper, data: d('disableSpendLimit') });
+    expect(events(off).map((e) => e.eventName)).toEqual(['SpendLimitDisabled']);
     expect(await read(sniper, sniperAbi as Abi, 'spendWindow')).toBe(0);
+    expect(await available()).toBe(2n ** 256n - 1n);
+    expect((await chain.send(operator, { to: sniper, data: snipe(5, parseEther('0.5')) })).ok).toBe(true);
+    // re-enabling starts a fresh budget
+    expect((await chain.send(owner, { to: sniper, data: d('setSpendLimit', [B, 3600]) })).ok).toBe(true);
+    expect(await available()).toBe(B);
+    // the constructor refuses window 0 too
+    const bad = await chain.send(owner, { data: encodeDeployData({ abi: sniperAbi, bytecode: sniperBytecode, args: [owner.address, operator.address, factory, MAX_QUOTE_IN, MAX_SPEND, 0] }) });
+    expect(revertName(bad)).toBe('InvalidSpendWindow()');
+  });
+
+  it('NEW-3: a member landing after the wall-clock deadline reverts Expired even while the block number is below its deadline (stalled sequencer)', async () => {
+    const deadlineTs = LAUNCH_TS + 3n;
+    // the sequencer stalled: the block number barely moved, the clock did
+    chain.setBlock(101n, LAUNCH_TS + 60n);
+    const late = await chain.send(operator, { to: sniper, data: snipeData({ deadline: 1_000n, deadlineTs }) });
+    expect(revertName(late)).toBe('Expired()');
+    expect(late.gasUsed).toBeLessThan(25_000n);
+    expect(await read(sniper, sniperAbi as Abi, 'bought', [token])).toBe(false);
+    chain.setBlock(102n, LAUNCH_TS + 4n);
+    expect(revertName(await chain.send(operator, { to: sniper, data: snipeData({ deadline: 1_000n, deadlineTs }) }))).toBe('Expired()');
+    // at the deadline second itself (tax 0 from T+3) the buy still goes through
+    chain.setBlock(103n, deadlineTs);
+    expect((await chain.send(operator, { to: sniper, data: snipeData({ deadline: 1_000n, deadlineTs }) })).ok).toBe(true);
   });
 
   it('L1: exit(tokensIn = 0) reverts instead of selling everything', async () => {
@@ -413,7 +489,7 @@ describe('PonsSniper deadline on Robinhood Chain (chainId 4663 → ArbSys L2 blo
     expect(decodeFunctionResult({ abi: sniperAbi, functionName: 'arbBlockNumbers', data: await chain.call(sniper, encodeFunctionData({ abi: sniperAbi, functionName: 'arbBlockNumbers' })) })).toBe(true);
     await chain.send(owner, { to: sniper, value: parseEther('1') });
     const snipe = (deadline: bigint): Hex =>
-      encodeFunctionData({ abi: sniperAbi, functionName: 'snipe', args: [curve, token, parseEther('0.01'), 0n, 1000, deadline] });
+      encodeFunctionData({ abi: sniperAbi, functionName: 'snipe', args: [curve, token, parseEther('0.01'), 0n, 1000, deadline, LAUNCH_TS + 1_000_000n] });
     // deadline below the ArbSys block → Expired although block.number (23M) is far below it
     const r1 = await chain.send(owner, { to: sniper, data: snipe(100_299_899n) });
     expect(decodeErrorResult({ abi: sniperAbi, data: r1.returnData }).errorName).toBe('Expired');

@@ -18,7 +18,6 @@ import {
   insertSnipe,
   listArmed,
   listEnabledPlays,
-  listen,
   updateSnipe,
   type Sql,
 } from '@hood/db';
@@ -26,6 +25,39 @@ import type { ActiveSnipe, ChangeChannel, EventRecord, FeedBlockRow, SnipeRecord
 
 const json = (v: unknown): unknown =>
   JSON.parse(JSON.stringify(v ?? null, (_k, x: unknown) => (typeof x === 'bigint' ? x.toString() : x)));
+
+interface SnipeRow {
+  id: string;
+  play_id: number | null;
+  token: string;
+  curve: string;
+  mode: 'live' | 'paper';
+  status: ActiveSnipe['status'];
+  decided_at: Date;
+  decision: unknown;
+  quote_in: string | null;
+  tokens_out: string | null;
+  entry_price: number | null;
+  buy_block: string | number | null;
+  sells: unknown;
+}
+
+const activeOf = (r: SnipeRow): ActiveSnipe => ({
+  id: Number(r.id),
+  playId: r.play_id ?? 0,
+  token: r.token,
+  curve: r.curve,
+  mode: r.mode,
+  status: r.status,
+  decidedAt: new Date(r.decided_at),
+  decision: r.decision,
+  // numeric(78,0) may come back as '123' or '123.0' depending on the driver
+  quoteIn: r.quote_in === null ? null : BigInt(String(r.quote_in).split('.')[0]!),
+  tokensOut: r.tokens_out === null ? null : BigInt(String(r.tokens_out).split('.')[0]!),
+  entryPrice: r.entry_price,
+  buyBlock: r.buy_block === null ? null : Number(r.buy_block),
+  sells: r.sells,
+});
 
 export class PgStore implements SniperStore {
   constructor(private readonly sql: Sql) {}
@@ -104,47 +136,25 @@ export class PgStore implements SniperStore {
   }
 
   async loadActiveSnipes(mode: 'live' | 'paper'): Promise<ActiveSnipe[]> {
-    const rows = await this.sql.query<{
-      id: string;
-      play_id: number | null;
-      token: string;
-      curve: string;
-      mode: 'live' | 'paper';
-      status: ActiveSnipe['status'];
-      decided_at: Date;
-      decision: unknown;
-      quote_in: string | null;
-      tokens_out: string | null;
-      entry_price: number | null;
-      buy_block: string | number | null;
-      sells: unknown;
-    }>(
+    const rows = await this.sql.query<SnipeRow>(
       // N3: an aborted run whose burst still has a member marked 'sent' never reached its end
       `SELECT * FROM snipes WHERE mode = $1 AND (status IN ('pending','open')
          OR (status = 'aborted' AND EXISTS (SELECT 1 FROM jsonb_array_elements(burst) e WHERE e->>'status' = 'sent')))
        ORDER BY id`,
       [mode],
     );
-    return rows.map((r) => ({
-      id: Number(r.id),
-      playId: r.play_id ?? 0,
-      token: r.token,
-      curve: r.curve,
-      mode: r.mode,
-      status: r.status,
-      decidedAt: new Date(r.decided_at),
-      decision: r.decision,
-      quoteIn: r.quote_in === null ? null : BigInt(r.quote_in),
-      tokensOut: r.tokens_out === null ? null : BigInt(r.tokens_out),
-      entryPrice: r.entry_price,
-      buyBlock: r.buy_block === null ? null : Number(r.buy_block),
-      sells: r.sells,
-    }));
+    return rows.map(activeOf);
   }
 
-  async onChange(cb: (channel: ChangeChannel, payload: string) => void): Promise<() => Promise<void>> {
+  /**
+   * NEW-2: postgres.js re-LISTENs after a reconnect but never replays the NOTIFYs sent while the
+   * connection was down (e.g. a `hoodctl kill`). `onConnect` runs on every (re)connect of the
+   * LISTEN connection (postgres.js `onlisten`; all channels share one connection, so it is wired
+   * to the settings channel only) and the caller reloads settings, plays and armed candidates.
+   */
+  async onChange(cb: (channel: ChangeChannel, payload: string) => void, onConnect?: () => void): Promise<() => Promise<void>> {
     const channels: ChangeChannel[] = [CHANNELS.plays, CHANNELS.armed, CHANNELS.settings];
-    const offs = await Promise.all(channels.map((c) => listen(this.sql, c, (p) => cb(c, p))));
+    const offs = await Promise.all(channels.map((c) => this.sql.listen(c, (p) => cb(c, p), c === CHANNELS.settings ? onConnect : undefined)));
     return async () => {
       await Promise.all(offs.map((off) => off()));
     };
@@ -198,6 +208,31 @@ export class PgStore implements SniperStore {
   async notifySnipeEvent(payload: string): Promise<void> {
     const p = JSON.parse(payload) as Record<string, unknown>;
     await insertEvent(this.sql, { level: 'info', source: 'sniper', type: String(p.type ?? 'snipe_event'), payload: p });
+  }
+
+  async pruneFeedBlocks(before: Date): Promise<number> {
+    const rows = await this.sql.query<{ n: string }>(`WITH d AS (DELETE FROM feed_blocks WHERE ts < $1 RETURNING 1) SELECT count(*)::text AS n FROM d`, [before]);
+    return Number(rows[0]?.n ?? 0);
+  }
+
+  async findSnipesByToken(token: string, mode: 'live' | 'paper'): Promise<ActiveSnipe[]> {
+    const rows = await this.sql.query<SnipeRow>(`SELECT * FROM snipes WHERE mode = $1 AND token = $2 ORDER BY id DESC`, [mode, token.toLowerCase()]);
+    return rows.map(activeOf);
+  }
+
+  /** Block cursors live in `settings` under `sniper_cursor:<key>` ({"block": n}). */
+  async getCursor(key: string): Promise<number | null> {
+    const rows = await this.sql.query<{ value: unknown }>(`SELECT value FROM settings WHERE key = $1`, [`sniper_cursor:${key}`]);
+    const v = rows[0]?.value as { block?: unknown } | undefined;
+    const n = Number(v?.block);
+    return v && Number.isFinite(n) ? n : null;
+  }
+
+  async setCursor(key: string, block: number): Promise<void> {
+    await this.sql.query(
+      `INSERT INTO settings (key, value) VALUES ($1, $2::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [`sniper_cursor:${key}`, JSON.stringify({ block, at: new Date().toISOString() })],
+    );
   }
 
   async insertFeedBlocks(rows: FeedBlockRow[]): Promise<void> {

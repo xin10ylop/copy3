@@ -184,6 +184,7 @@ describe('H1: spoofed launches never sign and never burn play state', () => {
     expect(run.launch.event.exemptions.sort()).toEqual([LAUNCH.deployer, LAUNCH.creatorFeeRecipient].sort()); // from the receipt
     expect(h.sniper.risk.playCount(9)).toBe(1);
     expect(h.sniper.risk.hasPlayedDeployer(9, LAUNCH.deployer)).toBe(true);
+    h.chain.blockNumber = run.deadlineBlock + 1; // NEW-3: "no fill" is final only past the burst's deadline block
     h.scripted!.resolveFill!(null);
     await waitFor(() => run.status === 'failed');
     expect(h.sniper.risk.playCount(9)).toBe(0); // confirmed but never filled: un-counted for stopAfter …
@@ -262,7 +263,8 @@ describe('H3: chain reconciliation', () => {
     await waitFor(() => h.store.events.some((e) => e.type === 'snipe_unresolved'), 4000);
     expect(run.status).toBe('pending');
     expect(h.sniper.risk.open).toBe(1);
-    h.chain.readSniperFails = false; // chain says: never bought
+    h.chain.readSniperFails = false; // chain says: never bought …
+    h.chain.blockNumber = run.deadlineBlock + 1; // … read past the deadline block (NEW-3)
     await waitFor(() => run.status === 'failed', 4000);
     expect(h.sniper.risk.open).toBe(0);
   });

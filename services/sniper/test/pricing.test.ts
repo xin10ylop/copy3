@@ -1,4 +1,5 @@
 import { mcapFromReserves, parsePreset, quoteBuy, snipeTaxWeiFor } from '@hood/core';
+import { genericPreset } from '@hood/db';
 import { parseEther } from 'viem';
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_LAUNCH_RESERVES, launchReserves, planMinOut, worstTaxBps } from '../src/pricing.js';
@@ -37,6 +38,20 @@ describe('pricing', () => {
     expect(out(at(3.9))).toBeGreaterThan(plan.minTokensOut);
     expect(out(at(4.1))).toBeLessThan(plan.minTokensOut);
     expect(plan.expectedOut).toBeGreaterThan(plan.minTokensOut);
+  });
+
+  it('NEW-1: the seeded generic preset caps entry at 4.2 ETH mcap through k = Q·T — reserves moved along the curve (a fake 3 ETH buy) do not move minTokensOut', () => {
+    const p = genericPreset();
+    expect(p.maxEntryMcapEth).toBe(4.2);
+    const q = parseEther('0.07');
+    const honest = planMinOut(p, START, q, 0);
+    const net = parseEther('3') - parseEther('0.03');
+    const moved = { quote: START.quote + net, token: START.token - quoteBuy(START, parseEther('3'), 100, 0, 0n) };
+    expect(mcapFromReserves(moved)).toBeGreaterThan(5); // the fake price is above the cap …
+    const attacked = planMinOut(p, moved, q, 0);
+    expect(attacked.basis).toBe('maxEntryMcap');
+    // … but the on-chain bound is the same (k is invariant; float rounding only)
+    expect(Math.abs(Number(attacked.minTokensOut - honest.minTokensOut)) / Number(honest.minTokensOut)).toBeLessThan(1e-9);
   });
 
   it('slippage basis: minOut = expected·(1 − slippage) at the worst allowed tax', () => {

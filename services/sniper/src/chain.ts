@@ -50,6 +50,17 @@ export interface RecentLaunch {
   block: number;
 }
 
+/**
+ * PonsSniper decaying spend budget (NEW-4/5): `level` drains at `maxSpend / window` per second
+ * since `updatedAt` (unix s); a buy must keep it ≤ `maxSpend`. `window == 0` = budget off.
+ */
+export interface SpendBudgetState {
+  maxSpend: bigint;
+  window: number;
+  level: bigint;
+  updatedAt: number;
+}
+
 /** PonsSniper admin state checked at live startup (M4 / live-mode gate). */
 export interface SniperConfigState {
   owner: Address;
@@ -57,6 +68,29 @@ export interface SniperConfigState {
   maxQuoteIn: bigint;
   /** operators(key) for every key passed, same order */
   operators: boolean[];
+  /** the spend budget (absent: an older contract / a fake without one) */
+  spend?: SpendBudgetState;
+}
+
+/** A PonsSniper `Sniped` event (startup orphan sweep, NEW-3). */
+export interface SnipedLog {
+  token: Address;
+  curve: Address;
+  quoteIn: bigint;
+  tokensOut: bigint;
+  taxBps: number;
+  block: number;
+  txHash: Hex;
+}
+
+/** Public RPCs cap eth_getLogs ranges (often 10 000 blocks): every log scan is chunked (NEW-8). */
+export const LOG_CHUNK_BLOCKS = 10_000;
+
+/** [from, to] (inclusive) split into ranges of at most `chunk` blocks, oldest first. */
+export function blockRanges(from: number, to: number, chunk = LOG_CHUNK_BLOCKS): [number, number][] {
+  const out: [number, number][] = [];
+  for (let a = Math.max(0, from); a <= to; a += chunk) out.push([a, Math.min(to, a + chunk - 1)]);
+  return out;
 }
 
 export interface ChainClient {
@@ -67,8 +101,10 @@ export interface ChainClient {
   /** curve.graduated() — sells on the curve revert once true */
   curveGraduated(curve: Address): Promise<boolean>;
   estimateGas(tx: { from: Address; to: Address; data: Hex; value?: bigint; stateOverride?: StateOverride }): Promise<bigint>;
-  /** most recent TokenLaunched logs within `lookbackBlocks`, newest first, at most `limit` (startup checks) */
+  /** most recent TokenLaunched logs within `lookbackBlocks`, newest first, at most `limit` (startup checks; chunked, NEW-8) */
   recentLaunches(lookbackBlocks: number, limit: number): Promise<RecentLaunch[]>;
+  /** PonsSniper `Sniped` events in [fromBlock, toBlock], oldest first (chunked ≤ LOG_CHUNK_BLOCKS) */
+  snipedLogs(sniper: Address, fromBlock: number, toBlock: number): Promise<SnipedLog[]>;
   /** owner / factory / maxQuoteIn / operators(keys) of the PonsSniper contract */
   readSniperConfig(sniper: Address, keys: readonly Address[]): Promise<SniperConfigState>;
   getTransactionCount(address: Address, tag: 'latest' | 'pending'): Promise<number>;
@@ -146,34 +182,64 @@ export class ViemChain implements ChainClient {
   }
 
   async recentLaunches(lookbackBlocks: number, limit: number): Promise<RecentLaunch[]> {
-    const head = await this.http.getBlockNumber();
-    const logs = await this.http.getLogs({
-      address: PONS_V2.factory as Address,
-      event: getAbiItem({ abi: factoryAbi, name: 'TokenLaunched' }),
-      fromBlock: head > BigInt(lookbackBlocks) ? head - BigInt(lookbackBlocks) : 0n,
-      toBlock: head,
-    });
-    return logs
-      .slice(-limit)
-      .reverse()
-      .map((l) => {
-        const p = parseTokenLaunchedLog(toRaw(l as Log));
-        return { token: p.token as Address, curve: p.curve as Address, block: Number(l.blockNumber ?? 0n) };
+    // NEW-8: one eth_getLogs over 36 000 blocks is refused by public RPCs (range caps) and the gate
+    // then failed closed forever: walk back in chunks of ≤ LOG_CHUNK_BLOCKS, newest first
+    const head = Number(await this.http.getBlockNumber({ cacheTime: 0 }));
+    const out: RecentLaunch[] = [];
+    for (const [a, b] of blockRanges(head - lookbackBlocks, head).reverse()) {
+      const logs = await this.http.getLogs({
+        address: PONS_V2.factory as Address,
+        event: getAbiItem({ abi: factoryAbi, name: 'TokenLaunched' }),
+        fromBlock: BigInt(a),
+        toBlock: BigInt(b),
       });
+      for (const l of [...logs].reverse()) {
+        const p = parseTokenLaunchedLog(toRaw(l as Log));
+        out.push({ token: p.token as Address, curve: p.curve as Address, block: Number(l.blockNumber ?? 0n) });
+        if (out.length >= limit) return out;
+      }
+    }
+    return out;
+  }
+
+  async snipedLogs(sniper: Address, fromBlock: number, toBlock: number): Promise<SnipedLog[]> {
+    const out: SnipedLog[] = [];
+    for (const [a, b] of blockRanges(fromBlock, toBlock)) {
+      const logs = await this.http.getLogs({ address: sniper, event: getAbiItem({ abi: sniperAbi, name: 'Sniped' }), fromBlock: BigInt(a), toBlock: BigInt(b) });
+      for (const l of logs) {
+        out.push({
+          token: l.args.token!.toLowerCase() as Address,
+          curve: l.args.curve!.toLowerCase() as Address,
+          quoteIn: l.args.quoteIn!,
+          tokensOut: l.args.tokensOut!,
+          taxBps: Number(l.args.taxBps!),
+          block: Number(l.blockNumber ?? 0n),
+          txHash: (l.transactionHash ?? '0x') as Hex,
+        });
+      }
+    }
+    return out;
   }
 
   async readSniperConfig(sniper: Address, keys: readonly Address[]): Promise<SniperConfigState> {
-    const [owner, factory, maxQuoteIn, ...ops] = await Promise.all([
-      this.http.readContract({ address: sniper, abi: sniperAbi, functionName: 'owner' }),
-      this.http.readContract({ address: sniper, abi: sniperAbi, functionName: 'factory' }),
-      this.http.readContract({ address: sniper, abi: sniperAbi, functionName: 'maxQuoteIn' }),
+    const r = <F extends 'owner' | 'factory' | 'maxQuoteIn' | 'maxSpendPerWindow' | 'spendWindow' | 'spendLevel' | 'spendUpdatedAt'>(functionName: F) =>
+      this.http.readContract({ address: sniper, abi: sniperAbi, functionName });
+    const [owner, factory, maxQuoteIn, maxSpend, window, level, updatedAt, ...ops] = await Promise.all([
+      r('owner'),
+      r('factory'),
+      r('maxQuoteIn'),
+      r('maxSpendPerWindow'),
+      r('spendWindow'),
+      r('spendLevel'),
+      r('spendUpdatedAt'),
       ...keys.map((k) => this.http.readContract({ address: sniper, abi: sniperAbi, functionName: 'operators', args: [k] })),
     ]);
     return {
-      owner: owner.toLowerCase() as Address,
-      factory: factory.toLowerCase() as Address,
-      maxQuoteIn: BigInt(maxQuoteIn),
+      owner: String(owner).toLowerCase() as Address,
+      factory: String(factory).toLowerCase() as Address,
+      maxQuoteIn: BigInt(maxQuoteIn as bigint),
       operators: ops.map((o) => o === true),
+      spend: { maxSpend: BigInt(maxSpend as bigint), window: Number(window), level: BigInt(level as bigint), updatedAt: Number(updatedAt) },
     };
   }
 
