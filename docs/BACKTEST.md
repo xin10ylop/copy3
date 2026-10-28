@@ -133,3 +133,21 @@ are not additive on this sample.
   partial fills, our effect on the dump timing.
 * Next: run the sniper in paper mode in Ohio for a week with `PAPER_FILL=last`
   as the pessimistic bracket, compare with these numbers, then size up.
+
+## Daily distribution (bootstrap from the 3-day data, best preset, 0.07 ETH)
+
+Preset: no fixed TP, trailing 50/20, SL 40 %, timeout 60 s, dump exit. "Race win"
+= share of launches where we are first in the +1 s block (the rest filled last).
+
+| Signal | snipes/day | actual full days (ETH) | race win | P(losing day) | median day | p10 / p90 |
+|---|---|---|---|---|---|---|
+| team buy ≥ 0.1 ETH | ~93 | +0.91, +0.62, +0.48 | 100 % | 1 % | +0.65 | +0.28 / +1.11 |
+| | | | 75 % | 3 % | +0.51 | +0.15 / +0.94 |
+| | | | 50 % | 10 % | +0.35 | −0.00 / +0.78 |
+| any team buy | ~155 | +1.29, +1.22, +0.14 | 100 % | 2 % | +0.85 | +0.27 / +1.65 |
+| | | | 75 % | 7 % | +0.66 | +0.06 / +1.42 |
+| | | | 50 % | 17 % | +0.44 | −0.11 / +1.21 |
+
+Per-trade win rate is 52 % (≥ 0.1 signal) / 38 % (any team buy); the median trade
+is a small loss and the day is carried by the runners. Scale linearly with size up to
+the ~0.3 ETH impact ceiling.
