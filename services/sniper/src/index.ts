@@ -3,6 +3,8 @@ export * from './types.js';
 export * from './store.js';
 export * from './detector.js';
 export * from './rules.js';
+export * from './ledger.js';
+export * from './sizing.js';
 export * from './risk.js';
 export * from './pricing.js';
 export * from './scheduler.js';

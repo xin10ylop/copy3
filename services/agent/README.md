@@ -12,6 +12,8 @@ The agent replicates the video's Claude "play finder" skill on our own indexed d
   It writes a **CSV** and a **markdown report**, and proposes a **play** (a watch rule plus a preset) for approval in Telegram.
 * **`scout`**: finds recent runners (peak10 ≥ X %) and clusters them in SQL by shared funder, deployer and team wallets. It runs the model only on clusters that no existing play covers.
 * **`backtest <playId>`**: a deterministic backtest of a stored play (no model call, cost 0). It runs a grid search over TP, trailing, SL and timeout, writes a report and CSV, and updates `plays.stats`.
+* **Auto-approval** (after every scout pass, `src/autopilot.ts`): a proposed play whose backtest clears `settings.auto_approve` (`{enabled, minCoins: 10, minExpectancyEth: 0.002, minWinRate: 0.35, maxConcurrentPlays: 20}`, seeded by `pnpm --filter @hood/db seed`) is enabled at once (operator → `active`, `play_auto_approved` event); the others wait for the Telegram buttons. `/play <ca>` results are never auto-approved.
+* **`nightly`** (also scheduled by `serve` at `NIGHTLY_HOUR_UTC`): for every enabled play, re-backtest over the last `REFIT_DAYS` of launches matching its trigger (`launchesMatchingTrigger`, launch-second fingerprint included), refit the exits with `gridSearch` (≥ `REFIT_MIN_COINS` snipes; written when better by more than `REFIT_MARGIN_ETH`), disable it when the rolling realised expectancy of its last `ROLLING_TRADES` closed snipes (paper or live, ≥ `DISABLE_MIN_TRADES`) or the refit expectancy is ≤ 0, and on generic fingerprint plays add `deployerNotIn` / `teamWalletsNotIn` entries for operators whose last `BLACKLIST_MIN_LAUNCHES` matching launches all lost. Events: `play_refit`, `play_auto_disabled`, `operator_blacklisted`, `nightly_finished`.
 
 The model is `claude-opus-5-5` with:
 * adaptive thinking (`display: "summarized"`) and `output_config.effort: "high"`;
@@ -52,6 +54,13 @@ The model is `claude-opus-5-5` with:
 | `SCOUT_MIN_CLUSTER_SIZE` | `2` | Clusters with fewer runners than this are ignored. |
 | `SCOUT_IGNORE` | - | Comma list of hub addresses (exchange hot wallets…) that must not link operators. Pons infra is ignored automatically. |
 | `AGENT_HEALTH_PORT` | `9470` | `serve` exposes `GET /healthz`. |
+| `NIGHTLY_HOUR_UTC` | `3` | Hour (UTC) of the nightly job in `serve`; `-1` = off. |
+| `REFIT_DAYS` | `3` | Look-back of the nightly re-backtest. |
+| `REFIT_MIN_COINS` | `20` | Simulated snipes needed for a refit and for a refit-based disable. |
+| `REFIT_MARGIN_ETH` | `0.0005` | A refit preset must beat the current one by more than this per snipe. |
+| `ROLLING_TRADES` | `30` | Realised snipes in the rolling expectancy. |
+| `DISABLE_MIN_TRADES` | `10` | Realised snipes needed before the rolling expectancy can disable a play. |
+| `BLACKLIST_MIN_LAUNCHES` | `5` | Generic plays: blacklist an operator whose last N matching launches all lost. |
 
 ## Commands
 
@@ -59,6 +68,7 @@ The model is `claude-opus-5-5` with:
 pnpm --filter @hood/agent play 0xa7a7c2f7cea8f9bb3b5b85802f0cd844fa9b7586 --hint "video coin"
 pnpm --filter @hood/agent scout --since-minutes 60 --min-peak 100
 pnpm --filter @hood/agent backtest 12 --since-days 30
+pnpm --filter @hood/agent start nightly     # refit / auto-disable / blacklist once, now
 pnpm --filter @hood/agent serve
 pnpm --filter @hood/agent typecheck
 pnpm --filter @hood/agent test
@@ -145,7 +155,9 @@ test/tools.test.ts         schemas reject bad addresses, tool behaviour, output 
 test/runner.test.ts        scripted Anthropic API: get_token -> get_wallet_funding -> write_csv -> propose_play;
                            refusal, round/cost caps, request shape (model, thinking, effort, fallbacks, caching)
 test/scout.test.ts         clustering (funder / contract creator / team wallet / deployer, hubs ignored), coverage, runScout
-test/trigger.test.ts       SPEC §4 trigger semantics
+test/trigger.test.ts       SPEC §4 trigger semantics, launchSecond fields, blacklists
+test/autopilot.test.ts     auto-approval policy (pure + PGlite), nightly decisions (refit / keep / disable /
+                           blacklist), runNightly end to end on synthetic launches, the db seed
 test/backtest-run.test.ts  runBacktest end to end
 ```
 

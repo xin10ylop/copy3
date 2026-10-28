@@ -210,6 +210,31 @@ describe('launch-second fingerprint: ledger → rules → burst at T+1', () => {
     h.scripted!.resolveFill!(null);
   });
 
+  it('a team buy routed through a contract (invisible to the feed decoder) fires from the node CurveBuy log', async () => {
+    const h = harness();
+    await h.sniper.start();
+    h.warm();
+    h.launchSecond(new Map(), 0, 4);
+    await waitFor(() => h.chain.tokenWatchers.size > 0); // the ledger subscribed once the receipt named the curve
+    expect(h.scripted!.orders).toHaveLength(0);
+    // the operator's contract bought for TEAM in the block at T+300 ms; only the node log shows it
+    h.chain.emitTokenLog(
+      curveTradeLog({ curve: LAUNCH.curve, side: 'buy', trader: STRANGER, recipient: TEAM, quote: parseEther('0.2'), tokens: 10n ** 26n, fee: parseEther('0.002'), tax: 0n, block: h.blockAt(3), txHash: `0x${'5c'.repeat(32)}`, logIndex: 1 }),
+    );
+    await waitFor(() => h.scripted!.orders.length === 1);
+    const run = h.scripted!.orders[0]!.run;
+    expect(run.decision.reasons.join()).toMatch(/team 0\.2 ETH by 1 wallet/);
+    expect(run.notes.join()).toMatch(/launch-second confirmed/); // a log is proof: no receipt needed
+    // a log from a block after the launch second is ignored
+    const lg = h.sniper.ledger(LAUNCH.txHash)!;
+    h.feed(emptyBlock(h.blockAt(10), T + 1, (T + 1) * 1000 + OFFSET));
+    h.chain.emitTokenLog(
+      curveTradeLog({ curve: LAUNCH.curve, side: 'buy', trader: TEAM, recipient: TEAM, quote: parseEther('5'), tokens: 10n ** 26n, fee: 0n, tax: 0n, block: h.blockAt(10), txHash: `0x${'5d'.repeat(32)}`, logIndex: 0 }),
+    );
+    expect(lg.stats().seen.teamBuyEth).toBeCloseTo(0.2, 12);
+    h.scripted!.resolveFill!(null);
+  });
+
   it('a team buy below the threshold (0.05 ETH) never fires', async () => {
     const h = harness();
     await h.sniper.start();

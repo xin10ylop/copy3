@@ -164,7 +164,9 @@ Preset = {
   timeoutSec: number | null,   // default 60; null = off
   minQuoteReserveEth?: number, maxEntryMcapEth?: number,
   abortIfExemptSellInLaunchBlock: boolean,
-  exitIfExemptSellsPct: number | null   // default 0 = exit on the first exempt transfer-out/sell; null = off
+  exitIfExemptSellsPct: number | null,  // default 0 = exit on the first exempt transfer-out/sell; null = off
+  sizing: { mode: 'fixed'|'bankroll', fraction: number, minEth: number, maxEth: number }
+                               // default fixed (buyEth); bankroll = clamp(balance × fraction / MAX_CONCURRENT, min, max)
 }
 PlayTrigger = {
   armedWallet?: { funders: string[], minEth: number, maxEth: number, freshOnly: boolean, maxAgeSec: number, contractMode: boolean },
@@ -173,7 +175,10 @@ PlayTrigger = {
   nameRegex?: string, symbolRegex?: string,
   launchKind?: 'any'|'noDevBuy'|'devBuy',
   minDevBuyEth?: number, maxDevBuyEth?: number,
-  require: ('armedWallet'|'deployerIn'|'teamWalletsAny'|'nameRegex'|'symbolRegex')[]  // AND-set; others are OR
+  launchSecond?: { minTeamBuyEth?, maxTeamBuyEth?, minTeamBuyers?, minDevBuyEth?, maxDevBuyEth?, requireNoDevBuy? },
+                               // team/dev buys in the launch second; always AND; alone only when it demands ETH
+  deployerNotIn?: string[], teamWalletsNotIn?: string[],   // blacklists (AND)
+  require: ('armedWallet'|'deployerIn'|'teamWalletsAny'|'nameRegex'|'symbolRegex'|'launchSecond')[]  // AND-set; others are OR
 }
 ```
 

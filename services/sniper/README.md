@@ -530,7 +530,8 @@ right before the first send). Open positions keep being managed and exited.
   AND-set; live plays need `deployerIn`/`armedWallet`/an ETH-demanding `launchSecond`.
 - **Launch second** (`test/launch-second.test.ts`): synthetic feed blocks — launch at T, a 0.19 ETH
   team buy in the block at T+300 ms → burst planned for the T+1 boundary; 0.06 + 0.05 crossing the
-  threshold as the ledger grows; below the threshold, non-exempt buyers, a reverted team buy
+  threshold as the ledger grows; a contract-routed team buy seen only in the node CurveBuy log;
+  below the threshold, non-exempt buyers, a reverted team buy
   (refused before signing), a blacklisted deployer and an exempt transfer-out never fire; paper
   fill with bankroll sizing; ledger unit tests (classification, hint/log de-dup, launchAndBuy,
   reserves after the team buys).
