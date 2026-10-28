@@ -1,6 +1,7 @@
 /** Internal sniper types (shared shapes come from @hood/core). */
 import type { LaunchEvent, Play, Preset, Reserves } from '@hood/core';
 import type { Address, Hex } from 'viem';
+import type { LaunchSecondLedger } from './ledger.js';
 
 /** A launch seen on the feed (or recovered from a TokenLaunched log in fallback mode). */
 export interface DetectedLaunch {
@@ -24,6 +25,34 @@ export interface Decision {
   preset: Preset;
   reasons: string[];
 }
+
+/** Totals of the launch second `T` (blocks with timestamp == launch timestamp), ETH. */
+export interface LaunchSecondTotals {
+  /** quote-in of curve buys to exempt non-deployer wallets (outside the launch tx) */
+  teamBuyEth: number;
+  /** distinct team wallets that bought */
+  teamBuyers: number;
+  /** launchAndBuy quote + curve buys to the deployer */
+  devBuyEth: number;
+}
+
+/** What the launch-second ledger knows about one launch (see ledger.ts). */
+export interface LaunchSecondStats {
+  /** buys proven by a CurveBuy log (launch receipt, buy receipt or node log) */
+  confirmed: LaunchSecondTotals;
+  /** every buy seen so far: feed hints + confirmed buys, minus refuted (reverted) hints */
+  seen: LaunchSecondTotals;
+  /** exempt-wallet sells / token transfers out seen in the launch second */
+  exemptOut: number;
+  /** feed hints neither confirmed nor refuted yet */
+  pending: number;
+}
+
+/**
+ * `hint`: decide from the feed (seen totals, µs, before execution results exist).
+ * `confirm`: before signing — minimums against confirmed totals, maximums against seen totals.
+ */
+export type LaunchSecondStage = 'hint' | 'confirm';
 
 export interface BurstMember {
   index: number;
@@ -98,4 +127,6 @@ export interface SnipeRun {
   sendCleared?: boolean;
   /** executor key address that signed the burst (M1) */
   signer?: Address;
+  /** launch-second ledger of the launch (launch-second plays: confirmation + last-moment re-check) */
+  ledger?: LaunchSecondLedger;
 }

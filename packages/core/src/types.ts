@@ -114,11 +114,47 @@ export const TriggerFieldSchema = z.enum([
   'teamWalletsAny',
   'nameRegex',
   'symbolRegex',
+  'launchSecond',
 ]);
 export type TriggerField = z.infer<typeof TriggerFieldSchema>;
 
 export const LaunchKindFilterSchema = z.enum(['any', 'noDevBuy', 'devBuy']);
 export type LaunchKindFilter = z.infer<typeof LaunchKindFilterSchema>;
+
+/**
+ * Launch-second fingerprint (docs/BACKTEST.md): what happened in the launch second `T` (blocks
+ * with timestamp == launch timestamp, 99 % snipe tax for everyone who is not exempt).
+ *  - team buy = a curve buy whose recipient is in the launch's exempt set (deployer ∪
+ *    creatorFeeRecipient ∪ SnipeTaxExempted) and is NOT the deployer, outside the launch tx;
+ *  - dev buy  = the launchAndBuy quote plus curve buys to the deployer in the launch second.
+ * All conditions must hold (AND). The rule always behaves as if listed in `require`.
+ */
+export const LaunchSecondRuleSchema = z.object({
+  /** total ETH (quote-in) of team buys in the launch second, at least. */
+  minTeamBuyEth: z.number().min(0).optional(),
+  /** total ETH of team buys in the launch second, at most. */
+  maxTeamBuyEth: z.number().min(0).optional(),
+  /** distinct team wallets that bought in the launch second, at least. */
+  minTeamBuyers: z.number().int().min(0).optional(),
+  /** dev buy (launchAndBuy quote + deployer buys in the launch second), at least. */
+  minDevBuyEth: z.number().min(0).optional(),
+  /** dev buy, at most. */
+  maxDevBuyEth: z.number().min(0).optional(),
+  /** no dev buy at all in the launch second. */
+  requireNoDevBuy: z.boolean().optional(),
+});
+export type LaunchSecondRule = z.infer<typeof LaunchSecondRuleSchema>;
+
+/**
+ * A launch-second rule counts as a matcher on its own (a trigger may consist of it alone) only
+ * when it demands that someone spent ETH in the launch second: `minTeamBuyEth > 0`,
+ * `minTeamBuyers ≥ 1` or `minDevBuyEth > 0`. Otherwise it is only a filter (e.g.
+ * `requireNoDevBuy` alone would match almost every launch).
+ */
+export function launchSecondIsMatcher(rule: LaunchSecondRule | undefined | null): boolean {
+  if (!rule) return false;
+  return (rule.minTeamBuyEth ?? 0) > 0 || (rule.minTeamBuyers ?? 0) >= 1 || (rule.minDevBuyEth ?? 0) > 0;
+}
 
 export const PlayTriggerSchema = z.object({
   armedWallet: ArmedWalletRuleSchema.optional(),
@@ -130,6 +166,12 @@ export const PlayTriggerSchema = z.object({
   launchKind: LaunchKindFilterSchema.default('any'),
   minDevBuyEth: z.number().optional(),
   maxDevBuyEth: z.number().optional(),
+  /** launch-second fingerprint (team / dev buys in the launch second); always AND. */
+  launchSecond: LaunchSecondRuleSchema.optional(),
+  /** blacklist (AND): never match a launch whose deployer (or tx sender) is listed. */
+  deployerNotIn: z.array(AddressSchema).optional(),
+  /** blacklist (AND): never match a launch whose team set (exemptions ∪ creatorFeeRecipient) contains a listed wallet. */
+  teamWalletsNotIn: z.array(AddressSchema).optional(),
   /** fields that MUST all match (AND); the rest are OR-combined. */
   require: z.array(TriggerFieldSchema).default([]),
 });

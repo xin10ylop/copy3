@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parsePreset, parsePlay, PresetSchema, PlayTriggerSchema, AddressSchema } from '../src/types.js';
+import { parsePreset, parsePlay, PresetSchema, PlayTriggerSchema, AddressSchema, launchSecondIsMatcher } from '../src/types.js';
 
 describe('parsePreset defaults (SPEC §4)', () => {
   it('fills the backtest #2 defaults from an empty object (docs/BACKTEST.md)', () => {
@@ -73,5 +73,29 @@ describe('PlayTriggerSchema', () => {
     const t = PlayTriggerSchema.parse({});
     expect(t.launchKind).toBe('any');
     expect(t.require).toEqual([]);
+  });
+
+  it('parses the launch-second fingerprint and the blacklists (addresses lower-cased)', () => {
+    const t = PlayTriggerSchema.parse({
+      launchSecond: { minTeamBuyEth: 0.1, maxTeamBuyEth: 2, minTeamBuyers: 1, requireNoDevBuy: true },
+      deployerNotIn: ['0xABCdef0000000000000000000000000000000001'],
+      teamWalletsNotIn: ['0xABCdef0000000000000000000000000000000002'],
+      require: ['launchSecond'],
+    });
+    expect(t.launchSecond).toEqual({ minTeamBuyEth: 0.1, maxTeamBuyEth: 2, minTeamBuyers: 1, requireNoDevBuy: true });
+    expect(t.deployerNotIn).toEqual(['0xabcdef0000000000000000000000000000000001']);
+    expect(t.teamWalletsNotIn).toEqual(['0xabcdef0000000000000000000000000000000002']);
+    expect(() => PlayTriggerSchema.parse({ launchSecond: { minTeamBuyEth: -1 } })).toThrow();
+    expect(() => PlayTriggerSchema.parse({ launchSecond: { minTeamBuyers: 1.5 } })).toThrow();
+    expect(() => PlayTriggerSchema.parse({ deployerNotIn: ['0x12'] })).toThrow();
+  });
+
+  it('a launch-second rule is a matcher only when it demands ETH spent in the launch second', () => {
+    expect(launchSecondIsMatcher({ minTeamBuyEth: 0.1 })).toBe(true);
+    expect(launchSecondIsMatcher({ minTeamBuyers: 1 })).toBe(true);
+    expect(launchSecondIsMatcher({ minDevBuyEth: 0.05 })).toBe(true);
+    expect(launchSecondIsMatcher({ minTeamBuyEth: 0, requireNoDevBuy: true })).toBe(false);
+    expect(launchSecondIsMatcher({ maxTeamBuyEth: 1 })).toBe(false);
+    expect(launchSecondIsMatcher(undefined)).toBe(false);
   });
 });
