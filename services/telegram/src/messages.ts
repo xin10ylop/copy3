@@ -123,7 +123,7 @@ export function presetSummary(raw: unknown): string {
     p.trailing ? `trail +${p.trailing.activatePct}%/-${p.trailing.dropPct}%` : 'trail off',
     `SL -${p.stopLossPct}%`,
   ];
-  if (p.timeoutSec !== undefined) parts.push(`timeout ${fmtDuration(p.timeoutSec)}`);
+  if (p.timeoutSec != null) parts.push(`timeout ${fmtDuration(p.timeoutSec)}`);
   if (p.maxEntryMcapEth !== undefined) parts.push(`max entry ${p.maxEntryMcapEth} ETH mcap`);
   parts.push(`burst ${p.burst.count}×${p.burst.spacingMs}ms@${p.burst.startMs}ms`);
   if (p.stopAfter !== 1) parts.push(`stop after ${p.stopAfter}`);

@@ -158,13 +158,13 @@ Preset = {
   gasLimit: number, maxFeeGwei: number, priorityFeeGwei: number,
   stopAfter: number,           // 1
   firstBuyOnly: boolean, tokenCap: boolean,
-  takeProfits: { pct: number, sellPct: number }[],   // [{pct:150, sellPct:100}]
-  trailing?: { activatePct: number, dropPct: number } , // {100, 25}
+  takeProfits: { pct: number, sellPct: number }[],   // default [] (no fixed TP; backtested, see docs/BACKTEST.md)
+  trailing: { activatePct: number, dropPct: number } | null, // default {50, 20}; null = off
   stopLossPct: number,         // 40
-  timeoutSec?: number,
+  timeoutSec: number | null,   // default 60; null = off
   minQuoteReserveEth?: number, maxEntryMcapEth?: number,
   abortIfExemptSellInLaunchBlock: boolean,
-  exitIfExemptSellsPct?: number
+  exitIfExemptSellsPct: number | null   // default 0 = exit on the first exempt transfer-out/sell; null = off
 }
 PlayTrigger = {
   armedWallet?: { funders: string[], minEth: number, maxEth: number, freshOnly: boolean, maxAgeSec: number, contractMode: boolean },

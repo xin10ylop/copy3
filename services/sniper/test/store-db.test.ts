@@ -83,13 +83,43 @@ describe('PgStore (@hood/db on PGlite)', () => {
       tax_paid: '4326000000000000',
     });
     expect((row!.decision as { minTokensOut: string }).minTokensOut).toBe('5');
-    const stats = await store.loadSnipeStats(new Date(0));
+    const stats = await store.loadSnipeStats(new Date(0), 'live');
     expect(stats.countsByPlay[play!.id!]).toBe(1);
     expect(stats.openCount).toBe(1);
     expect(stats.tokens).toEqual(['0xe9a2dc2003a9e7e2ca11f93b64c08b55a749215d']);
     expect(stats.playDeployers).toEqual([{ playId: play!.id!, deployer: '0x81eb508048220493549302d8ea5ef73a3fde1784' }]);
     await store.updateSnipe(id, { status: 'closed', realizedPnlEth: 0.1, closedAt: new Date() });
-    expect((await store.loadSnipeStats(new Date(0))).realizedPnlSince).toBeCloseTo(0.1, 9);
+    expect((await store.loadSnipeStats(new Date(0), 'live')).realizedPnlSince).toBeCloseTo(0.1, 9);
+  });
+
+  it('L5: paper rows never touch live risk stats (and vice versa); H1: only confirmed launches mark firstBuyOnly', async () => {
+    const [play] = await store.loadPlays();
+    const base = { playId: play!.id!, decidedAt: new Date(), burst: [], sells: [], notes: null };
+    const before = await store.loadSnipeStats(new Date(0), 'live');
+    // a losing paper position (closed today), a stale paper pending row, a paper token
+    const paperId = await store.insertSnipe({ ...base, token: '0x' + 'a1'.repeat(20), curve: '0x' + 'a2'.repeat(20), decision: { launch: { event: { deployer: '0x' + 'a3'.repeat(20) } } }, mode: 'paper', status: 'open' });
+    await store.updateSnipe(paperId, { status: 'closed', realizedPnlEth: -0.4, closedAt: new Date() });
+    await store.insertSnipe({ ...base, token: '', curve: '', decision: {}, mode: 'paper', status: 'pending' });
+    const live = await store.loadSnipeStats(new Date(0), 'live');
+    expect(live).toEqual(before);
+    const paper = await store.loadSnipeStats(new Date(0), 'paper');
+    expect(paper.realizedPnlSince).toBeCloseTo(-0.4, 9);
+    expect(paper.openCount).toBe(1);
+    expect(paper.tokens).toEqual(['0x' + 'a1'.repeat(20)]);
+    // H1: an aborted, never-confirmed (spoofed) live launch does not block the deployer; a confirmed one does
+    const spoofDeployer = '0x' + 'b1'.repeat(20);
+    const realDeployer = '0x' + 'b2'.repeat(20);
+    await store.insertSnipe({ ...base, token: '', curve: '', decision: { confirmed: false, launch: { event: { deployer: spoofDeployer } } }, mode: 'live', status: 'aborted' });
+    await store.insertSnipe({ ...base, token: '0x' + 'b3'.repeat(20), curve: '0x' + 'b4'.repeat(20), decision: { confirmed: true, launch: { event: { deployer: realDeployer } } }, mode: 'live', status: 'aborted' });
+    const after = await store.loadSnipeStats(new Date(0), 'live');
+    expect(after.playDeployers.map((d) => d.deployer)).toContain(realDeployer);
+    expect(after.playDeployers.map((d) => d.deployer)).not.toContain(spoofDeployer);
+    expect(after.tokens).toContain('0x' + 'b3'.repeat(20));
+    expect(after.countsByPlay).toEqual(before.countsByPlay); // aborted rows never count for stopAfter
+    // H3: active rows per mode for the startup reconciliation
+    const active = await store.loadActiveSnipes('paper');
+    expect(active.map((a) => [a.mode, a.status])).toEqual([['paper', 'pending']]);
+    expect((await store.loadActiveSnipes('live')).every((a) => a.mode === 'live')).toBe(true);
   });
 
   it('writes feed_blocks (idempotent) and snipe events', async () => {

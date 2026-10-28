@@ -27,6 +27,11 @@ export function snipeRecord(run: SnipeRun, p?: PositionEntry): SnipeRecord {
           minTokensOut: run.minTokensOut,
           maxTaxBps: run.maxTaxBps,
           deadlineBlock: run.deadlineBlock,
+          // H1: only receipt-confirmed launches count for firstBuyOnly / token cap after a restart
+          confirmed: run.confirmed === true,
+          signer: run.signer,
+          abortReason: run.abortReason,
+          recovered: run.fill?.recovered === true,
         },
         bigintReplacer,
       ),
@@ -79,6 +84,11 @@ export class Recorder {
     await this.idle();
   }
 
+  /** Bind a run to an existing row (positions rebuilt at startup update their row, never insert). */
+  adopt(run: SnipeRun): void {
+    this.chains.set(run.key, Promise.resolve(run.id));
+  }
+
   /** Wait for all queued snipe writes. */
   async idle(): Promise<void> {
     await Promise.all(this.chains.values());
@@ -94,12 +104,12 @@ export class Recorder {
           const newId = await this.store.insertSnipe(rec);
           run.id = newId;
           this.stats.writes++;
-          await this.notify({ id: newId, type, status: run.status, playId: run.playId, token: rec.token, mode: run.mode });
+          await this.notify({ id: newId, type, status: run.status, playId: run.playId, token: rec.token, mode: run.mode, ...(p ? { phase: p.phase } : {}) });
           return newId;
         }
         await this.store.updateSnipe(id, rec);
         this.stats.writes++;
-        await this.notify({ id, type, status: run.status, playId: run.playId, token: rec.token, mode: run.mode });
+        await this.notify({ id, type, status: run.status, playId: run.playId, token: rec.token, mode: run.mode, ...(p ? { phase: p.phase } : {}) });
         return id;
       } catch (e) {
         this.stats.errors++;
@@ -108,7 +118,9 @@ export class Recorder {
       }
     });
     this.chains.set(run.key, next);
-    if (run.status === 'closed' || run.status === 'failed' || run.status === 'aborted') {
+    // an aborted run whose members are still in flight can still fill (H2): keep its row binding
+    // until the run has really ended, or the fill would insert a second row
+    if (run.status === 'closed' || run.status === 'failed' || (run.status === 'aborted' && run.ended)) {
       void next.then(() => {
         if (this.chains.get(run.key) === next) this.chains.delete(run.key);
       });

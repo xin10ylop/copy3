@@ -80,13 +80,16 @@ export class PgStore implements SniperStore {
     );
     const open = await this.sql.query<{ n: string }>(`SELECT count(*)::text AS n FROM snipes WHERE mode = $1 AND status IN ('pending','open')`, [mode]);
     const pnl = await this.sql.query<{ s: number | null }>(`SELECT sum(realized_pnl_eth) AS s FROM snipes WHERE mode = $1 AND closed_at >= $2`, [mode, since]);
+    // token cap / firstBuyOnly: launches that were played (open/closed) or receipt-confirmed (H1:
+    // a spoofed, never-confirmed launch must not block the real one after a restart)
     const toks = await this.sql.query<{ token: string }>(
-      `SELECT DISTINCT token FROM snipes WHERE mode = $1 AND status IN ('pending','open','closed') AND token <> ''`,
+      `SELECT DISTINCT token FROM snipes WHERE mode = $1 AND token <> ''
+       AND (status IN ('open','closed') OR decision->>'confirmed' = 'true')`,
       [mode],
     );
     const pd = await this.sql.query<{ play_id: number; deployer: string | null }>(
       `SELECT DISTINCT play_id, decision->'launch'->'event'->>'deployer' AS deployer FROM snipes
-       WHERE mode = $1 AND status IN ('pending','open','closed') AND play_id IS NOT NULL`,
+       WHERE mode = $1 AND play_id IS NOT NULL AND (status IN ('open','closed') OR decision->>'confirmed' = 'true')`,
       [mode],
     );
     return {

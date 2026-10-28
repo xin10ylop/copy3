@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { decodedTxFromRpc, parsePlay, type DecodedTx, type FeedBlock, type Play, type RawLog, type RpcTxLike } from '@hood/core';
+import type { ReceiptLite } from '../../src/chain.js';
 
 const fx = (name: string): string => fileURLToPath(new URL(`../../../../packages/core/test/fixtures/${name}`, import.meta.url));
 
@@ -43,4 +44,16 @@ export function emptyBlock(block: number, ts: number, receivedAt: number, txs: D
 
 export function play(over: Record<string, unknown> & { trigger?: Record<string, unknown>; preset?: Record<string, unknown> }): Play {
   return { ...parsePlay({ name: 'test', ...over }), id: (over.id as number | undefined) ?? 1, enabled: true };
+}
+
+/** The real launch receipt (TokenLaunched + 2× SnipeTaxExempted from the curve + …). */
+export function launchReceipt(over: Partial<ReceiptLite> = {}): ReceiptLite {
+  return {
+    transactionHash: LAUNCH.txHash,
+    status: 'success',
+    blockNumber: LAUNCH.block,
+    gasUsed: 3_627_212n,
+    logs: launchFixture.receipt.logs,
+    ...over,
+  };
 }

@@ -74,6 +74,7 @@ function setup(): { sched: ManualScheduler; chain: FakeChain; a: FakeSender; b: 
     blockTs: (n) => (n === LAUNCH.block + 9 ? LAUNCH.ts + 1 : undefined),
     receiptPollMs: 1,
     reconcileTimeoutMs: 300,
+    settleTimeoutMs: 20,
     onFinal: (r) => finals.push(r),
   });
   return { sched, chain, a, b, ex, finals };
@@ -131,7 +132,14 @@ describe('LiveExecutor burst', () => {
     expect(fill!.entryPrice).toBeCloseTo(0.07 / 25_000_000, 15);
     await expectEventually(() => finals.length === 1);
     expect(r.burst.map((m) => m.status)).toEqual(['reverted', 'reverted', 'reverted', 'mined', 'reverted', 'reverted', 'reverted', 'reverted', 'reverted', 'dropped']);
-    expect(ex.nonces.value).toBe(51); // resynced to chain after the dropped member
+    // M1: the dropped member's nonce (51) was broadcast but never consumed → filled with a
+    // 0-value self-transfer so it cannot execute later, and the key continues after it
+    const filler = parseTransaction(a.sent.at(-1)!.raw);
+    expect(filler).toMatchObject({ nonce: 51, gas: 21_000n });
+    expect(filler.to?.toLowerCase()).toBe(account.address.toLowerCase());
+    expect(filler.value ?? 0n).toBe(0n);
+    expect(ex.stats.fillers).toBe(1);
+    expect(ex.nonces.value).toBe(52);
   });
 
   it('reconciliation is idempotent: duplicate receipts never create a second fill', async () => {

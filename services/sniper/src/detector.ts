@@ -18,15 +18,18 @@
 import {
   PONS_V2,
   SELECTORS,
+  TOPICS,
   createAddress,
   launchEventFromCall,
   parseLaunchCall,
+  parseTokenLaunchedLog,
   predictLaunchAddresses,
   type LaunchCall,
 } from '@hood/core';
 import type { DecodedTx, FeedBlock } from '@hood/core';
 import type { Address, Hex } from 'viem';
-import type { DetectedLaunch } from './types.js';
+import type { ReceiptLite } from './chain.js';
+import type { DetectedLaunch, LaunchConfirmation } from './types.js';
 
 export interface LaunchDetectorOptions {
   factory?: Address;
@@ -243,4 +246,55 @@ export class LaunchDetector {
   get(txHash: Hex): DetectedLaunch | undefined {
     return this.launches.get(txHash.toLowerCase());
   }
+}
+
+export type ReceiptVerdict =
+  | { ok: true; confirmation: LaunchConfirmation; notes: string[] }
+  | { ok: false; reason: string; /** the receipt contradicts the feed tx (spoof / wrong deployer) */ spoof: boolean };
+
+const topicAddr = (t: string | undefined): Address => `0x${(t ?? '').slice(26)}`.toLowerCase() as Address;
+
+/**
+ * H1: the launch receipt is the only ground truth. Before anything is signed it must show a
+ * successful tx with exactly one factory `TokenLaunched` whose `deployer` equals the deployer the
+ * rules matched on (calldata / tx signer). Token, curve and the team (exempt) wallets are taken
+ * from the receipt: `SnipeTaxExempted(account)` logs emitted by that curve.
+ */
+export function verifyLaunchReceipt(r: ReceiptLite, l: DetectedLaunch, factory: string = PONS_V2.factory): ReceiptVerdict {
+  if (r.status !== 'success') return { ok: false, reason: `launch tx ${r.transactionHash} reverted`, spoof: true };
+  const f = factory.toLowerCase();
+  const launched = r.logs
+    .filter((x) => x.address.toLowerCase() === f && x.topics[0] === TOPICS.TokenLaunched)
+    .flatMap((x) => {
+      try {
+        return [parseTokenLaunchedLog(x)];
+      } catch {
+        return [];
+      }
+    });
+  const want = l.event.deployer.toLowerCase();
+  const mine = launched.filter((x) => x.deployer.toLowerCase() === want);
+  if (mine.length === 0) {
+    return launched.length === 0
+      ? { ok: false, reason: 'receipt has no TokenLaunched from the factory (not a real launch)', spoof: true }
+      : { ok: false, reason: `TokenLaunched.deployer ${launched.map((x) => x.deployer).join(',')} ≠ ${want} (spoofed deployer)`, spoof: true };
+  }
+  if (mine.length > 1) return { ok: false, reason: `ambiguous: ${mine.length} TokenLaunched for ${want} in one tx`, spoof: false };
+  const tl = mine[0]!;
+  const notes: string[] = [];
+  if (r.blockNumber !== l.block) return { ok: false, reason: `receipt block ${r.blockNumber} ≠ launch block ${l.block}`, spoof: false };
+  const exempt = new Set<Address>();
+  for (const x of r.logs) {
+    if (x.address.toLowerCase() === tl.curve && x.topics[0] === TOPICS.SnipeTaxExempted) exempt.add(topicAddr(x.topics[1]));
+  }
+  let exemptions = [...exempt];
+  if (exemptions.length === 0) {
+    exemptions = l.event.exemptions.map((a) => a.toLowerCase() as Address);
+    notes.push('receipt had no SnipeTaxExempted logs; exemptions from calldata');
+  }
+  return {
+    ok: true,
+    confirmation: { token: tl.token as Address, curve: tl.curve as Address, deployer: tl.deployer as Address, exemptions, block: r.blockNumber },
+    notes,
+  };
 }

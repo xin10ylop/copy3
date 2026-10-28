@@ -4,6 +4,9 @@ import { CURVE_FEE_BPS, minOutWithSlippage, quoteBuy, snipeTaxWeiFor, type Prese
 /** The snipe-tax schedule only takes these values (9900 >> {0,4,9,14}). */
 export const SNIPE_TAX_STEPS = [9900, 618, 19, 0] as const;
 
+/** Hard ceiling for maxTaxBps (zod caps presets at it; PonsSniper refuses ≥ 9900). M3. */
+export const MAX_TAX_BPS = 5000;
+
 /** Largest scheduled tax ≤ maxTaxBps: the worst tax a burst member can actually pay. */
 export function worstTaxBps(maxTaxBps: number): number {
   return SNIPE_TAX_STEPS.find((s) => s <= maxTaxBps) ?? 0;
@@ -25,7 +28,8 @@ export interface MinOutPlan {
  * Both assume the worst tax the preset allows (618 bps for the default maxTaxBps 1000).
  */
 export function planMinOut(p: Preset, r: Reserves, quoteIn: bigint, creatorTaxBps: number, feeBps = CURVE_FEE_BPS): MinOutPlan {
-  const taxBps = worstTaxBps(p.maxTaxBps);
+  // M3: never price at the 99 % launch-second tax (that would make minTokensOut ≈ 0)
+  const taxBps = worstTaxBps(Math.min(p.maxTaxBps, MAX_TAX_BPS));
   const snipeTax = snipeTaxWeiFor(quoteIn, taxBps);
   const expectedOut = quoteBuy(r, quoteIn, feeBps, creatorTaxBps, snipeTax);
   if (p.maxEntryMcapEth !== undefined && p.maxEntryMcapEth > 0) {

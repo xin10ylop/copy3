@@ -292,7 +292,7 @@ export function simulateSnipe(
   let peakPct = (peakValue / cost) * 100 - 100;
   let trailingActive = false;
   let lastTs = entryTs;
-  const deadline = preset.timeoutSec !== undefined ? entryTs + preset.timeoutSec : Number.POSITIVE_INFINITY;
+  const deadline = preset.timeoutSec != null ? entryTs + preset.timeoutSec : Number.POSITIVE_INFINITY;
 
   const sell = (ts: number, tokens: number, price: number, reason: ExitReason): void => {
     const amount = Math.min(tokens, remaining);
@@ -313,7 +313,7 @@ export function simulateSnipe(
     }
     const disposedPct = exemptDisposalPct(e);
     lastTs = e.ev.ts;
-    if (preset.exitIfExemptSellsPct !== undefined && disposedPct >= preset.exitIfExemptSellsPct) {
+    if (preset.exitIfExemptSellsPct != null && disposedPct >= preset.exitIfExemptSellsPct) {
       // A transfer-out is seen ~1 block before the dump wallet sells: exit at the current
       // price. An exempt curve sell has already moved the price: exit after it.
       if (e.kind === 'trade') marketPrice = e.ev.priceAfter;
@@ -352,7 +352,7 @@ export function simulateSnipe(
   }
 
   if (remaining > 0) {
-    if (preset.timeoutSec !== undefined) {
+    if (preset.timeoutSec != null) {
       sell(deadline, remaining, marketPrice, 'timeout');
       lastTs = deadline;
     } else {
@@ -503,7 +503,7 @@ export function gridSearch(
             takeProfits,
             stopLossPct: sl,
             ...(trailing ? { trailing } : { trailing: undefined }),
-            ...(timeout !== null ? { timeoutSec: timeout } : { timeoutSec: undefined }),
+            timeoutSec: timeout,
           };
           const summary = summarize(items.map((it) => simulateSnipe(it.launch, it.trades, preset, it.transfers)));
           n = summary.n;

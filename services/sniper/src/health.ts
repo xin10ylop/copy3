@@ -10,7 +10,7 @@ export interface HealthState {
   clock: ClockSnapshot;
   rttMs: number;
   counters: Record<string, number>;
-  positions: { key: string; token: string; pnlPct: number | null; tokensHeld: string }[];
+  positions: { key: string; token: string; pnlPct: number | null; tokensHeld: string; phase?: string }[];
   lastError: string | null;
   nonce: number | null;
   plays: number;
@@ -57,6 +57,7 @@ export function prometheus(s: HealthState): string {
   g('sniper_plays', s.plays, 'enabled plays in memory');
   g('sniper_armed', s.armed, 'armed candidates in memory');
   g('sniper_positions_open', s.positions.length, 'open positions');
+  g('sniper_positions_terminal', s.positions.filter((p) => p.phase === 'graduated' || p.phase === 'stuck').length, 'graduated / stuck positions needing manual action');
   for (const [k, v] of Object.entries(s.counters)) g(`sniper_${k}`, v, `counter ${k}`);
   return `${lines.join('\n')}\n`;
 }

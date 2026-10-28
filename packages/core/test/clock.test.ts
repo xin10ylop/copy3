@@ -132,6 +132,24 @@ describe('SequencerClock', () => {
     expect(Math.abs(clock.predictBoundaryMs(T0 + 61) - truth(T0 + 61))).toBeLessThan(1);
   });
 
+  it('L3: a poisoned far-future timestamp does not freeze the clock (self-reset after 3 regressions)', () => {
+    const c = new SequencerClock({ minSeconds: 3 });
+    const S = 1_800_000_000;
+    for (let s = 0; s < 10; s++) for (let k = 0; k < 10; k++) c.ingest(S + s, (S + s) * 1000 + 40 + k * 100, s * 10 + k);
+    expect(c.predictBoundaryMs(S + 11)).toBeCloseTo((S + 11) * 1000 + 40, 6);
+    c.ingest(9_999_999_999, (S + 10) * 1000 + 40, 100); // bogus block
+    for (let s = 10; s < 20; s++) for (let k = 0; k < 10; k++) c.ingest(S + s, (S + s) * 1000 + 40 + k * 100, 101 + (s - 10) * 10 + k);
+    expect(c.selfResets).toBe(1);
+    expect(c.ready).toBe(true);
+    expect(c.snapshot().recentSeconds.at(-1)!.ts).toBe(S + 19);
+    expect(c.predictBoundaryMs(S + 21)).toBeCloseTo((S + 21) * 1000 + 40, 6);
+    // ordinary out-of-order replays (≤ 2 s old) never reset it
+    c.ingest(S + 18, (S + 20) * 1000, 1);
+    c.ingest(S + 18, (S + 20) * 1000, 2);
+    c.ingest(S + 18, (S + 20) * 1000, 3);
+    expect(c.selfResets).toBe(1);
+  });
+
   it('falls back to ts·1000 + fallbackOffset before it is ready', () => {
     const c = new SequencerClock({ fallbackOffsetMs: 40 });
     c.ingest(T0, T0 * 1000 + 5);

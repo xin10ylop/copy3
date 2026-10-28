@@ -2,17 +2,24 @@ import { describe, it, expect } from 'vitest';
 import { parsePreset, parsePlay, PresetSchema, PlayTriggerSchema, AddressSchema } from '../src/types.js';
 
 describe('parsePreset defaults (SPEC §4)', () => {
-  it('fills the video defaults from an empty object', () => {
+  it('fills the backtest #2 defaults from an empty object (docs/BACKTEST.md)', () => {
     const p = parsePreset({});
     expect(p.buyEth).toBe(0.07);
     expect(p.maxTaxBps).toBe(1000);
     expect(p.burst).toEqual({ startMs: -120, spacingMs: 15, count: 10 });
     expect(p.stopAfter).toBe(1);
-    expect(p.takeProfits).toEqual([{ pct: 150, sellPct: 100 }]);
-    expect(p.trailing).toEqual({ activatePct: 100, dropPct: 25 });
+    expect(p.takeProfits).toEqual([]);
+    expect(p.trailing).toEqual({ activatePct: 50, dropPct: 20 });
     expect(p.stopLossPct).toBe(40);
+    expect(p.timeoutSec).toBe(60);
+    expect(p.exitIfExemptSellsPct).toBe(0); // dump exit on the first exempt transfer-out/sell
     expect(p.abortIfExemptSellInLaunchBlock).toBe(true);
     expect(p.firstBuyOnly).toBe(true);
+  });
+
+  it('M3: maxTaxBps is capped at 5000 (≥ 9900 would disable the tax gate)', () => {
+    expect(parsePreset({ maxTaxBps: 5000 }).maxTaxBps).toBe(5000);
+    for (const m of [5001, 9900, 65535]) expect(() => parsePreset({ maxTaxBps: m })).toThrow();
   });
 
   it('respects overrides', () => {

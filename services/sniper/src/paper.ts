@@ -1,8 +1,11 @@
 /**
  * Paper execution: same pipeline as live, but no tx is sent. The planned burst is recorded
  * (members marked `skipped`); the fill is simulated at the first block of launch+1 s seen on
- * the feed, using the curve state right before that block (eth_call at block−1) and the real
- * fee model: snipe tax for that second (618 bps at +1 s) + 1 % curve fee + creator tax.
+ * the feed with the real fee model: snipe tax for that second (618 bps at +1 s) + 1 % curve
+ * fee + creator tax. Two fill models bracket the real outcome (L4, `PAPER_FILL`):
+ *  - `first` (optimistic): our buy is first in that block — curve state at block−1;
+ *  - `last`  (pessimistic): our buy comes after every other buy of that block — state at block.
+ * Paper PnL is therefore a bracket, not a forecast: run both and compare.
  * Sells are simulated with `quoteSell` on the latest known reserves.
  */
 import { CURVE_FEE_BPS, quoteBuy, quoteSell, snipeTaxBps, snipeTaxWeiFor, type FeedBlock, type Reserves } from '@hood/core';
@@ -26,6 +29,8 @@ export interface PaperOptions {
   /** creator tax for a curve (from the launch call) */
   creatorTaxBps: (curve: Address) => number;
   feeBps?: number;
+  /** L4: fill model, default 'first' */
+  fill?: 'first' | 'last';
 }
 
 export class PaperExecutor implements ExecutionBackend {
@@ -65,6 +70,17 @@ export class PaperExecutor implements ExecutionBackend {
       if (b.block <= run.launch.block || b.timestamp < launchTs + 1) continue;
       const elapsed = b.timestamp - launchTs;
       const tax = snipeTaxBps(elapsed);
+      if (!run.sendCleared) {
+        // L2: the same last-moment kill-switch / daily-loss check the live burst runs
+        const why = p.order.guard?.() ?? null;
+        if (why) {
+          this.pending.delete(key);
+          run.notes.push(`send blocked before the first member: ${why}`);
+          p.resolve(null);
+          continue;
+        }
+        run.sendCleared = true;
+      }
       if (tax > run.maxTaxBps || b.block > run.deadlineBlock) {
         if (elapsed >= 3 || b.block > run.deadlineBlock) {
           this.pending.delete(key);
@@ -93,11 +109,16 @@ export class PaperExecutor implements ExecutionBackend {
 
   private async fillAt(p: PendingPaper, b: FeedBlock, taxBps: number): Promise<Fill | null> {
     const { run, curve } = p.order;
+    const mode = this.o.fill ?? 'first';
+    // first: state right before the +1 s block; last: state after it (behind every other buyer)
+    const at = mode === 'last' ? b.block : b.block - 1;
     let reserves: Reserves | null = null;
+    let reservesBlock: number | undefined = at;
     try {
-      reserves = await this.o.chain.getReserves(curve, b.block - 1); // state right before the +1 s block
+      reserves = await this.o.chain.getReserves(curve, at);
     } catch {
       reserves = this.o.book?.(curve) ?? null;
+      reservesBlock = undefined;
     }
     if (!reserves) {
       run.notes.push('paper: no reserves for fill');
@@ -119,11 +140,13 @@ export class PaperExecutor implements ExecutionBackend {
       taxPaid,
       entryPrice: Number(run.quoteIn) / Number(tokensOut),
       reserves,
+      ...(reservesBlock !== undefined ? { reservesBlock } : {}),
     };
   }
 
   async exit(order: ExitOrder): Promise<ExitResult> {
     this.stats.exits++;
+    if (order.tokensIn <= 0n) return { ok: false, tokensIn: 0n, quoteOut: 0n, error: 'zero-size exit refused (L1)' };
     let r = this.o.book?.(order.curve) ?? null;
     if (!r) r = await this.o.chain.getReserves(order.curve).catch(() => null);
     if (!r) return { ok: false, tokensIn: order.tokensIn, quoteOut: 0n, error: 'paper: no reserves' };

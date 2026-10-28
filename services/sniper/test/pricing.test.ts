@@ -14,6 +14,14 @@ describe('pricing', () => {
     expect(worstTaxBps(9900)).toBe(9900);
   });
 
+  it('M3: minTokensOut is never priced at the launch-second tax, even for a preset that bypassed zod', () => {
+    const q = parseEther('0.07');
+    const capped = planMinOut({ ...parsePreset({ slippageBps: 3000 }), maxTaxBps: 9900 }, START, q, 0);
+    expect(capped.taxBps).toBe(618);
+    expect(capped.minTokensOut).toBe(planMinOut(parsePreset({ maxTaxBps: 5000, slippageBps: 3000 }), START, q, 0).minTokensOut);
+    expect(capped.minTokensOut).toBeGreaterThan(10n ** 24n);
+  });
+
   it('maxEntryMcapEth turns into an on-chain minTokensOut: above the cap the buy reverts', () => {
     const p = parsePreset({ buyEth: 0.07, maxEntryMcapEth: 4 });
     const q = parseEther('0.07');

@@ -67,16 +67,24 @@ export const PresetSchema = z.object({
   stopAfter: z.number().int().positive().default(1),
   firstBuyOnly: z.boolean().default(true),
   tokenCap: z.boolean().default(false),
-  takeProfits: z.array(TakeProfitSchema).default([{ pct: 150, sellPct: 100 }]),
-  /** null disables the trailing stop; omitted = SPEC default. */
-  trailing: TrailingSchema.nullable().default({ activatePct: 100, dropPct: 25 }),
+  // Exit defaults = the preset the 3-day walk-forward picked (docs/BACKTEST.md, Backtest #2):
+  // no fixed take-profit, trailing 50/20, SL 40 %, 60 s timeout, exit on the first exempt outflow.
+  /** fixed take-profit ladder; default none (the trailing stop takes profit). */
+  takeProfits: z.array(TakeProfitSchema).default([]),
+  /** null disables the trailing stop; omitted = default (arm at +50 %, exit on a 20 % pull-back). */
+  trailing: TrailingSchema.nullable().default({ activatePct: 50, dropPct: 20 }),
   stopLossPct: z.number().default(40),
-  timeoutSec: z.number().positive().optional(),
+  /** null disables the timeout. */
+  timeoutSec: z.number().positive().nullable().default(60),
   minQuoteReserveEth: z.number().optional(),
   maxEntryMcapEth: z.number().optional(),
   abortIfExemptSellInLaunchBlock: z.boolean().default(true),
-  /** exit if an exempt wallet dumps ≥ this percent of its holding (via transfer or sell). */
-  exitIfExemptSellsPct: z.number().optional(),
+  /**
+   * exit if exempt (team) wallets moved out ≥ this percent of their holding (transfer or sell).
+   * Default 0 = exit on the FIRST exempt transfer-out/sell (dump exit on); omit-able per play.
+   */
+  /** exit when exempt wallets have sold/transferred out at least this % of their holding; null disables. */
+  exitIfExemptSellsPct: z.number().min(0).nullable().default(0),
 });
 export type Preset = z.infer<typeof PresetSchema>;
 

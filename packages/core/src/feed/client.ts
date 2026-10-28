@@ -47,6 +47,14 @@ export interface FeedClientOptions {
   createSocket?: (url: string, headers: Record<string, string>) => FeedSocket;
 }
 
+/** ws RawData (Buffer | ArrayBuffer | Buffer[] fragments) → text. */
+function rawText(data: WebSocket.RawData | string): string {
+  if (typeof data === 'string') return data;
+  if (Buffer.isBuffer(data)) return data.toString('utf8');
+  if (Array.isArray(data)) return Buffer.concat(data).toString('utf8');
+  return Buffer.from(data).toString('utf8');
+}
+
 export interface FeedGap {
   from: number;
   to: number;
@@ -236,7 +244,7 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
       const receivedAt = this.now();
       if (this.socket !== sock || isBinary) return;
       try {
-        this.handleFrame(typeof data === 'string' ? data : data.toString(), receivedAt);
+        this.handleFrame(rawText(data), receivedAt);
       } catch {
         /* handleFrame never throws; belt and braces inside the ws handler */
       }

@@ -43,18 +43,23 @@ export function evaluatePosition(s: PositionState, markPrice: number, nowMs: num
   if (p.trailing && s.peakPnlPct >= p.trailing.activatePct) s.trailingArmed = true;
   const all = (reason: ExitReason): ExitSignal => ({ reason, sellTokens: s.tokensHeld, pnlPct, all: true });
 
-  if (p.exitIfExemptSellsPct !== undefined && s.exemptOutflowPct > 0 && s.exemptOutflowPct >= p.exitIfExemptSellsPct) return all('exempt_dump');
+  if (p.exitIfExemptSellsPct != null && s.exemptOutflowPct > 0 && s.exemptOutflowPct >= p.exitIfExemptSellsPct) return all('exempt_dump');
   if (pnlPct <= -p.stopLossPct) return all('stop_loss');
   if (s.trailingArmed && p.trailing) {
     const peakPrice = s.entryPrice * (1 + s.peakPnlPct / 100);
     if (markPrice <= peakPrice * (1 - p.trailing.dropPct / 100)) return all('trailing');
   }
-  if (p.timeoutSec !== undefined && nowMs - s.openedAtMs >= p.timeoutSec * 1000) return all('timeout');
+  if (p.timeoutSec != null && nowMs - s.openedAtMs >= p.timeoutSec * 1000) return all('timeout');
   const levels = [...p.takeProfits].sort((a, b) => a.pct - b.pct);
-  const next = levels[s.tpHit];
-  if (next && pnlPct >= next.pct) {
+  for (let next = levels[s.tpHit]; next && pnlPct >= next.pct; next = levels[s.tpHit]) {
     const sellAll = next.sellPct >= 100;
     const sellTokens = sellAll ? s.tokensHeld : (s.tokensHeld * BigInt(Math.round(next.sellPct * 100))) / 10_000n;
+    // L1: a level whose share rounds to 0 tokens is consumed without an order (an exit of 0
+    // tokens is never sent: the contract refuses it, and it used to mean "sell everything")
+    if (sellTokens <= 0n) {
+      s.tpHit++;
+      continue;
+    }
     return { reason: `tp${s.tpHit + 1}`, sellTokens, pnlPct, all: sellTokens >= s.tokensHeld };
   }
   return null;

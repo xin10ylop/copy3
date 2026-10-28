@@ -89,10 +89,10 @@ const cases: Case[] = [
   { name: 'bad regex is reported, never matches', trigger: { nameRegex: '(' }, expect: false, reason: /bad regex/ },
 ];
 
-describe('Rules.evaluate (table)', () => {
+describe('Rules.evaluate (table, paper mode: every identity matcher arms a run)', () => {
   for (const c of cases) {
     it(c.name, () => {
-      const r = new Rules();
+      const r = new Rules({ mode: 'paper' });
       r.setPlays([play({ id: 1, trigger: c.trigger })]);
       r.setArmed(c.armed ?? []);
       const ev = launch(c.event);
@@ -106,9 +106,41 @@ describe('Rules.evaluate (table)', () => {
   }
 });
 
+describe('H1: live plays need a non-spoofable matcher', () => {
+  const live = (trigger: Record<string, unknown>, armedList: ArmedCandidate[] = []): Rules => {
+    const r = new Rules({ mode: 'live' });
+    r.setPlays([play({ id: 1, trigger })]);
+    r.setArmed(armedList);
+    return r;
+  };
+  it('name / symbol / team wallets alone never arm a LIVE run (anyone can launch with those)', () => {
+    for (const t of [{ nameRegex: 'shiba' }, { symbolRegex: '^SHIB$' }, { teamWalletsAny: [TEAM] }, { nameRegex: 'shiba', teamWalletsAny: [TEAM], require: ['nameRegex', 'teamWalletsAny'] }]) {
+      const r = live(t);
+      expect(r.evaluate(launch(), NOW)).toHaveLength(0);
+      expect(r.explain(launch(), NOW)[0]!.reasons.join()).toMatch(/non-spoofable/);
+      // the same play still arms a paper run
+      const pr = new Rules({ mode: 'paper' });
+      pr.setPlays([play({ id: 1, trigger: t })]);
+      expect(pr.evaluate(launch(), NOW)).toHaveLength(1);
+    }
+  });
+  it('deployerIn or armedWallet (bound to the tx signer / TokenLaunched.deployer) arm a live run', () => {
+    expect(live({ deployerIn: [DEV] }).evaluate(launch(), NOW)).toHaveLength(1);
+    expect(live({ armedWallet: armedRule }, [armed()]).evaluate(launch(), NOW)).toHaveLength(1);
+    // an anchor plus a spoofable filter: both must hold as configured
+    expect(live({ deployerIn: [DEV], nameRegex: 'doge', require: ['deployerIn', 'nameRegex'] }).evaluate(launch(), NOW)).toHaveLength(0);
+    expect(live({ deployerIn: [OTHER], nameRegex: 'shiba' }).evaluate(launch(), NOW)).toHaveLength(0); // OR hit only on the name
+  });
+  it('the default mode is live (fail closed)', () => {
+    const r = new Rules();
+    r.setPlays([play({ id: 1, trigger: { nameRegex: 'shiba' } })]);
+    expect(r.evaluate(launch(), NOW)).toHaveLength(0);
+  });
+});
+
 describe('Rules state', () => {
   it('returns every matching play in id order with its preset; disabled plays are ignored', () => {
-    const r = new Rules();
+    const r = new Rules({ mode: 'paper' });
     r.setPlays([
       play({ id: 7, trigger: { nameRegex: 'shiba' }, preset: { buyEth: 0.2 } }),
       play({ id: 3, trigger: { deployerIn: [DEV] }, preset: { buyEth: 0.05 } }),

@@ -15,3 +15,5 @@ export * from './positions.js';
 export * from './recorder.js';
 export * from './health.js';
 export * from './sniper.js';
+export * from './preflight.js';
+export * from './guards.js';

@@ -40,6 +40,15 @@ export interface SniperHolding {
   balance: bigint;
 }
 
+/** PonsSniper admin state checked at live startup (M4 / live-mode gate). */
+export interface SniperConfigState {
+  owner: Address;
+  factory: Address;
+  maxQuoteIn: bigint;
+  /** operators(key) for every key passed, same order */
+  operators: boolean[];
+}
+
 export interface ChainClient {
   getReserves(curve: Address, blockNumber?: number): Promise<Reserves>;
   getBlockNumber(): Promise<number>;
@@ -50,6 +59,8 @@ export interface ChainClient {
   estimateGas(tx: { from: Address; to: Address; data: Hex; value?: bigint }): Promise<bigint>;
   /** most recent TokenLaunched {token, curve} within `lookbackBlocks` (startup checks) */
   recentLaunch(lookbackBlocks: number): Promise<{ token: Address; curve: Address } | null>;
+  /** owner / factory / maxQuoteIn / operators(keys) of the PonsSniper contract */
+  readSniperConfig(sniper: Address, keys: readonly Address[]): Promise<SniperConfigState>;
   getTransactionCount(address: Address, tag: 'latest' | 'pending'): Promise<number>;
   getReceipt(hash: Hex): Promise<ReceiptLite | null>;
   getGasPrice(): Promise<bigint>;
@@ -59,7 +70,7 @@ export interface ChainClient {
   getBlockTimestamp(blockNumber: number): Promise<number>;
   /** TokenLaunched logs from the factory (ws). Optional: without ws we poll receipts. */
   watchLaunches?(cb: (log: RawLog) => void): () => void;
-  /** CurveBuy/CurveSell on `curve` and Transfer on `token` (ws). */
+  /** CurveBuy/CurveSell/CurveCompleted on `curve` and Transfer on `token` (ws). */
   watchToken?(token: Address, curve: Address, cb: (log: RawLog) => void): () => void;
 }
 
@@ -120,13 +131,28 @@ export class ViemChain implements ChainClient {
     const logs = await this.http.getLogs({
       address: PONS_V2.factory as Address,
       event: getAbiItem({ abi: factoryAbi, name: 'TokenLaunched' }),
-      fromBlock: head - BigInt(lookbackBlocks),
+      fromBlock: head > BigInt(lookbackBlocks) ? head - BigInt(lookbackBlocks) : 0n,
       toBlock: head,
     });
     const last = logs.at(-1);
     if (!last) return null;
     const p = parseTokenLaunchedLog(toRaw(last as Log));
     return { token: p.token as Address, curve: p.curve as Address };
+  }
+
+  async readSniperConfig(sniper: Address, keys: readonly Address[]): Promise<SniperConfigState> {
+    const [owner, factory, maxQuoteIn, ...ops] = await Promise.all([
+      this.http.readContract({ address: sniper, abi: sniperAbi, functionName: 'owner' }),
+      this.http.readContract({ address: sniper, abi: sniperAbi, functionName: 'factory' }),
+      this.http.readContract({ address: sniper, abi: sniperAbi, functionName: 'maxQuoteIn' }),
+      ...keys.map((k) => this.http.readContract({ address: sniper, abi: sniperAbi, functionName: 'operators', args: [k] })),
+    ]);
+    return {
+      owner: owner.toLowerCase() as Address,
+      factory: factory.toLowerCase() as Address,
+      maxQuoteIn: BigInt(maxQuoteIn),
+      operators: ops.map((o) => o === true),
+    };
   }
 
   async getReceipt(hash: Hex): Promise<ReceiptLite | null> {
@@ -199,7 +225,11 @@ export class ViemChain implements ChainClient {
     if (!this.ws) return () => undefined;
     const a = this.ws.watchEvent({
       address: curve,
-      events: [getAbiItem({ abi: curveAbi, name: 'CurveBuy' }), getAbiItem({ abi: curveAbi, name: 'CurveSell' })],
+      events: [
+        getAbiItem({ abi: curveAbi, name: 'CurveBuy' }),
+        getAbiItem({ abi: curveAbi, name: 'CurveSell' }),
+        getAbiItem({ abi: curveAbi, name: 'CurveCompleted' }),
+      ],
       onLogs: (logs) => logs.forEach((l) => cb(toRaw(l as Log))),
     });
     const b = this.ws.watchEvent({

@@ -6,10 +6,13 @@
  *  - `reserve()` takes a concurrency slot at decision time — nothing else; a spoofed or failed
  *    launch must not burn `stopAfter` or `firstBuyOnly` for the real one.
  *  - `confirm()` runs once the receipt proved the launch (TokenLaunched from the factory with the
- *    same deployer): counts the play, marks the deployer + token.
+ *    same deployer): counts the play for `stopAfter`, marks the token (token cap) and the
+ *    deployer (`firstBuyOnly`: this deployer's first real launch has been played).
  *  - `release()` frees the slot of a run that ended without a position; a confirmed run that never
- *    filled is un-counted again so the next launch of that deployer can still be played.
+ *    filled is un-counted for `stopAfter` (the DB counts pending/open/closed rows only), while the
+ *    token and the deployer stay marked (the launch was real and has been played).
  *  - positions (incl. ones rebuilt at startup) hold their slot until closed.
+ *  - `sendCheck()` (kill switch, daily loss) runs at decide time AND right before the first send.
  */
 import { mcapFromReserves, type Preset, type Reserves } from '@hood/core';
 import { formatEther } from 'viem';
@@ -49,8 +52,6 @@ export class Risk {
   private readonly playDeployers = new Set<string>();
   /** latest L2 gas price (wei), refreshed off the hot path */
   gasPriceWei: bigint | null = null;
-  /** PonsSniper ETH balance (live), refreshed off the hot path; null = unknown */
-  contractBalanceWei: bigint | null = null;
 
   constructor(private readonly opts: RiskOptions) {}
 
@@ -118,13 +119,11 @@ export class Risk {
     const n = this.countsByPlay.get(playId) ?? 0;
     if (this.opts.mode === 'live' && n >= p.stopAfter) reasons.push(`stopAfter ${p.stopAfter} reached (${n})`);
     if (l.token && this.tokens.has(l.token)) reasons.push('token already sniped');
-    if (p.firstBuyOnly && this.playDeployers.has(`${playId}:${l.event.deployer}`)) reasons.push('firstBuyOnly: deployer already sniped by this play');
+    if (p.firstBuyOnly && this.playDeployers.has(`${playId}:${l.event.deployer.toLowerCase()}`)) reasons.push('firstBuyOnly: deployer already sniped by this play');
     if (p.maxFeeGwei <= 0) reasons.push('maxFeeGwei must be > 0');
     if (this.gasPriceWei !== null && Number(this.gasPriceWei) / 1e9 > this.opts.maxGasPriceGwei)
       reasons.push(`gas price ${Number(this.gasPriceWei) / 1e9} gwei > cap ${this.opts.maxGasPriceGwei}`);
     if (p.buyEth <= 0) reasons.push('buyEth must be > 0');
-    if (this.opts.mode === 'live' && this.contractBalanceWei !== null && this.contractBalanceWei < BigInt(Math.round(p.buyEth * 1e18)))
-      reasons.push(`contract balance ${formatEther(this.contractBalanceWei)} ETH < buy ${p.buyEth}`);
     return { ok: reasons.length === 0, reasons };
   }
 
@@ -154,6 +153,16 @@ export class Risk {
     this.openCount++;
   }
 
+  /** Re-check token cap / firstBuyOnly / stopAfter with the confirmed launch (a sibling run may have confirmed first). */
+  confirmCheck(playId: number, p: Preset, token: string, deployer: string): RiskVerdict {
+    const reasons: string[] = [];
+    if (this.tokens.has(token.toLowerCase())) reasons.push('token already sniped');
+    if (p.firstBuyOnly && this.playDeployers.has(`${playId}:${deployer.toLowerCase()}`)) reasons.push('firstBuyOnly: deployer already sniped by this play');
+    const n = this.countsByPlay.get(playId) ?? 0;
+    if (this.opts.mode === 'live' && n >= p.stopAfter) reasons.push(`stopAfter ${p.stopAfter} reached (${n})`);
+    return { ok: reasons.length === 0, reasons };
+  }
+
   /** The receipt proved the launch: count it for stopAfter / firstBuyOnly / token cap. */
   confirm(playId: number, token: string, deployer: string): void {
     this.countsByPlay.set(playId, (this.countsByPlay.get(playId) ?? 0) + 1);
@@ -161,18 +170,28 @@ export class Risk {
     this.playDeployers.add(`${playId}:${deployer.toLowerCase()}`);
   }
 
-  /** A run ended without a position: free its slot; un-count a confirmed run that never filled. */
-  release(playId: number, confirmed: { deployer: string } | null): void {
+  /** A run ended without a position: free its slot; un-count a confirmed run for stopAfter. */
+  release(playId: number, confirmed: boolean): void {
     this.openCount = Math.max(0, this.openCount - 1);
-    if (confirmed) {
-      this.countsByPlay.set(playId, Math.max(0, (this.countsByPlay.get(playId) ?? 1) - 1));
-      this.playDeployers.delete(`${playId}:${confirmed.deployer.toLowerCase()}`);
-    }
+    if (confirmed) this.countsByPlay.set(playId, Math.max(0, (this.countsByPlay.get(playId) ?? 1) - 1));
   }
 
-  /** A position rebuilt at startup holds a slot. */
-  adoptPosition(): void {
+  /** firstBuyOnly bookkeeping (tests / introspection). */
+  hasPlayedDeployer(playId: number, deployer: string): boolean {
+    return this.playDeployers.has(`${playId}:${deployer.toLowerCase()}`);
+  }
+
+  /** A position rebuilt at startup holds a slot (and its token / play count). */
+  adoptPosition(playId: number, token: string, deployer: string | null): void {
     this.openCount++;
+    this.tokens.add(token.toLowerCase());
+    if (deployer) this.playDeployers.add(`${playId}:${deployer.toLowerCase()}`);
+  }
+
+  /** Realized PnL of a position closed without a slot here (reconciled after startup). Live only. */
+  bookRealized(pnlEth: number): void {
+    this.rollDay();
+    if (this.opts.mode === 'live') this.realizedTodayEth += pnlEth;
   }
 
   onPositionClosed(pnlEth: number): void {

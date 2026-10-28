@@ -23,10 +23,12 @@ interface IArbSys {
 ///         tokens stay here, pre-approved to the curve, so `exit` is a single call.
 /// @dev    Buys are paid from this contract's ETH balance (fund it via `receive`); burst txs
 ///         should carry `msg.value = 0` so that every member stays executable and the
-///         executor's nonces are always consumed. Sale proceeds stay in the contract (they
-///         fund the next snipe); the owner sweeps profits with `sweepEth`.
+///         executor's nonces are always consumed. Sale proceeds are forwarded to `treasury`
+///         (default: the current owner); if the receiver cannot take ETH they stay here and
+///         the owner sweeps them with `sweepEth` — an exit never reverts because of the receiver.
 ///         Operator keys are hot: they can only buy real Pons curves (verified against the
-///         immutable factory), at most `maxQuoteIn` per token, once per token.
+///         immutable factory), at most `maxQuoteIn` per token, once per token, and they can only
+///         sell into those curves; they cannot move ETH or tokens anywhere else.
 contract PonsSniper {
     // ---------------------------------------------------------------- errors / events
     error NotOwner();
@@ -48,6 +50,9 @@ contract PonsSniper {
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event MaxQuoteInSet(uint256 maxQuoteIn);
+    event TreasurySet(address indexed treasury);
+    event ProceedsSent(address indexed to, uint256 amount);
+    event ProceedsHeld(address indexed to, uint256 amount);
 
     // ---------------------------------------------------------------- curve call encoding
     /// @dev buy(uint256 quoteIn, uint256 minTokensOut, address recipient)   — RESEARCH §3, §7.1
@@ -58,11 +63,16 @@ contract PonsSniper {
     bytes4 internal constant FACTORY_GET_LAUNCHED = 0x3cf28b5a;
     /// @dev the snipe tax is 9900 in the launch second; a cap at/above it disables the gate
     uint256 internal constant TAX_CAP_LIMIT = 9900;
+    /// @dev gas forwarded with the proceeds (enough for an EOA, a Safe or a splitter; a receiver
+    ///      that burns more cannot make the exit run out of gas)
+    uint256 internal constant PROCEEDS_GAS = 50_000;
 
     // ---------------------------------------------------------------- storage
     address public owner; // packed with maxQuoteIn (one slot)
     uint96 public maxQuoteIn;
     address public pendingOwner;
+    /// @dev receiver of exit proceeds; address(0) = the current owner, address(this) = keep here
+    address payable public treasury;
     mapping(address => bool) public operators;
     mapping(address => bool) public bought;
     /// @dev true on Arbitrum Nitro chains: deadlines are L2 block numbers from ArbSys.
@@ -127,7 +137,8 @@ contract PonsSniper {
         emit Sniped(token, curve, quoteIn, tokensOut, tax);
     }
 
-    /// @notice Sell `tokensIn` (> 0) of `token` on its factory curve; proceeds stay in the contract.
+    /// @notice Sell `tokensIn` (> 0; 0 reverts `NothingToSell`, use `exitAll`) of `token` on its
+    ///         factory curve; proceeds go to the treasury.
     function exit(address curve, address token, uint256 tokensIn, uint256 minQuoteOut)
         external
         onlyOperator
@@ -145,6 +156,12 @@ contract PonsSniper {
     function setOperator(address operator, bool enabled) external onlyOwner {
         operators[operator] = enabled;
         emit OperatorSet(operator, enabled);
+    }
+
+    /// @notice Where exit proceeds go (address(0) = owner, this contract = compound in place).
+    function setTreasury(address payable t) external onlyOwner {
+        treasury = t;
+        emit TreasurySet(t);
     }
 
     function setMaxQuoteIn(uint96 v) external onlyOwner {
@@ -212,6 +229,16 @@ contract PonsSniper {
         _curveSell(curve, tokensIn, minQuoteOut);
         quoteOut = address(this).balance - before;
         emit Exited(token, curve, tokensIn, quoteOut);
+        _forward(quoteOut);
+    }
+
+    /// @dev Pay the proceeds to the treasury; on failure keep them (sweepable), never revert.
+    function _forward(uint256 amount) internal {
+        address payable to = treasury == address(0) ? payable(owner) : treasury;
+        if (amount == 0 || to == address(this)) return;
+        (bool ok,) = to.call{value: amount, gas: PROCEEDS_GAS}("");
+        if (ok) emit ProceedsSent(to, amount);
+        else emit ProceedsHeld(to, amount);
     }
 
     /// @dev `curve` must be the factory's curve for `token` (a hot operator key cannot point the

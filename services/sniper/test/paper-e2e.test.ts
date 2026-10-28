@@ -8,7 +8,7 @@ import { ManualScheduler } from '../src/scheduler.js';
 import { Sniper } from '../src/sniper.js';
 import { MemoryStore } from '../src/store.js';
 import { FakeChain, curveTradeLog, transferLog } from './helpers/fakes.js';
-import { LAUNCH, amlil, emptyBlock, launchBlock, launchFixture, play, tokenLaunchedLog } from './helpers/fixtures.js';
+import { LAUNCH, amlil, emptyBlock, launchBlock, launchFixture, launchReceipt, play, tokenLaunchedLog } from './helpers/fixtures.js';
 
 const T = LAUNCH.ts;
 const OFFSET = 45; // first block of a second arrives 45 ms after the tick
@@ -48,7 +48,7 @@ function harness(presetOver: Record<string, unknown>, opts: { receipt?: boolean 
   chain.latest.set(LAUNCH.curve, INITIAL);
   chain.atBlock = (_c, b) => (b >= LAUNCH.block + 5 ? afterTeam() : INITIAL);
   if (opts.receipt !== false) {
-    chain.receipts.set(LAUNCH.txHash, { transactionHash: LAUNCH.txHash, status: 'success', blockNumber: LAUNCH.block, gasUsed: 3_627_212n, logs: [tokenLaunchedLog] });
+    chain.receipts.set(LAUNCH.txHash, launchReceipt());
   }
   const sched = new ManualScheduler((T - 31) * 1000);
   // eslint-disable-next-line prefer-const
@@ -149,6 +149,8 @@ describe('paper mode end-to-end (AMLIL timeline on the SHIBA launch fixture)', (
     for (let s = 10; s >= 1; s--) h.second(T - s, LAUNCH.block - 2 - s * 10);
     h.second(T, LAUNCH.block - 2, 2);
     await settle();
+    // the node pushes TokenLaunched over ws; the receipt (still required, H1) exists from then on
+    h.chain.receipts.set(LAUNCH.txHash, launchReceipt());
     h.chain.launchWatcher!(tokenLaunchedLog);
     await waitFor(() => h.sniper.activeRuns[0]?.plan !== undefined);
     expect(h.sniper.activeRuns[0]!.launch.addressSource).toBe('log');

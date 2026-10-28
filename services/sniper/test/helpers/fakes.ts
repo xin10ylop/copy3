@@ -1,6 +1,6 @@
 import { TOPICS, type RawLog, type Reserves, type RpcTxLike } from '@hood/core';
 import type { Address, Hex } from 'viem';
-import type { ChainClient, ReceiptLite } from '../../src/chain.js';
+import type { ChainClient, ReceiptLite, SniperConfigState, SniperHolding } from '../../src/chain.js';
 import type { RawSender, SendResult } from '../../src/rpc.js';
 
 export class FakeChain implements ChainClient {
@@ -16,6 +16,19 @@ export class FakeChain implements ChainClient {
   tokenWatchers = new Map<string, (l: RawLog) => void>();
   launchWatcher: ((l: RawLog) => void) | null = null;
   blockTs = new Map<number, number>();
+  /** per-address nonce (falls back to `nonce`) */
+  nonces = new Map<string, number>();
+  /** native balances (default 1 ETH) */
+  ethBalances = new Map<string, bigint>();
+  blockNumber = 0;
+  /** token → PonsSniper holding; `readSniperFails` makes every read throw (RPC down) */
+  holdings = new Map<string, SniperHolding>();
+  readSniperFails = false;
+  graduated = new Set<string>();
+  receiptFails = false;
+  estimate: bigint | Error = 180_000n;
+  recent: { token: Address; curve: Address } | null = null;
+  sniperConfig: SniperConfigState | null = null;
 
   async getReserves(curve: Address, blockNumber?: number): Promise<Reserves> {
     this.calls.push(`getReserves:${curve}:${blockNumber ?? 'latest'}`);
@@ -23,19 +36,44 @@ export class FakeChain implements ChainClient {
     if (!r) throw new Error('no contract code');
     return r;
   }
-  async getTransactionCount(): Promise<number> {
+  async getTransactionCount(address?: Address): Promise<number> {
     this.calls.push('getTransactionCount');
-    return this.nonce;
+    return (address ? this.nonces.get(address.toLowerCase()) : undefined) ?? this.nonce;
   }
   async getReceipt(hash: Hex): Promise<ReceiptLite | null> {
     this.calls.push(`getReceipt:${hash.slice(0, 10)}`);
+    if (this.receiptFails) throw new Error('HTTP 429');
     return this.receipts.get(hash.toLowerCase()) ?? null;
+  }
+  async getBlockNumber(): Promise<number> {
+    this.calls.push('getBlockNumber');
+    return this.blockNumber;
+  }
+  async readSniper(_sniper: Address, token: Address): Promise<SniperHolding> {
+    this.calls.push(`readSniper:${token}`);
+    if (this.readSniperFails) throw new Error('HTTP 429 rate limited');
+    return this.holdings.get(token.toLowerCase()) ?? { bought: false, balance: 0n };
+  }
+  async curveGraduated(curve: Address): Promise<boolean> {
+    this.calls.push(`curveGraduated:${curve}`);
+    return this.graduated.has(curve.toLowerCase());
+  }
+  async estimateGas(): Promise<bigint> {
+    if (this.estimate instanceof Error) throw this.estimate;
+    return this.estimate;
+  }
+  async recentLaunch(): Promise<{ token: Address; curve: Address } | null> {
+    return this.recent;
+  }
+  async readSniperConfig(_s: Address, keys: readonly Address[]): Promise<SniperConfigState> {
+    if (!this.sniperConfig) throw new Error('no contract');
+    return { ...this.sniperConfig, operators: keys.map((_k, i) => this.sniperConfig!.operators[i] ?? false) };
   }
   async getGasPrice(): Promise<bigint> {
     return 20_600_000n;
   }
-  async getBalance(): Promise<bigint> {
-    return 10n ** 18n;
+  async getBalance(address: Address): Promise<bigint> {
+    return this.ethBalances.get(address.toLowerCase()) ?? 10n ** 18n;
   }
   async balancesOf(_token: Address, holders: Address[]): Promise<bigint[]> {
     return holders.map((h) => this.balances.get(h.toLowerCase()) ?? 0n);
@@ -61,6 +99,8 @@ export class FakeChain implements ChainClient {
 
 export class FakeSender implements RawSender {
   sent: { raw: Hex; at: number }[] = [];
+  /** fail the next N sends (transient error), then succeed */
+  failNext = 0;
   constructor(
     readonly url: string,
     private readonly now: () => number,
@@ -69,6 +109,10 @@ export class FakeSender implements RawSender {
   async sendRaw(raw: Hex): Promise<SendResult> {
     const at = this.now();
     this.sent.push({ raw, at });
+    if (this.failNext > 0) {
+      this.failNext--;
+      return { endpoint: this.url, sentAt: at, doneAt: at, ok: false, error: 'HTTP 502' };
+    }
     return this.fail
       ? { endpoint: this.url, sentAt: at, doneAt: at, ok: false, error: 'boom' }
       : { endpoint: this.url, sentAt: at, doneAt: at + 3, ok: true };

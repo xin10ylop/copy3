@@ -115,9 +115,11 @@ export class MemoryStore implements SniperStore {
     const all = [...this.snipes.values()].filter((s) => s.mode === mode);
     const countsByPlay: Record<number, number> = {};
     for (const s of all) if (s.status === 'pending' || s.status === 'open' || s.status === 'closed') countsByPlay[s.playId] = (countsByPlay[s.playId] ?? 0) + 1;
+    const played = (s: SnipeRecord): boolean =>
+      s.status === 'open' || s.status === 'closed' || (s.decision as { confirmed?: unknown } | null)?.confirmed === true;
     const deployers = new Map<string, { playId: number; deployer: string }>();
     for (const s of all) {
-      if (s.status === 'aborted' || s.status === 'failed') continue;
+      if (!played(s)) continue;
       const d = (s.decision as { launch?: { event?: { deployer?: string } } } | null)?.launch?.event?.deployer;
       if (d) deployers.set(`${s.playId}:${d}`, { playId: s.playId, deployer: d });
     }
@@ -125,7 +127,7 @@ export class MemoryStore implements SniperStore {
       countsByPlay,
       openCount: all.filter((s) => s.status === 'open' || s.status === 'pending').length,
       realizedPnlSince: all.filter((s) => s.closedAt && s.closedAt >= since).reduce((a, s) => a + (s.realizedPnlEth ?? 0), 0),
-      tokens: all.filter((s) => s.status !== 'aborted' && s.status !== 'failed' && s.token).map((s) => s.token),
+      tokens: all.filter((s) => played(s) && s.token).map((s) => s.token),
       playDeployers: [...deployers.values()],
     };
   }

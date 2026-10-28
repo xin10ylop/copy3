@@ -40,6 +40,7 @@ export interface BurstMember {
 }
 
 export interface Fill {
+  /** block of the buy (live: receipt; paper: simulated block; recovered: best known, see `recovered`) */
   block: number;
   ts: number;
   quoteIn: bigint;
@@ -49,8 +50,22 @@ export interface Fill {
   /** effective entry price (quoteIn / tokensOut), ETH per whole token */
   entryPrice: number;
   txHash?: Hex;
-  /** reserves right before the fill (paper) or after (live, if known) */
+  /** reserves the position book starts from (paper: before or after the fill block, see PAPER_FILL) */
   reserves?: Reserves;
+  /** block number `reserves` were read at; logs at or below it are already contained (M5) */
+  reservesBlock?: number;
+  /** reconstructed from chain state (sniper.bought / balanceOf) because the receipts were missed (H3) */
+  recovered?: boolean;
+}
+
+/** Ground truth of a launch from its receipt (H1). */
+export interface LaunchConfirmation {
+  token: Address;
+  curve: Address;
+  deployer: Address;
+  /** SnipeTaxExempted(account) logs emitted by the curve in the launch receipt */
+  exemptions: Address[];
+  block: number;
 }
 
 export type SnipeStatus = 'pending' | 'open' | 'closed' | 'failed' | 'aborted';
@@ -73,4 +88,14 @@ export interface SnipeRun {
   burst: BurstMember[];
   fill?: Fill;
   notes: string[];
+  /** the launch receipt proved it (TokenLaunched from the factory with the same deployer) */
+  confirmed?: boolean;
+  /** why the run was aborted while members were possibly in flight (H2: a later fill exits at once) */
+  abortReason?: string;
+  /** risk slot released / run finished (guards double accounting) */
+  ended?: boolean;
+  /** the burst passed the last kill-switch / daily-loss check right before its first send (L2) */
+  sendCleared?: boolean;
+  /** executor key address that signed the burst (M1) */
+  signer?: Address;
 }

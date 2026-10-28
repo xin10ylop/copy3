@@ -53,6 +53,12 @@ export interface SequencerClockOptions {
   backlogGapMs?: number;
   /** How many recent seconds to keep for `snapshot().recentSeconds`. Default 20. */
   historySeconds?: number;
+  /**
+   * Block timestamps never go backwards. This many consecutive blocks more than 2 s older than
+   * the newest second seen means that second was bogus (a poisoned far-future timestamp would
+   * otherwise freeze the clock for good): the clock resets and re-learns. Default 3.
+   */
+  regressResetAfter?: number;
 }
 
 export interface SecondRecord {
@@ -123,6 +129,9 @@ export class SequencerClock {
   private lastArrival = -Infinity;
   private lastArrivalOfCur = -Infinity;
   private cache: Estimate | null = null;
+  private regressions = 0;
+  /** times the clock reset itself after a poisoned timestamp */
+  selfResets = 0;
 
   constructor(options: SequencerClockOptions = {}) {
     this.o = {
@@ -136,6 +145,7 @@ export class SequencerClock {
       minDriftSpanMs: options.minDriftSpanMs ?? 60_000,
       backlogGapMs: options.backlogGapMs ?? 20,
       historySeconds: options.historySeconds ?? 20,
+      regressResetAfter: options.regressResetAfter ?? 3,
     };
   }
 
@@ -144,6 +154,13 @@ export class SequencerClock {
    * apart from gaps, which is required for the lower-bound estimate.
    */
   ingest(blockTimestamp: number, arrivalMs: number, block?: number): void {
+    if (!Number.isFinite(blockTimestamp) || !Number.isFinite(arrivalMs)) return;
+    if (blockTimestamp < this.curTs - 2) {
+      if (++this.regressions >= this.o.regressResetAfter) {
+        this.reset();
+        this.selfResets++;
+      } else return;
+    } else this.regressions = 0;
     const contiguous = block === undefined || this.curBlock === undefined || block === this.curBlock + 1;
     if (blockTimestamp > this.curTs) {
       const lowerOffsetMs =
@@ -178,6 +195,7 @@ export class SequencerClock {
 
   /** Forget everything (e.g. after a long feed outage or host clock change). */
   reset(): void {
+    this.regressions = 0;
     this.secs = [];
     this.phase = [];
     this.curTs = -1;

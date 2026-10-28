@@ -3,11 +3,23 @@
  * nonces (EIP-1559, chainId 4663), fires each at its scheduled local time to every
  * SEND_ENDPOINT over keep-alive connections, then reconciles by polling receipts (Sniped /
  * SnipeTaxCharged logs). Reconciliation is idempotent; the fill resolves as soon as it is
- * seen, statuses + nonce resync complete in the background.
+ * seen, statuses + nonce settlement complete in the background.
+ *
+ * Keys (reviewer M1). Every key is a PonsSniper operator with its own nonce sequence:
+ *  - `accounts[0]` is the EXIT key: exits never queue behind a burst's nonces;
+ *  - `accounts[1..]` are BURST slots: one concurrent burst per slot (a burst holds its slot from
+ *    signing until its nonces are settled), so concurrent bursts never share a sequence;
+ *  - a single account is shared by exits and bursts (serialised; not recommended for live).
+ * A member that no endpoint accepted is re-sent once (same raw tx, same nonce) to every endpoint;
+ * after the burst (or an exit) every nonce the key broadcast but the chain did not consume is
+ * consumed with a 0-value self-transfer (21k gas), then the key resyncs from the chain.
+ *
+ * Kill switch (L2): `order.guard` runs right before the first member leaves.
+ * Balances (L8): `preflight` checks the cached contract / key balances before a burst.
  */
 import { sniperAbi } from '@hood/contracts';
 import { TOPICS, type FeedBlock, type RawLog } from '@hood/core';
-import { decodeEventLog, encodeFunctionData, keccak256, parseGwei, type Address, type Hex, type LocalAccount } from 'viem';
+import { decodeEventLog, encodeFunctionData, formatEther, keccak256, parseEther, parseGwei, type Address, type Hex, type LocalAccount } from 'viem';
 import type { ChainClient, ReceiptLite } from './chain.js';
 import type { Logger } from './log.js';
 import type { RawSender } from './rpc.js';
@@ -23,13 +35,18 @@ export interface SnipeOrder {
   gasLimit: number;
   maxFeeGwei: number;
   priorityFeeGwei: number;
+  /** L2: memory-only check right before the first member is sent; a reason blocks the whole burst */
+  guard?: () => string | null;
 }
 
 export interface ExitOrder {
   key: string;
   curve: Address;
   token: Address;
+  /** tokens to sell (> 0 unless `all`) */
   tokensIn: bigint;
+  /** sell the contract's whole balance (`exitAll`): no dust, no mismatch with the chain */
+  all: boolean;
   minQuoteOut: bigint;
   reason: string;
   gasLimit: number;
@@ -43,6 +60,14 @@ export interface ExitResult {
   txHash?: Hex;
   block?: number;
   error?: string;
+  /** broadcast, but no receipt in time: the outcome must be read from the chain */
+  unknown?: boolean;
+}
+
+export interface PreflightInput {
+  quoteIn: bigint;
+  gasLimit: number;
+  maxFeeGwei: number;
 }
 
 /** What the orchestrator needs from live or paper execution. */
@@ -54,11 +79,15 @@ export interface ExecutionBackend {
   abort(runKey: string): number;
   exit(order: ExitOrder): Promise<ExitResult>;
   onFeedBlock(b: FeedBlock): void;
+  /** L8: reasons the next burst must not be sent (cached balances, free slot); [] = ok. Memory-only. */
+  preflight?(o: PreflightInput): string[];
 }
 
 export class NonceManager {
   private nextNonce: number | null = null;
   private inflight = 0;
+  /** highest nonce this key broadcast that at least one endpoint accepted (gap detection) */
+  maxSent = -1;
 
   get value(): number | null {
     return this.nextNonce;
@@ -81,6 +110,10 @@ export class NonceManager {
     return Array.from({ length: k }, (_, i) => start + i);
   }
 
+  markSent(n: number): void {
+    if (n > this.maxSent) this.maxSent = n;
+  }
+
   release(): void {
     this.inflight = Math.max(0, this.inflight - 1);
   }
@@ -93,8 +126,39 @@ export class NonceManager {
   }
 }
 
+/** One operator key: own nonce sequence, serialised use, cached gas balance. */
+export class ExecutorKey {
+  readonly nonces = new NonceManager();
+  /** a burst holds the slot from signing until its nonces are settled */
+  inBurst = false;
+  balanceWei: bigint | null = null;
+  private tail: Promise<unknown> = Promise.resolve();
+
+  constructor(
+    readonly account: LocalAccount,
+    readonly role: 'exit' | 'burst' | 'shared',
+  ) {}
+
+  get address(): Address {
+    return this.account.address.toLowerCase() as Address;
+  }
+
+  /** Run `fn` after every earlier holder of this key finished. */
+  lock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.tail.then(fn, fn);
+    this.tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+}
+
 export interface LiveExecutorOptions {
-  account: LocalAccount;
+  /** operator accounts: [0] = exit key, [1..] = one burst slot each; a single account is shared */
+  accounts?: LocalAccount[];
+  /** legacy single account (= `accounts: [account]`) */
+  account?: LocalAccount;
   sniper: Address;
   chainId: number;
   senders: RawSender[];
@@ -103,14 +167,29 @@ export interface LiveExecutorOptions {
   logger: Logger;
   /** block → timestamp from the feed (avoids an RPC) */
   blockTs?: (block: number) => number | undefined;
+  /** burst / exit receipt polling (nonce-gated). Default 200 ms. */
   receiptPollMs?: number;
   reconcileTimeoutMs?: number;
+  exitReceiptTimeoutMs?: number;
+  /** wait this long for gap fillers to land before trusting them. Default 3000 ms. */
+  settleTimeoutMs?: number;
+  /** maxFeePerGas of gap-filling self-transfers. Default 1 gwei. */
+  fillerMaxFeeGwei?: number;
+  /** minimum gas balance per key (L8). Default 0.001 ETH. */
+  minGasBalanceWei?: bigint;
   /** called when every member has a final status */
   onFinal?: (run: SnipeRun) => void;
   onSend?: (run: SnipeRun, m: BurstMember) => void;
+  /** operational alerts (low_balance, nonce_gap); rate-limited per type+subject */
+  onAlert?: (type: string, payload: Record<string, unknown>) => void;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+/** endpoint already has the tx: counts as accepted */
+const KNOWN_RE = /already known|known transaction|already imported|already exists/i;
+/** re-sending cannot help */
+const PERMANENT_RE = /nonce too low|insufficient funds|intrinsic gas|invalid sender|exceeds block gas|invalid chain/i;
+const ALERT_EVERY_MS = 10 * 60_000;
 
 export function decodeSniped(
   logs: RawLog[],
@@ -145,86 +224,217 @@ export function snipeTaxFromLogs(logs: RawLog[], curve: Address): bigint {
 
 export class LiveExecutor implements ExecutionBackend {
   readonly mode = 'live' as const;
-  readonly nonces = new NonceManager();
+  readonly keys: ExecutorKey[];
+  readonly exitKey: ExecutorKey;
+  readonly burstKeys: ExecutorKey[];
+  /** PonsSniper ETH balance (cached, refreshed off the hot path) */
+  contractBalanceWei: bigint | null = null;
   private readonly cancels = new Map<string, (() => void)[]>();
-  readonly stats = { bursts: 0, members: 0, sends: 0, sendErrors: 0, fills: 0, exits: 0 };
+  private readonly lastAlert = new Map<string, number>();
+  readonly stats = { bursts: 0, members: 0, sends: 0, sendErrors: 0, resends: 0, fills: 0, exits: 0, fillers: 0, noFreeKey: 0, guardBlocked: 0 };
 
-  constructor(private readonly o: LiveExecutorOptions) {}
+  constructor(private readonly o: LiveExecutorOptions) {
+    const accts = o.accounts && o.accounts.length ? o.accounts : o.account ? [o.account] : [];
+    if (accts.length === 0) throw new Error('LiveExecutor: at least one operator account required');
+    if (new Set(accts.map((a) => a.address.toLowerCase())).size !== accts.length) throw new Error('LiveExecutor: duplicate operator account');
+    if (accts.length === 1) {
+      const k = new ExecutorKey(accts[0]!, 'shared');
+      this.keys = [k];
+      this.exitKey = k;
+      this.burstKeys = [k];
+    } else {
+      this.keys = accts.map((a, i) => new ExecutorKey(a, i === 0 ? 'exit' : 'burst'));
+      this.exitKey = this.keys[0]!;
+      this.burstKeys = this.keys.slice(1);
+    }
+  }
 
+  /** First burst key (health / legacy single-key callers). */
   get address(): Address {
-    return this.o.account.address;
+    return this.burstKeys[0]!.address;
+  }
+
+  get nonces(): NonceManager {
+    return this.burstKeys[0]!.nonces;
+  }
+
+  private get poll(): number {
+    return this.o.receiptPollMs ?? 200;
   }
 
   async init(): Promise<void> {
-    this.nonces.set(await this.o.chain.getTransactionCount(this.o.account.address, 'pending'));
+    for (const k of this.keys) k.nonces.set(await this.o.chain.getTransactionCount(k.address, 'pending'));
+    await this.refreshBalances();
   }
 
-  private signer(order: SnipeOrder): { nonces: number[]; signOne: (i: number) => Promise<BurstMember> } {
+  private alert(type: string, subject: string, payload: Record<string, unknown>): void {
+    const id = `${type}:${subject}`;
+    const now = Date.now();
+    if ((this.lastAlert.get(id) ?? -Infinity) + ALERT_EVERY_MS > now) return;
+    this.lastAlert.set(id, now);
+    this.o.logger.warn({ type, ...payload }, 'executor alert');
+    try {
+      this.o.onAlert?.(type, payload);
+    } catch {
+      /* alert sink must not break execution */
+    }
+  }
+
+  private get minGas(): bigint {
+    return this.o.minGasBalanceWei ?? parseEther('0.001');
+  }
+
+  /** L8: contract ETH and every key's gas balance (off the hot path; errors keep the last value). */
+  async refreshBalances(): Promise<void> {
+    const res = await Promise.allSettled([this.o.chain.getBalance(this.o.sniper), ...this.keys.map((k) => this.o.chain.getBalance(k.address))]);
+    if (res[0]!.status === 'fulfilled') this.contractBalanceWei = res[0]!.value;
+    this.keys.forEach((k, i) => {
+      const r = res[i + 1]!;
+      if (r.status === 'fulfilled') k.balanceWei = r.value;
+    });
+    for (const k of this.keys) {
+      if (k.balanceWei !== null && k.balanceWei < this.minGas)
+        this.alert('low_balance', k.address, { key: k.address, role: k.role, balanceEth: formatEther(k.balanceWei), minEth: formatEther(this.minGas) });
+    }
+  }
+
+  private freeBurstKey(): ExecutorKey | undefined {
+    return this.burstKeys.find((k) => !k.inBurst);
+  }
+
+  preflight(o: PreflightInput): string[] {
+    const reasons: string[] = [];
+    const lowBalance: string[] = [];
+    if (this.contractBalanceWei !== null && this.contractBalanceWei < o.quoteIn)
+      lowBalance.push(`contract balance ${formatEther(this.contractBalanceWei)} ETH < quoteIn ${formatEther(o.quoteIn)} ETH`);
+    const perTx = BigInt(o.gasLimit) * parseGwei(String(o.maxFeeGwei));
+    const need = perTx > this.minGas ? perTx : this.minGas;
+    const key = this.freeBurstKey();
+    if (!key) reasons.push(`no free burst key (${this.burstKeys.length} slot(s) busy)`);
+    else if (key.balanceWei !== null && key.balanceWei < need)
+      lowBalance.push(`burst key ${key.address} gas balance ${formatEther(key.balanceWei)} ETH < ${formatEther(need)} ETH`);
+    if (this.exitKey !== key && this.exitKey.balanceWei !== null && this.exitKey.balanceWei < need)
+      lowBalance.push(`exit key ${this.exitKey.address} gas balance ${formatEther(this.exitKey.balanceWei)} ETH < ${formatEther(need)} ETH (positions could not be exited)`);
+    if (lowBalance.length) this.alert('low_balance', 'preflight', { reasons: lowBalance });
+    return [...reasons, ...lowBalance];
+  }
+
+  private async signMember(key: ExecutorKey, order: SnipeOrder, data: Hex, nonce: number, i: number): Promise<BurstMember> {
+    const maxFeePerGas = parseGwei(String(order.maxFeeGwei));
+    const maxPriorityFeePerGas = parseGwei(String(Math.min(order.priorityFeeGwei, order.maxFeeGwei)));
+    const raw = await key.account.signTransaction({
+      chainId: this.o.chainId,
+      type: 'eip1559',
+      to: this.o.sniper,
+      data,
+      value: 0n,
+      nonce,
+      gas: BigInt(order.gasLimit),
+      maxFeePerGas,
+      maxPriorityFeePerGas,
+    });
+    return { index: i, nonce, hash: keccak256(raw), raw, scheduledAt: order.times[i]!, sends: [], status: 'planned' };
+  }
+
+  private snipeData(order: SnipeOrder): Hex {
     const { run } = order;
-    const data = encodeFunctionData({
+    return encodeFunctionData({
       abi: sniperAbi,
       functionName: 'snipe',
       args: [order.curve, order.token, run.quoteIn, run.minTokensOut, run.maxTaxBps, BigInt(run.deadlineBlock)],
     });
-    const nonces = this.nonces.take(order.times.length);
-    const maxFeePerGas = parseGwei(String(order.maxFeeGwei));
-    const maxPriorityFeePerGas = parseGwei(String(Math.min(order.priorityFeeGwei, order.maxFeeGwei)));
-    const signOne = async (i: number): Promise<BurstMember> => {
-      const raw = await this.o.account.signTransaction({
-        chainId: this.o.chainId,
-        type: 'eip1559',
-        to: this.o.sniper,
-        data,
-        value: 0n,
-        nonce: nonces[i]!,
-        gas: BigInt(order.gasLimit),
-        maxFeePerGas,
-        maxPriorityFeePerGas,
-      });
-      return { index: i, nonce: nonces[i]!, hash: keccak256(raw), raw, scheduledAt: order.times[i]!, sends: [], status: 'planned' };
-    };
-    return { nonces, signOne };
   }
 
-  /** Pre-sign one member per send time with consecutive nonces (reserves the nonces). */
+  /** Pre-sign one member per send time with consecutive nonces of the first burst key (benchmarks). */
   async sign(order: SnipeOrder): Promise<BurstMember[]> {
-    const { signOne } = this.signer(order);
+    const key = this.burstKeys[0]!;
+    const data = this.snipeData(order);
+    const nonces = key.nonces.take(order.times.length);
     const members: BurstMember[] = [];
-    for (let i = 0; i < order.times.length; i++) members.push(await signOne(i));
+    for (let i = 0; i < order.times.length; i++) members.push(await this.signMember(key, order, data, nonces[i]!, i));
     return members;
   }
 
-  /** Schedule one member; resolves when its fan-out completed (or it was cancelled). */
-  private schedule(run: SnipeRun, m: BurstMember): Promise<void> {
+  /**
+   * Fan a raw tx out to every endpoint. If no endpoint accepted it (and the errors are not
+   * permanent), re-send once — same raw tx, same nonce — so later members are not stranded
+   * behind a nonce hole. Returns whether any endpoint accepted it.
+   */
+  private async broadcast(raw: Hex, log: BurstMember['sends']): Promise<boolean> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const res = await Promise.all(this.o.senders.map((s) => s.sendRaw(raw)));
+      let accepted = false;
+      let permanent = false;
+      for (const r of res) {
+        this.stats.sends++;
+        const known = !r.ok && r.error !== undefined && KNOWN_RE.test(r.error);
+        if (!r.ok && !known) this.stats.sendErrors++;
+        if (r.ok || known) accepted = true;
+        if (!r.ok && r.error !== undefined && PERMANENT_RE.test(r.error)) permanent = true;
+        log.push({ endpoint: r.endpoint, sentAt: r.sentAt, doneAt: r.doneAt, ok: r.ok || known, ...(r.error ? { error: attempt ? `resend: ${r.error}` : r.error } : {}) });
+      }
+      if (accepted || permanent) return accepted;
+      if (attempt === 0) this.stats.resends++;
+    }
+    return false;
+  }
+
+  /** Schedule one member; resolves when its fan-out completed (or it was cancelled / blocked). */
+  private schedule(key: ExecutorKey, order: SnipeOrder, m: BurstMember): Promise<void> {
+    const { run } = order;
     let cancels = this.cancels.get(run.key);
     if (!cancels) this.cancels.set(run.key, (cancels = []));
     return new Promise<void>((resolve) => {
+      let done = false;
+      const finish = (): void => {
+        if (!done) {
+          done = true;
+          resolve();
+        }
+      };
       const cancel = this.o.scheduler.at(m.scheduledAt, () => {
+        if (m.status !== 'planned') return finish();
+        if (!run.sendCleared) {
+          let why: string | null;
+          try {
+            why = order.guard?.() ?? null;
+          } catch (e) {
+            why = `guard failed: ${(e as Error).message}`;
+          }
+          if (why) {
+            this.stats.guardBlocked++;
+            run.notes.push(`send blocked before the first member: ${why}`);
+            m.status = 'skipped';
+            this.abort(run.key);
+            return finish();
+          }
+          run.sendCleared = true;
+        }
         m.sentAt = this.o.scheduler.now();
         m.status = 'sent';
         this.stats.members++;
-        const sends = this.o.senders.map((s) =>
-          s.sendRaw(m.raw).then((r) => {
-            this.stats.sends++;
-            if (!r.ok) this.stats.sendErrors++;
-            m.sends.push({ endpoint: r.endpoint, sentAt: r.sentAt, doneAt: r.doneAt, ok: r.ok, ...(r.error ? { error: r.error } : {}) });
-          }),
+        try {
+          this.o.onSend?.(run, m);
+        } catch {
+          /* observer only */
+        }
+        void this.broadcast(m.raw, m.sends).then(
+          (ok) => {
+            if (ok) key.nonces.markSent(m.nonce);
+            else {
+              m.status = 'dropped';
+              m.revertReason = 'rejected by every endpoint (after one re-send)';
+            }
+            finish();
+          },
+          () => finish(),
         );
-        this.o.onSend?.(run, m);
-        void Promise.all(sends).then(() => resolve());
       });
       cancels.push(() => {
         cancel();
         if (m.status === 'planned') m.status = 'skipped';
-        resolve();
+        finish();
       });
-    });
-  }
-
-  /** Schedule every member; resolves when all scheduled sends have completed (or were cancelled). */
-  fire(run: SnipeRun, members: BurstMember[]): Promise<void> {
-    return Promise.all(members.map((m) => this.schedule(run, m))).then(() => {
-      this.cancels.delete(run.key);
     });
   }
 
@@ -264,10 +474,15 @@ export class LiveExecutor implements ExecutionBackend {
     return fill;
   }
 
-  /** Poll receipts until every sent member is final; `onFill` fires as soon as the buy is seen. */
-  async reconcile(run: SnipeRun, curve: Address, onFill: (f: Fill | null) => void): Promise<void> {
-    const poll = this.o.receiptPollMs ?? 100;
+  /**
+   * Poll until every sent member is final; `onFill` fires as soon as the buy is seen. Gentle:
+   * one `getTransactionCount(latest)` per tick, and a receipt only for members whose nonce the
+   * chain has consumed (each fetched until found). Falls back to polling every open member when
+   * the nonce read fails.
+   */
+  async reconcile(run: SnipeRun, curve: Address, onFill: (f: Fill | null) => void, keyAddr?: Address): Promise<void> {
     const deadline = Date.now() + (this.o.reconcileTimeoutMs ?? 15_000);
+    const addr = keyAddr ?? run.signer ?? this.address;
     let reported = false;
     const report = (f: Fill | null): void => {
       if (!reported) {
@@ -278,8 +493,10 @@ export class LiveExecutor implements ExecutionBackend {
     while (Date.now() < deadline) {
       const open = run.burst.filter((m) => m.status === 'sent');
       if (open.length === 0) break;
+      const landed = await this.o.chain.getTransactionCount(addr, 'latest').catch(() => null);
+      const due = landed === null ? open : open.filter((m) => m.nonce < landed);
       await Promise.all(
-        open.map(async (m) => {
+        due.map(async (m) => {
           const r = await this.o.chain.getReceipt(m.hash).catch(() => null);
           if (r) {
             const f = await this.mergeReceipt(run, m, r, curve);
@@ -288,102 +505,189 @@ export class LiveExecutor implements ExecutionBackend {
         }),
       );
       if (run.fill) report(run.fill);
-      await sleep(run.fill ? poll * 3 : poll);
+      await sleep(this.poll);
     }
     for (const m of run.burst) if (m.status === 'sent') m.status = 'dropped';
     report(run.fill ?? null);
   }
 
-  async execute(order: SnipeOrder): Promise<Fill | null> {
-    const { run } = order;
-    this.stats.bursts++;
-    // sign + schedule member by member: the first send is not held up by signing the rest
-    const { signOne } = this.signer(order);
-    run.burst = [];
-    const done: Promise<void>[] = [];
-    try {
-      for (let i = 0; i < order.times.length; i++) {
-        if (run.status !== 'pending') break; // aborted while signing
-        const m = await signOne(i);
-        run.burst.push(m);
-        done.push(this.schedule(run, m));
-      }
-    } catch (e) {
-      run.notes.push(`sign failed: ${(e as Error).message}`);
-      if (run.burst.length === 0) {
-        this.nonces.release();
-        return null;
+  /**
+   * M1: after a burst / exit, make the key's sequence contiguous again. Nonces in
+   * [chain count, highest broadcast] were sent but never consumed (a hole in front of them):
+   * consume each with a 0-value self-transfer so nothing stale can execute later, then resync.
+   */
+  async settle(key: ExecutorKey): Promise<void> {
+    if (key.nonces.busy) return;
+    const latest = await this.o.chain.getTransactionCount(key.address, 'latest').catch(() => null);
+    if (latest === null) return;
+    const maxSent = key.nonces.maxSent;
+    if (latest > maxSent) {
+      key.nonces.resync(latest);
+      return;
+    }
+    let allAccepted = true;
+    const filled: number[] = [];
+    for (let n = latest; n <= maxSent; n++) {
+      try {
+        const raw = await key.account.signTransaction({
+          chainId: this.o.chainId,
+          type: 'eip1559',
+          to: key.account.address,
+          value: 0n,
+          nonce: n,
+          gas: 21_000n,
+          maxFeePerGas: parseGwei(String(this.o.fillerMaxFeeGwei ?? 1)),
+          maxPriorityFeePerGas: 0n,
+        });
+        this.stats.fillers++;
+        filled.push(n);
+        if (!(await this.broadcast(raw, []))) allAccepted = false;
+      } catch {
+        allAccepted = false;
       }
     }
-    const sent = Promise.all(done).then(() => {
-      this.cancels.delete(run.key);
-    });
-    return new Promise<Fill | null>((resolve) => {
-      void (async () => {
-        await sent;
-        await this.reconcile(run, order.curve, resolve);
-        this.nonces.release();
+    this.alert('nonce_gap', `${key.address}:${latest}`, { key: key.address, filled, allAccepted });
+    const deadline = Date.now() + (this.o.settleTimeoutMs ?? 3000);
+    while (Date.now() < deadline) {
+      const n = await this.o.chain.getTransactionCount(key.address, 'latest').catch(() => null);
+      if (n !== null && n > maxSent) {
+        key.nonces.resync(n);
+        return;
+      }
+      await sleep(this.poll);
+    }
+    // fillers accepted but not yet visible: skip past them; otherwise trust the chain
+    key.nonces.resync(allAccepted ? maxSent + 1 : latest);
+  }
+
+  async execute(order: SnipeOrder): Promise<Fill | null> {
+    const { run } = order;
+    const key = this.freeBurstKey();
+    if (!key) {
+      this.stats.noFreeKey++;
+      run.notes.push(`no free burst key (${this.burstKeys.length} slot(s) busy)`);
+      return null;
+    }
+    key.inBurst = true;
+    run.signer = key.address;
+    this.stats.bursts++;
+    let resolveFill!: (f: Fill | null) => void;
+    const fillP = new Promise<Fill | null>((r) => (resolveFill = r));
+    let reported = false;
+    const report = (f: Fill | null): void => {
+      if (!reported) {
+        reported = true;
+        resolveFill(f);
+      }
+    };
+    void key
+      .lock(async () => {
         try {
-          const n = await this.o.chain.getTransactionCount(this.o.account.address, 'latest');
-          if (this.nonces.resync(n)) this.o.logger.debug({ nonce: n }, 'nonce resynced');
+          await this.burst(key, order, report);
         } catch (e) {
-          this.o.logger.warn({ err: e }, 'nonce resync failed');
+          run.notes.push(`burst error: ${(e as Error).message}`);
+          this.o.logger.error({ err: e, key: run.key }, 'burst failed');
+        } finally {
+          report(run.fill ?? null);
+          key.inBurst = false;
+          try {
+            this.o.onFinal?.(run);
+          } catch (e) {
+            this.o.logger.warn({ err: e }, 'onFinal threw');
+          }
+          void this.refreshBalances().catch(() => undefined);
         }
-        this.o.onFinal?.(run);
-      })();
-    });
+      })
+      .catch(() => undefined);
+    return fillP;
+  }
+
+  /** sign + schedule member by member (the first send never waits for the rest), reconcile, settle */
+  private async burst(key: ExecutorKey, order: SnipeOrder, report: (f: Fill | null) => void): Promise<void> {
+    const { run } = order;
+    if (key.nonces.value === null) key.nonces.set(await this.o.chain.getTransactionCount(key.address, 'pending'));
+    const data = this.snipeData(order);
+    const nonces = key.nonces.take(order.times.length);
+    try {
+      run.burst = [];
+      const done: Promise<void>[] = [];
+      try {
+        for (let i = 0; i < order.times.length; i++) {
+          if (run.status !== 'pending') break; // aborted while signing
+          const m = await this.signMember(key, order, data, nonces[i]!, i);
+          run.burst.push(m);
+          done.push(this.schedule(key, order, m));
+        }
+      } catch (e) {
+        run.notes.push(`sign failed: ${(e as Error).message}`);
+      }
+      await Promise.all(done);
+      this.cancels.delete(run.key);
+      if (run.burst.some((m) => m.status === 'sent')) await this.reconcile(run, order.curve, report, key.address);
+      else report(null);
+    } finally {
+      key.nonces.release();
+      await this.settle(key).catch((e: unknown) => this.o.logger.warn({ err: e, key: key.address }, 'nonce settle failed'));
+    }
   }
 
   async exit(order: ExitOrder): Promise<ExitResult> {
     this.stats.exits++;
-    const [nonce] = this.nonces.take(1);
-    try {
-      const raw = await this.o.account.signTransaction({
-        chainId: this.o.chainId,
-        type: 'eip1559',
-        to: this.o.sniper,
-        data: encodeFunctionData({ abi: sniperAbi, functionName: 'exit', args: [order.curve, order.token, order.tokensIn, order.minQuoteOut] }),
-        value: 0n,
-        nonce: nonce!,
-        gas: BigInt(order.gasLimit),
-        maxFeePerGas: parseGwei(String(order.maxFeeGwei)),
-        maxPriorityFeePerGas: 0n,
-      });
-      const hash = keccak256(raw);
-      const results = await Promise.all(this.o.senders.map((s) => s.sendRaw(raw)));
-      if (!results.some((r) => r.ok)) return { ok: false, tokensIn: order.tokensIn, quoteOut: 0n, txHash: hash, error: results.map((r) => r.error).join('; ') };
-      const deadline = Date.now() + 10_000;
-      while (Date.now() < deadline) {
-        const r = await this.o.chain.getReceipt(hash).catch(() => null);
-        if (r) {
-          if (r.status !== 'success') return { ok: false, tokensIn: order.tokensIn, quoteOut: 0n, txHash: hash, block: r.blockNumber, error: 'exit reverted' };
-          let quoteOut = 0n;
-          let tokensIn = order.tokensIn;
-          for (const l of r.logs) {
-            if (l.address.toLowerCase() !== this.o.sniper.toLowerCase()) continue;
-            try {
-              const d = decodeEventLog({ abi: sniperAbi, data: l.data as Hex, topics: l.topics as [Hex, ...Hex[]] });
-              if (d.eventName === 'Exited') {
-                quoteOut = d.args.quoteOut;
-                tokensIn = d.args.tokensIn;
-              }
-            } catch {
-              /* ignore */
-            }
-          }
-          return { ok: true, tokensIn, quoteOut, txHash: hash, block: r.blockNumber };
-        }
-        await sleep(this.o.receiptPollMs ?? 100);
-      }
-      return { ok: false, tokensIn: order.tokensIn, quoteOut: 0n, txHash: hash, error: 'exit receipt timeout' };
-    } finally {
-      this.nonces.release();
+    if (!order.all && order.tokensIn <= 0n) return { ok: false, tokensIn: 0n, quoteOut: 0n, error: 'zero-size exit refused (L1)' };
+    const key = this.exitKey;
+    return key.lock(async () => {
+      if (key.nonces.value === null) key.nonces.set(await this.o.chain.getTransactionCount(key.address, 'pending'));
+      const [nonce] = key.nonces.take(1);
       try {
-        this.nonces.resync(await this.o.chain.getTransactionCount(this.o.account.address, 'latest'));
-      } catch {
-        /* next resync */
+        const data = order.all
+          ? encodeFunctionData({ abi: sniperAbi, functionName: 'exitAll', args: [order.curve, order.token, order.minQuoteOut] })
+          : encodeFunctionData({ abi: sniperAbi, functionName: 'exit', args: [order.curve, order.token, order.tokensIn, order.minQuoteOut] });
+        const raw = await key.account.signTransaction({
+          chainId: this.o.chainId,
+          type: 'eip1559',
+          to: this.o.sniper,
+          data,
+          value: 0n,
+          nonce: nonce!,
+          gas: BigInt(order.gasLimit),
+          maxFeePerGas: parseGwei(String(order.maxFeeGwei)),
+          maxPriorityFeePerGas: 0n,
+        });
+        const hash = keccak256(raw);
+        const sends: BurstMember['sends'] = [];
+        if (!(await this.broadcast(raw, sends)))
+          return { ok: false, tokensIn: order.tokensIn, quoteOut: 0n, txHash: hash, error: sends.map((s) => s.error).filter(Boolean).join('; ') || 'not accepted' };
+        key.nonces.markSent(nonce!);
+        const deadline = Date.now() + (this.o.exitReceiptTimeoutMs ?? 10_000);
+        while (Date.now() < deadline) {
+          const r = await this.o.chain.getReceipt(hash).catch(() => null);
+          if (r) {
+            if (r.status !== 'success') return { ok: false, tokensIn: order.tokensIn, quoteOut: 0n, txHash: hash, block: r.blockNumber, error: 'exit reverted' };
+            let quoteOut = 0n;
+            let tokensIn = order.tokensIn;
+            for (const l of r.logs) {
+              if (l.address.toLowerCase() !== this.o.sniper.toLowerCase()) continue;
+              try {
+                const d = decodeEventLog({ abi: sniperAbi, data: l.data as Hex, topics: l.topics as [Hex, ...Hex[]] });
+                if (d.eventName === 'Exited') {
+                  quoteOut = d.args.quoteOut;
+                  tokensIn = d.args.tokensIn;
+                }
+              } catch {
+                /* ignore */
+              }
+            }
+            return { ok: true, tokensIn, quoteOut, txHash: hash, block: r.blockNumber };
+          }
+          await sleep(this.poll);
+        }
+        return { ok: false, tokensIn: order.tokensIn, quoteOut: 0n, txHash: hash, error: 'exit receipt timeout', unknown: true };
+      } finally {
+        key.nonces.release();
+        await this.settle(key).catch(() => undefined);
+        void this.refreshBalances().catch(() => undefined);
       }
-    }
+    });
   }
 
   onFeedBlock(): void {

@@ -5,6 +5,7 @@
  *   OWNER=0x…                       REQUIRED cold owner (sweeps, admin) — must differ from every hot key
  *   OPERATORS=0x…,0x…               burst keys + exit key (EXECUTOR / EXIT addresses of services/sniper)
  *   [MAX_QUOTE_IN_ETH=0.2]          per-snipe cap enforced on-chain (owner can change it)
+ *   [TREASURY=0x…]                  receiver of exit proceeds (default: the owner; printed as owner calldata)
  *   [FACTORY=0x7ed5…]               PonsV2LaunchFactory (default from @hood/core)
  *   [RPC_URL=https://rpc.mainnet.chain.robinhood.com] [FUND_ETH=0.2] [DRY_RUN=1]
  *   pnpm --filter @hood/contracts deploy
@@ -52,6 +53,8 @@ if (operators.some((o) => o.toLowerCase() === owner.toLowerCase()) || owner.toLo
   if (process.env.ALLOW_HOT_OWNER !== '1') throw new Error('OWNER must be a cold key distinct from the deployer and every operator (ALLOW_HOT_OWNER=1 to override)');
 }
 const factory = (process.env.FACTORY ?? PONS_V2_FACTORY) as Address;
+const treasury = process.env.TREASURY as Address | undefined;
+if (treasury !== undefined && !isAddress(treasury)) throw new Error('TREASURY must be an address');
 const maxQuoteIn = parseEther(process.env.MAX_QUOTE_IN_ETH ?? '0.2');
 
 const publicClient = createPublicClient({ chain: robinhood, transport: http(rpcUrl) });
@@ -81,6 +84,10 @@ async function main(): Promise<void> {
   for (const op of operators.slice(1)) {
     const data = encodeFunctionData({ abi: sniperAbi, functionName: 'setOperator', args: [op, true] });
     console.log(`owner must send: to=${address} data=${data}   # setOperator(${op}, true)`);
+  }
+  if (treasury) {
+    const data = encodeFunctionData({ abi: sniperAbi, functionName: 'setTreasury', args: [treasury] });
+    console.log(`owner must send: to=${address} data=${data}   # setTreasury(${treasury})`);
   }
   const fund = process.env.FUND_ETH;
   if (fund) {
