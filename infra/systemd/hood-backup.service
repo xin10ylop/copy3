@@ -1,0 +1,13 @@
+[Unit]
+Description=HoodSniper - pg_dump to /data/backups (keep 14)
+Requires=docker.service
+After=docker.service hood-stack.service
+RequiresMountsFor=/data
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/hoodsniper
+ExecStart=/opt/hoodsniper/infra/backup.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

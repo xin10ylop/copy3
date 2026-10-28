@@ -1,0 +1,20 @@
+# Restores the Robinhood Chain pruned snapshot into /data/nitro before the stack starts.
+# No-op when a complete database is already there (run-node.sh snapshot --if-missing);
+# wipes and retries automatically when a previous restore was interrupted.
+[Unit]
+Description=HoodSniper - restore Robinhood Chain pruned snapshot (first boot)
+Wants=network-online.target
+After=network-online.target docker.service
+RequiresMountsFor=/data
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/hoodsniper/infra/node/run-node.sh snapshot --if-missing
+TimeoutStartSec=infinity
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

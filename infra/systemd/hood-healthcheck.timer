@@ -1,0 +1,10 @@
+[Unit]
+Description=Run HoodSniper health checks every 2 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

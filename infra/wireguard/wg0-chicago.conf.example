@@ -1,0 +1,14 @@
+# /etc/wireguard/wg0.conf on the Chicago box (chmod 600).  wg genkey | tee priv | wg pubkey > pub
+# Then: systemctl enable --now wg-quick@wg0 ; set PG_BIND=10.66.0.1 and NITRO_BIND=10.66.0.1 in .env
+# and add the docker drop-in below so containers publish on 10.66.0.1 only after wg0 exists:
+#   mkdir -p /etc/systemd/system/docker.service.d
+#   printf '[Unit]\nAfter=wg-quick@wg0.service\nWants=wg-quick@wg0.service\n' > /etc/systemd/system/docker.service.d/10-wireguard.conf
+[Interface]
+Address = 10.66.0.1/24
+ListenPort = 51820
+PrivateKey = <chicago-private-key>
+
+[Peer]
+# Ohio executor
+PublicKey = <ohio-public-key>
+AllowedIPs = 10.66.0.2/32

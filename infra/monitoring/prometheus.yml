@@ -1,0 +1,23 @@
+# Prometheus scrape config for the monitoring profile of infra/docker-compose.yml.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Nitro exposes geth-style metrics when started with --metrics (port 6070).
+  - job_name: nitro
+    metrics_path: /debug/metrics/prometheus
+    static_configs:
+      - targets: ["nitro:6070"]
+
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]

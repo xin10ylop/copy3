@@ -5,11 +5,16 @@
  * Replace by re-exporting from '@hood/core' in src/deps.ts; nothing else in the agent
  * imports this file directly.
  *
- * Assumptions to re-check against the real implementation:
+ * Semantics (verified by replaying the Amlil fixture, docs/EXAMPLES.md, through
+ * constant product with Q0 = 1.68 ETH / T0 = 1e9 tokens - every buy matches exactly):
  *  - `CurveReserves` is `{ quote, token }` in wei / token base units (18 dec).
- *  - `quoteBuy` charges fee and snipe tax on the gross quote-in, then applies
- *    constant product on the net amount (RESEARCH §3: "tax is charged on the quote-in").
- *  - `quoteSell` charges the fee on the gross quote-out. Sells are never taxed.
+ *  - `quoteBuy(r, quoteIn, feeBps, taxBps)`: `quoteIn` is CurveBuy.quoteIn (what reaches
+ *    the curve); fee and the creator tax (`taxBps`) are deducted from it before constant
+ *    product. The snipe tax is NOT part of this: it is charged on top of quoteIn
+ *    (SnipeTaxCharged = quoteIn * snipeBps), so callers convert a total spend B with
+ *    quoteIn = B / (1 + snipeBps/1e4).
+ *  - `quoteSell(r, tokensIn, feeBps)`: fee (pass fee + creator tax) is taken from the
+ *    gross constant-product proceeds.
  */
 import { z } from 'zod';
 

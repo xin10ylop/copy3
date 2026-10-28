@@ -1,0 +1,284 @@
+#cloud-config
+# HoodSniper Chicago box (Cherry Servers bare metal, Ubuntu 24.04).
+#
+# Rendered by infra/cherry/provision.sh (or the Terraform example), which replace the two
+# "@@...@@" placeholders with base64 blobs:
+#   @@HOOD_BOOTSTRAP_ENV_B64@@  -> /etc/hood/bootstrap.env  (repo URL/ref, optional read-only git token)
+#   @@HOOD_DOTENV_B64@@         -> /etc/hood/dotenv         (optional: the full repo .env; empty = template)
+#
+# What it does on first boot:
+#   1. packages (docker prerequisites, mdadm, xfsprogs, jq, chrony, ufw)
+#   2. /data = md RAID0 over both NVMe drives (whole spare disk + free tail of the OS disk), XFS, noatime
+#   3. Docker CE + compose plugin, data-root on /data/docker
+#   4. user "hood", repo clone in /opt/hoodsniper, .env (0600) from the provided blob or the template
+#   5. node config download, systemd units: hood-snapshot (stream pruned snapshot), hood-stack (compose),
+#      hood-backup.timer (daily pg_dump, keep 14), hood-healthcheck.timer (every 2 min, Telegram alerts)
+#   6. ufw: deny incoming except SSH (+ WireGuard 51820/udp)
+# Progress: /var/log/cloud-init-output.log and `journalctl -u hood-snapshot -u hood-stack -f`.
+
+package_update: true
+package_upgrade: true
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - git
+  - jq
+  - mdadm
+  - xfsprogs
+  - nvme-cli
+  - gdisk
+  - chrony
+  - ufw
+  - fail2ban
+  - htop
+  - iotop
+  - sysstat
+  - postgresql-client
+  - wireguard-tools
+
+write_files:
+  - path: /etc/hood/bootstrap.env
+    permissions: "0600"
+    encoding: b64
+    content: "@@HOOD_BOOTSTRAP_ENV_B64@@"
+
+  - path: /etc/hood/dotenv
+    permissions: "0600"
+    encoding: b64
+    content: "@@HOOD_DOTENV_B64@@"
+
+  - path: /etc/sysctl.d/90-hood.conf
+    permissions: "0644"
+    content: |
+      # HoodSniper Chicago box
+      vm.swappiness = 1
+      vm.max_map_count = 1048576
+      vm.dirty_background_ratio = 5
+      vm.dirty_ratio = 20
+      fs.file-max = 4194304
+      fs.inotify.max_user_watches = 1048576
+      net.core.somaxconn = 8192
+      net.core.netdev_max_backlog = 16384
+      net.core.rmem_max = 33554432
+      net.core.wmem_max = 33554432
+      net.ipv4.tcp_rmem = 4096 262144 33554432
+      net.ipv4.tcp_wmem = 4096 262144 33554432
+      net.ipv4.tcp_slow_start_after_idle = 0
+      net.ipv4.tcp_fastopen = 3
+      net.ipv4.tcp_mtu_probing = 1
+
+  - path: /etc/security/limits.d/90-hood.conf
+    permissions: "0644"
+    content: |
+      *    soft nofile 1048576
+      *    hard nofile 1048576
+      root soft nofile 1048576
+      root hard nofile 1048576
+
+  - path: /usr/local/sbin/hood-setup-raid
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      # Build /data as md RAID0 over every NVMe not backing the OS (whole disk) plus the free tail
+      # of the OS disk(s). Idempotent: if a filesystem labelled hood-data exists it is just mounted.
+      set -euo pipefail
+      MOUNT="${HOOD_DATA_MOUNT:-/data}"
+      LABEL=hood-data
+      MD_DEV=/dev/md/hood-data
+      MIN_FREE_BYTES=$(( ${HOOD_RAID_MIN_FREE_GB:-50} * 1024 * 1024 * 1024 ))
+      WIPE_UNUSED="${HOOD_RAID_WIPE_UNUSED:-1}"   # fresh dedicated server: wipe leftover signatures
+
+      log() { echo "[hood-raid] $*"; logger -t hood-raid -- "$*" 2>/dev/null || true; }
+
+      mount_data() {
+        local dev="$1" uuid
+        uuid="$(blkid -s UUID -o value "$dev")"
+        mkdir -p "$MOUNT"
+        grep -q "UUID=$uuid" /etc/fstab || echo "UUID=$uuid $MOUNT xfs defaults,noatime,nofail 0 2" >> /etc/fstab
+        systemctl daemon-reload || true
+        mountpoint -q "$MOUNT" || mount "$MOUNT"
+      }
+
+      layout() {
+        mkdir -p "$MOUNT"/{nitro,postgres,backups,reports,docker,prometheus,grafana}
+        chown 1000:1000 "$MOUNT/nitro" "$MOUNT/reports"
+        chown 65534:65534 "$MOUNT/prometheus"
+        chown 472:0 "$MOUNT/grafana"
+        chmod 0700 "$MOUNT/backups"
+        log "$MOUNT ready: $(df -h "$MOUNT" | tail -n 1)"
+      }
+
+      if mountpoint -q "$MOUNT"; then log "$MOUNT already mounted"; layout; exit 0; fi
+      mdadm --assemble --scan >/dev/null 2>&1 || true
+      if existing="$(blkid -L "$LABEL" 2>/dev/null)" && [[ -n "$existing" ]]; then
+        log "found existing $LABEL filesystem on $existing"
+        mount_data "$existing"; layout; exit 0
+      fi
+
+      # Disks that back anything mounted or any active swap are "busy" (the OS disk(s)).
+      mapfile -t busy < <(
+        { findmnt -rno SOURCE | sed 's/\[.*//' | grep '^/dev/' || true
+          swapon --show=NAME --noheadings 2>/dev/null || true; } | sort -u |
+        while read -r src; do lsblk -rnspo NAME,TYPE "$src" 2>/dev/null | awk '$2=="disk"{print $1}'; done | sort -u
+      )
+      log "busy disks: ${busy[*]:-none}"
+
+      members=()
+      while read -r disk; do
+        [[ -n "$disk" ]] || continue
+        if printf '%s\n' "${busy[@]}" | grep -qx -- "$disk"; then
+          free="$(sfdisk -F "$disk" 2>/dev/null | sed -n 's/.*, \([0-9][0-9]*\) bytes,.*/\1/p' | head -n 1)"
+          if (( ${free:-0} >= MIN_FREE_BYTES )); then
+            log "OS disk $disk: appending a RAID partition in $((free / 1024 / 1024 / 1024)) GiB of free space"
+            before="$(lsblk -rnpo NAME,TYPE "$disk" | awk '$2=="part"{print $1}' | sort)"
+            echo ',,R' | sfdisk --append --no-reread --force "$disk"
+            partx -a "$disk" 2>/dev/null || partx -u "$disk" 2>/dev/null || true
+            udevadm settle
+            after="$(lsblk -rnpo NAME,TYPE "$disk" | awk '$2=="part"{print $1}' | sort)"
+            part="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -n 1)"
+            [[ -n "$part" ]] || { log "could not find the new partition on $disk"; exit 1; }
+            wipefs -a "$part"
+            members+=("$part")
+          else
+            log "OS disk $disk: no usable free space (set os_partition_size when ordering)"
+          fi
+          continue
+        fi
+        if [[ -n "$(lsblk -rnpo NAME,TYPE "$disk" | awk '$2=="part"')" ]] || [[ -n "$(wipefs -n "$disk" 2>/dev/null | tail -n +2)" ]]; then
+          if [[ "$WIPE_UNUSED" != "1" ]]; then log "skipping $disk: has partitions/signatures"; continue; fi
+          log "wiping unused $disk"
+          while read -r p; do
+            [[ -n "$p" ]] || continue
+            mdadm --zero-superblock "$p" 2>/dev/null || true
+            wipefs -a "$p"
+          done < <(lsblk -rnpo NAME,TYPE "$disk" | awk '$2=="part"{print $1}')
+          wipefs -a "$disk"
+          sgdisk --zap-all "$disk" >/dev/null
+          udevadm settle
+        fi
+        members+=("$disk")
+      done < <(lsblk -dnpo NAME,TYPE | awk '$2=="disk" && $1 ~ /^\/dev\/nvme/ {print $1}')
+
+      (( ${#members[@]} > 0 )) || { log "no NVMe space available for $MOUNT"; exit 1; }
+      if (( ${#members[@]} == 1 )); then
+        dev="${members[0]}"
+      else
+        log "creating RAID0 over: ${members[*]}"
+        mdadm --create "$MD_DEV" --name=hood-data --level=0 --chunk=512 \
+          --raid-devices="${#members[@]}" --run "${members[@]}"
+        mdadm --detail --brief "$MD_DEV" >> /etc/mdadm/mdadm.conf
+        update-initramfs -u || true
+        dev="$(readlink -f "$MD_DEV")"
+      fi
+      mkfs.xfs -f -L "$LABEL" "$dev"
+      mount_data "$dev"
+      layout
+
+  - path: /usr/local/sbin/hood-bootstrap
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      # Docker + repo + .env + systemd units. Re-runnable.
+      set -euo pipefail
+      log() { echo "[hood-bootstrap] $*"; logger -t hood-bootstrap -- "$*" 2>/dev/null || true; }
+      # shellcheck disable=SC1091
+      source /etc/hood/bootstrap.env
+      HOOD_DIR="${HOOD_DIR:-/opt/hoodsniper}"
+      HOOD_REPO_REF="${HOOD_REPO_REF:-main}"
+      [[ -n "${HOOD_REPO_URL:-}" ]] || { log "HOOD_REPO_URL missing in /etc/hood/bootstrap.env"; exit 1; }
+
+      sysctl --system >/dev/null
+
+      # --- Docker CE + compose plugin (official repo) ---
+      if ! command -v docker >/dev/null 2>&1; then
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+        chmod a+r /etc/apt/keyrings/docker.asc
+        codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $codename stable" \
+          > /etc/apt/sources.list.d/docker.list
+        apt-get update -q
+        DEBIAN_FRONTEND=noninteractive apt-get install -yq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+      fi
+      mkdir -p /etc/docker
+      if mountpoint -q /data && [[ ! -f /etc/docker/daemon.json ]]; then
+        cat > /etc/docker/daemon.json <<'JSON'
+      {
+        "data-root": "/data/docker",
+        "log-driver": "json-file",
+        "log-opts": { "max-size": "50m", "max-file": "5" },
+        "live-restore": true
+      }
+      JSON
+        systemctl restart docker
+      fi
+      systemctl enable --now docker
+
+      # --- operator user ---
+      if ! id hood >/dev/null 2>&1; then
+        useradd -m -s /bin/bash -G docker hood
+        if [[ -f /root/.ssh/authorized_keys ]]; then
+          install -d -m 0700 -o hood -g hood /home/hood/.ssh
+          install -m 0600 -o hood -g hood /root/.ssh/authorized_keys /home/hood/.ssh/authorized_keys
+        fi
+      fi
+
+      # --- repo ---
+      git_auth=()
+      if [[ -n "${HOOD_GIT_TOKEN:-}" ]]; then
+        basic="$(printf 'x-access-token:%s' "$HOOD_GIT_TOKEN" | base64 -w0)"
+        git_auth=(-c "http.extraHeader=Authorization: Basic $basic")
+      fi
+      if [[ ! -d "$HOOD_DIR/.git" ]]; then
+        git "${git_auth[@]}" clone "$HOOD_REPO_URL" "$HOOD_DIR"
+      fi
+      git -C "$HOOD_DIR" "${git_auth[@]}" fetch --tags origin "$HOOD_REPO_REF"
+      git -C "$HOOD_DIR" checkout -q FETCH_HEAD
+      chown -R hood:hood "$HOOD_DIR"
+
+      # --- .env (0600) ---
+      if [[ ! -f "$HOOD_DIR/.env" ]]; then
+        if [[ -s /etc/hood/dotenv ]]; then
+          install -m 0600 -o hood -g hood /etc/hood/dotenv "$HOOD_DIR/.env"
+          log ".env written from the provisioning blob"
+        else
+          install -m 0600 -o hood -g hood "$HOOD_DIR/infra/env/chicago.env.example" "$HOOD_DIR/.env"
+          sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 24)/" "$HOOD_DIR/.env"
+          sed -i "s/^GRAFANA_ADMIN_PASSWORD=.*/GRAFANA_ADMIN_PASSWORD=$(openssl rand -hex 16)/" "$HOOD_DIR/.env"
+          log ".env created from infra/env/chicago.env.example - fill in L1_RPC_URL, L1_BEACON_URL, TELEGRAM_*, ANTHROPIC_API_KEY"
+        fi
+      fi
+      shred -u /etc/hood/dotenv 2>/dev/null || rm -f /etc/hood/dotenv
+
+      # --- node config + units ---
+      sudo -u hood "$HOOD_DIR/infra/node/download-config.sh"
+      for unit in "$HOOD_DIR"/infra/systemd/*.service "$HOOD_DIR"/infra/systemd/*.timer; do
+        sed "s#/opt/hoodsniper#$HOOD_DIR#g" "$unit" > "/etc/systemd/system/$(basename "$unit")"
+      done
+      systemctl daemon-reload
+      systemctl enable hood-snapshot.service hood-stack.service hood-backup.timer hood-healthcheck.timer
+      systemctl start hood-backup.timer hood-healthcheck.timer
+
+      # --- firewall (published compose ports bind 127.0.0.1; ufw guards host services) ---
+      ufw default deny incoming
+      ufw default allow outgoing
+      ufw allow OpenSSH
+      ufw allow 51820/udp comment 'wireguard (Ohio executor)'
+      ufw --force enable
+
+      if grep -Eq '^L1_RPC_URL=.+' "$HOOD_DIR/.env" && grep -Eq '^L1_BEACON_URL=.+' "$HOOD_DIR/.env"; then
+        log "starting hood-snapshot + hood-stack (snapshot restore takes 1-3 h)"
+        systemctl start --no-block hood-stack.service
+      else
+        msg="HoodSniper: edit $HOOD_DIR/.env (L1_RPC_URL, L1_BEACON_URL, TELEGRAM_*, ANTHROPIC_API_KEY) then: systemctl start hood-stack"
+        log "$msg"
+        echo "$msg" > /etc/motd
+      fi
+
+runcmd:
+  - [systemctl, enable, --now, chrony]
+  - [/usr/local/sbin/hood-setup-raid]
+  - [/usr/local/sbin/hood-bootstrap]
+
+final_message: "hoodsniper cloud-init finished after $UPTIME s - see /var/log/cloud-init-output.log"

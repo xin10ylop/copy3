@@ -13,17 +13,20 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p test/tsconfig.json --noEmit",
     "test": "vitest run --passWithNoTests",
     "start": "tsx src/main.ts"
   },
   "dependencies": {
+    "@hood/agent": "workspace:*",
     "@hood/core": "workspace:*",
     "@hood/db": "workspace:*",
-    "viem": "^2.45.0",
-    "zod": "^4.1.12",
+    "@hood/tracker": "workspace:*",
+    "grammy": "^1.40.0",
     "pino": "^9.14.0",
-    "grammy": "^1.40.0"
+    "postgres": "^3.4.7",
+    "viem": "^2.45.0",
+    "zod": "^4.1.12"
   },
   "devDependencies": {}
 }

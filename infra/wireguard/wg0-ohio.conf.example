@@ -1,0 +1,13 @@
+# /etc/wireguard/wg0.conf on the Ohio executor (chmod 600). systemctl enable --now wg-quick@wg0
+# Only config sync (Postgres LISTEN/NOTIFY + result writes) and the fallback node RPC use this tunnel;
+# the hot path sends straight to https://rpc.mainnet.chain.robinhood.com (~3 ms).
+[Interface]
+Address = 10.66.0.2/24
+PrivateKey = <ohio-private-key>
+
+[Peer]
+# Chicago box
+PublicKey = <chicago-public-key>
+Endpoint = <chicago-public-ip>:51820
+AllowedIPs = 10.66.0.1/32
+PersistentKeepalive = 25

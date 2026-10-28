@@ -19,6 +19,9 @@ export const PONS_V2 = {
   tradeRouterProxy: '0x65050a9b7e5075a2ba5ced7b1b64ee66262c40dc',
 } as const;
 
+/** Canonical multicall3 (verified deployed on this chain 2026-10-28, codeLen 3808). */
+export const MULTICALL3 = '0xca11bde05977b3631167028862be2a173976ca11';
+
 export const QUOTE_TOKENS = {
   eth: '0x0000000000000000000000000000000000000000',
   usdg: '0x5fc5360d0400a0fd4f2af552add042d716f1d168',
@@ -32,15 +35,63 @@ export const LAUNCH_SUPPLY = 1_000_000_000n * 10n ** 18n;
 export const LAUNCH_FEE_WEI = 500_000_000_000_000n; // 0.0005 ETH
 export const CURVE_FEE_BPS = 100;
 
+/**
+ * Function selectors from RESEARCH §3. Every entry is asserted against
+ * `toFunctionSelector(signature)` in test/abis.test.ts; a drift fails the build.
+ */
 export const SELECTORS = {
+  // factory launch entrypoints
   launchToken3: '0xf35abbcf',
   launchToken4: '0xa72101af',
   launchTokenFor: '0xd6a0eef5',
   launchAndBuy: '0xf85f8e41',
+  // factory views
+  getLaunchedToken: '0x3cf28b5a',
+  getLaunchConfig: '0x1cad862d',
+  launchConfigCount: '0xae72d871',
+  previewLaunchEconomics: '0xf718b78c',
+  canLaunch: '0x58373f04',
+  launchFee: '0xcf3cf573',
+  factorySnipeTaxStartBps: '0x50e25ac2',
+  factorySnipeTaxSeconds: '0x6783774b',
+  launchDeployer: '0x858f5964',
+  launchForwarder: '0x9b924452',
+  whitelistedLaunchers: '0xda3eda65',
+  // curve trading
   curveBuy: '0x59a87bc1',
   curveSell: '0xd04c6983',
   currentSnipeTaxBps: '0xd7e1ef39',
+  snipeTaxExempt: '0xd44bdfe7',
+  exemptFromSnipeTax: '0x31ff7f22',
+  // curve reserves / views
   getReserves: '0x0902f1ac',
+  quoteReserve: '0x9da771f4',
+  tokenReserve: '0xcbcb3171',
+  realQuoteReserve: '0x4f1f58fd',
+  phantomQuote: '0xc57eadfc',
+  launchedAt: '0xbf56b371',
+  graduated: '0xe7c2b772',
+  readyToGraduate: '0xc68360a5',
+  feeBps: '0x24a9d853',
+  creatorTaxBps: '0xc1bb8901',
+  maxInternalPriceImpactBps: '0x90addc1e',
+  launchSupply: '0x3f7ed6b7',
+  sellableTokens: '0x808bcddc',
+  reservedTokens: '0x15a55347',
+  graduationThreshold: '0x8b0bc501',
+  token: '0xfc0c546a',
+  pairToken: '0x3de35b79',
+  isNativeQuote: '0xdc08e094',
+  deployer: '0xd5f39488',
+  factory: '0xc45a0155',
+} as const;
+
+/** Custom-error selectors from RESEARCH §3 (verified in test/abis.test.ts). */
+export const ERROR_SELECTORS = {
+  SlippageExceeded: '0x71c4efed',
+  ZeroAmount: '0x1f2a2005',
+  AlreadyGraduated: '0xe6a0d45f',
+  InvalidLaunchEconomics: '0xbc0ecfe3',
 } as const;
 
 export const TOPICS = {

@@ -1,0 +1,12 @@
+# Generated / secret files that live under infra/
+node/config/*.json
+env/*.env
+!env/*.env.example
+cherry/terraform/.terraform/
+cherry/terraform/.terraform.lock.hcl
+cherry/terraform/*.tfstate
+cherry/terraform/*.tfstate.*
+cherry/terraform/terraform.tfvars
+cherry/rendered-*.yaml
+wireguard/*.conf
+!wireguard/*.conf.example

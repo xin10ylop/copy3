@@ -1,0 +1,16 @@
+# BuildKit picks this up for infra/Dockerfile (build context = repo root).
+**/node_modules
+**/dist
+**/coverage
+.git
+.env
+.env.*
+!.env.example
+data
+reports
+contracts/artifacts
+contracts/cache
+infra/node/config/*.json
+infra/cherry/terraform/.terraform
+infra/cherry/terraform/*.tfstate*
+**/*.log

@@ -1,0 +1,8 @@
+[Unit]
+Description=HoodSniper - health checks (node lag, postgres, containers, disk) with Telegram alerts
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/hoodsniper
+ExecStart=/opt/hoodsniper/infra/healthcheck.sh --alert

@@ -1,0 +1,323 @@
+# HoodSniper – Chicago box stack (Cherry Servers bare metal).
+#
+# Always run through the wrapper so the repo-root .env is used for interpolation:
+#   infra/compose.sh up -d
+#   infra/compose.sh --profile monitoring up -d
+#   infra/compose.sh --profile executor up -d sniper   # only when the executor runs HERE, not in Ohio
+#
+# Host layout (created by infra/cherry/cloud-init.yaml): ${DATA_ROOT}=/data is an md RAID0 of the
+# NVMe drives; nitro, postgres, reports, backups and monitoring data live there.
+# Every published port binds to 127.0.0.1 unless you override *_BIND (Docker bypasses ufw!).
+
+name: hoodsniper
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+x-app-env: &app-env
+  DATABASE_URL: postgres://${POSTGRES_USER:-hood}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-hood}
+  NODE_HTTP: http://nitro:8547
+  NODE_WS: ws://nitro:8548
+  REPORTS_DIR: /reports
+  HEALTH_PORT: "8080"
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  TZ: ${TZ:-UTC}
+
+x-app: &app
+  build:
+    context: ..
+    dockerfile: infra/Dockerfile
+    args:
+      TYPECHECK: ${HOOD_BUILD_TYPECHECK:-1}
+  image: hoodsniper/app:${HOOD_IMAGE_TAG:-local}
+  restart: unless-stopped
+  init: true
+  stop_grace_period: 30s
+  env_file:
+    - path: ../.env
+      required: false
+  logging: *logging
+  depends_on:
+    postgres:
+      condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
+  healthcheck:
+    test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.HEALTH_PORT||8080)+'/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 90s
+
+services:
+  # -------------------------------------------------------------------------------------------
+  # Robinhood Chain full node (Arbitrum Nitro). Flags: docs/RESEARCH.md §1.
+  # First start: restore the pruned snapshot with infra/node/run-node.sh snapshot (streams the
+  # ~1.05 TB multipart tar straight into the data dir, no 2x disk needed), or set NITRO_INIT_URL /
+  # NITRO_INIT_LATEST=pruned when the disk can hold archive + extracted DB at the same time.
+  nitro:
+    image: ${NITRO_IMAGE:-offchainlabs/nitro-node:v3.12.2-5f02f3f}
+    restart: unless-stopped
+    stop_grace_period: 5m
+    logging: *logging
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    ports:
+      - "${NITRO_BIND:-127.0.0.1}:8547:8547"
+      - "${NITRO_BIND:-127.0.0.1}:8548:8548"
+    volumes:
+      - ${DATA_ROOT:-/data}/nitro:/home/user/.arbitrum
+      - ./node/config:/home/nitro/config:ro
+      - ./node/healthcheck.sh:/usr/local/bin/hood-node-healthcheck:ro
+    command:
+      - --chain.id=4663
+      - --chain.info-files=/home/nitro/config/robinhood-chain-info.json
+      - --init.genesis-json-file=/home/nitro/config/robinhood-genesis.json
+      - --persistent.chain=robinhood
+      - --parent-chain.connection.url=${L1_RPC_URL:?set L1_RPC_URL (Ethereum mainnet execution RPC) in .env}
+      - --parent-chain.blob-client.beacon-url=${L1_BEACON_URL:?set L1_BEACON_URL (Ethereum beacon API with blob sidecars) in .env}
+      - --node.feed.input.url=wss://feed.mainnet.chain.robinhood.com
+      - --node.feed.input.secondary-url=wss://delayed-feed.mainnet.chain.robinhood.com
+      - --execution.forwarding-target=https://rpc.mainnet.chain.robinhood.com
+      - --http.addr=0.0.0.0
+      - --http.port=8547
+      - --http.vhosts=*
+      - --http.corsdomain=*
+      - --http.api=net,web3,eth,debug,arb
+      - --ws.addr=0.0.0.0
+      - --ws.port=8548
+      - --ws.origins=*
+      - --ws.api=net,web3,eth,debug
+      - --metrics
+      - --metrics-server.addr=0.0.0.0
+      - --metrics-server.port=6070
+      - --init.url=${NITRO_INIT_URL:-}
+      - --init.latest=${NITRO_INIT_LATEST:-}
+      - --init.latest-base=${NITRO_INIT_LATEST_BASE:-https://robinhood-snapshots.offchainlabs.com/}
+      - --init.download-path=/home/user/.arbitrum/download
+    healthcheck:
+      test: ["CMD", "bash", "/usr/local/bin/hood-node-healthcheck", "8547"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30m
+
+  # -------------------------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    shm_size: 2gb
+    stop_grace_period: 2m
+    logging: *logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-hood}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-hood}
+      POSTGRES_INITDB_ARGS: --data-checksums
+    # Tuned for the 128 GB / 16-core box shared with nitro (nitro keeps ~32-48 GB of caches).
+    # Scale PG_* down on smaller hosts: shared_buffers ~ 1/8 RAM, effective_cache_size ~ 1/3 RAM.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-16GB}
+      - -c
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-48GB}
+      - -c
+      - work_mem=${PG_WORK_MEM:-64MB}
+      - -c
+      - maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:-2GB}
+      - -c
+      - max_connections=${PG_MAX_CONNECTIONS:-200}
+      - -c
+      - max_wal_size=16GB
+      - -c
+      - min_wal_size=2GB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - wal_compression=zstd
+      - -c
+      - wal_buffers=64MB
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=256
+      - -c
+      - max_worker_processes=16
+      - -c
+      - max_parallel_workers=8
+      - -c
+      - max_parallel_workers_per_gather=4
+      - -c
+      - max_parallel_maintenance_workers=4
+      - -c
+      - default_statistics_target=200
+      - -c
+      - autovacuum_max_workers=4
+      - -c
+      - autovacuum_vacuum_scale_factor=0.05
+      - -c
+      - autovacuum_analyze_scale_factor=0.02
+      - -c
+      - jit=off
+      - -c
+      - log_min_duration_statement=${PG_LOG_MIN_DURATION_MS:-500}
+      - -c
+      - log_checkpoints=on
+      - -c
+      - log_lock_waits=on
+      - -c
+      - track_io_timing=on
+      - -c
+      - idle_in_transaction_session_timeout=5min
+    volumes:
+      - ${DATA_ROOT:-/data}/postgres:/var/lib/postgresql/data
+    ports:
+      - "${PG_BIND:-127.0.0.1}:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # -------------------------------------------------------------------------------------------
+  # One-shot: apply packages/db migrations, then exit 0. Every app service waits for it.
+  migrate:
+    <<: *app
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *app-env
+      SERVICE: db
+    command: ["pnpm", "--filter", "@hood/db", "migrate"]
+    healthcheck:
+      disable: true
+
+  indexer:
+    <<: *app
+    environment:
+      <<: *app-env
+      SERVICE: indexer
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      nitro:
+        condition: service_healthy
+
+  tracker:
+    <<: *app
+    environment:
+      <<: *app-env
+      SERVICE: tracker
+
+  agent:
+    <<: *app
+    environment:
+      <<: *app-env
+      SERVICE: agent
+    volumes:
+      - ${DATA_ROOT:-/data}/reports:/reports
+
+  # Runs /play, /scout and /backtest in-process (imports services/agent), so it needs the same
+  # ANTHROPIC_API_KEY and the shared reports volume to attach the CSV/report files.
+  telegram:
+    <<: *app
+    environment:
+      <<: *app-env
+      SERVICE: telegram
+    volumes:
+      - ${DATA_ROOT:-/data}/reports:/reports
+
+  # -------------------------------------------------------------------------------------------
+  # Profile "executor": the hot path on THIS box (≈24 ms behind an Ohio competitor on every send).
+  # Preferred deployment is infra/executor/install-executor.sh on an AWS us-east-2 host.
+  # Secrets come from ../.env.executor (chmod 600, never committed).
+  sniper:
+    <<: *app
+    profiles: ["executor"]
+    env_file:
+      - path: ../.env
+        required: false
+      - path: ../.env.executor
+        required: true
+    environment:
+      <<: *app-env
+      SERVICE: sniper
+      SEND_ENDPOINTS: ${SNIPER_SEND_ENDPOINTS:-https://rpc.mainnet.chain.robinhood.com,http://nitro:8547}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      nitro:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------------------------------
+  # Profile "monitoring": Prometheus + Grafana (+ host / postgres exporters).
+  # Grafana: ssh -L 3000:127.0.0.1:3000 <box>, then http://localhost:3000 (admin / GRAFANA_ADMIN_PASSWORD).
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    logging: *logging
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ${DATA_ROOT:-/data}/prometheus:/prometheus
+    ports:
+      - "${PROMETHEUS_BIND:-127.0.0.1}:9090:9090"
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ${DATA_ROOT:-/data}/grafana:/var/lib/grafana
+    ports:
+      - "${GRAFANA_BIND:-127.0.0.1}:3000:3000"
+    depends_on:
+      - prometheus
+
+  node-exporter:
+    image: prom/node-exporter:v1.9.1
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    logging: *logging
+    pid: host
+    command:
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/.+)($$|/)
+    volumes:
+      - /:/host:ro,rslave
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.17.1
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER:-hood}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-hood}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy

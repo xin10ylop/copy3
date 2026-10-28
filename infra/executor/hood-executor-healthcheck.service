@@ -1,0 +1,11 @@
+[Unit]
+Description=HoodSniper executor health checks (unit, /healthz, clock offset, send RPC) with Telegram alerts
+After=hood-sniper.service
+
+[Service]
+Type=oneshot
+User=hood
+Group=hood
+WorkingDirectory=/opt/hood/hoodsniper
+Environment=HC_STATE_DIR=/opt/hood/.healthcheck
+ExecStart=/opt/hood/hoodsniper/infra/healthcheck.sh --role executor --alert

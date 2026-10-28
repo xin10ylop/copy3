@@ -1,0 +1,7 @@
+project_id = 123456
+repo_url   = "https://github.com/<owner>/<repo>"
+repo_ref   = "main"
+# plan      = "amd-ryzen-9700x"   # when the 7950X is out of stock (provision.sh --list-stock)
+# cycle     = "monthly"
+# git_token = "github_pat_..."     # read-only, revoke after provisioning
+# dotenv_path = "../../../.env.chicago"

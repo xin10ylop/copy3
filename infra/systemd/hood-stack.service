@@ -1,0 +1,22 @@
+# docker compose stack: nitro, postgres, migrate, indexer, tracker, agent, telegram
+# (+ COMPOSE_PROFILES from /etc/hood/stack.env, e.g. COMPOSE_PROFILES=monitoring).
+[Unit]
+Description=HoodSniper compose stack
+Requires=docker.service
+Wants=network-online.target hood-snapshot.service
+After=docker.service network-online.target hood-snapshot.service
+RequiresMountsFor=/data
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/hoodsniper
+EnvironmentFile=-/etc/hood/stack.env
+ExecStart=/opt/hoodsniper/infra/compose.sh up -d --build --remove-orphans
+ExecReload=/opt/hoodsniper/infra/compose.sh up -d --build --remove-orphans
+ExecStop=/opt/hoodsniper/infra/compose.sh down
+TimeoutStartSec=45min
+TimeoutStopSec=10min
+
+[Install]
+WantedBy=multi-user.target

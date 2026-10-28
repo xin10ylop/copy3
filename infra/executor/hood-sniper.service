@@ -1,0 +1,50 @@
+# HoodSniper executor - the sniper hot path (feed -> rules -> timed burst -> position manager).
+# Installed by infra/executor/install-executor.sh to /etc/systemd/system/hood-sniper.service.
+[Unit]
+Description=HoodSniper executor (sniper hot path)
+Wants=network-online.target chrony.service
+After=network-online.target chrony.service wg-quick@wg0.service
+# Restart forever: the sniper reconciles its nonce from chain on every start.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=hood
+Group=hood
+WorkingDirectory=/opt/hood/hoodsniper
+EnvironmentFile=/opt/hood/hoodsniper/.env.executor
+Environment=NODE_ENV=production
+Environment=UV_THREADPOOL_SIZE=8
+Environment="NODE_OPTIONS=--max-old-space-size=3072 --enable-source-maps"
+# Do not start bursting on an unsynchronised clock (waits <= 5 min for |correction| < 1 ms; best effort).
+ExecStartPre=-/usr/bin/chronyc waitsync 30 0.001
+ExecStart=/usr/local/bin/pnpm --filter @hood/sniper start
+Restart=always
+RestartSec=1
+TimeoutStopSec=20
+KillMode=mixed
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity
+# Latency: run ahead of everything else on the box.
+Nice=-10
+# CPU pinning hints (install-executor.sh writes a drop-in when HOOD_PIN_CPU is set):
+#   2 vCPU (c7i.large):   CPUAffinity=1  and NIC IRQs on CPU 0 (irqbalance off)
+#   4+ vCPU:              CPUAffinity=2 3, IRQs on 0-1; optionally isolcpus=2,3 nohz_full=2,3 on the
+#                         kernel cmdline so nothing else is scheduled there.
+#CPUAffinity=1
+
+# Hardening: the key only needs to be readable by this unit.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/hood
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
