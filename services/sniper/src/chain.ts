@@ -19,11 +19,15 @@ import {
   createPublicClient,
   getAbiItem,
   http,
+  keccak256,
+  encodeAbiParameters,
   webSocket,
   type Address,
   type Hex,
   type Log,
   type PublicClient,
+  type StateOverride,
+  type Transport,
 } from 'viem';
 
 export interface ReceiptLite {
@@ -40,6 +44,12 @@ export interface SniperHolding {
   balance: bigint;
 }
 
+export interface RecentLaunch {
+  token: Address;
+  curve: Address;
+  block: number;
+}
+
 /** PonsSniper admin state checked at live startup (M4 / live-mode gate). */
 export interface SniperConfigState {
   owner: Address;
@@ -52,13 +62,13 @@ export interface SniperConfigState {
 export interface ChainClient {
   getReserves(curve: Address, blockNumber?: number): Promise<Reserves>;
   getBlockNumber(): Promise<number>;
-  /** sniper.bought(token) + token.balanceOf(sniper) */
+  /** sniper.bought(token) + token.balanceOf(sniper), both read at ONE block (N11) */
   readSniper(sniper: Address, token: Address): Promise<SniperHolding>;
   /** curve.graduated() — sells on the curve revert once true */
   curveGraduated(curve: Address): Promise<boolean>;
-  estimateGas(tx: { from: Address; to: Address; data: Hex; value?: bigint }): Promise<bigint>;
-  /** most recent TokenLaunched {token, curve} within `lookbackBlocks` (startup checks) */
-  recentLaunch(lookbackBlocks: number): Promise<{ token: Address; curve: Address } | null>;
+  estimateGas(tx: { from: Address; to: Address; data: Hex; value?: bigint; stateOverride?: StateOverride }): Promise<bigint>;
+  /** most recent TokenLaunched logs within `lookbackBlocks`, newest first, at most `limit` (startup checks) */
+  recentLaunches(lookbackBlocks: number, limit: number): Promise<RecentLaunch[]>;
   /** owner / factory / maxQuoteIn / operators(keys) of the PonsSniper contract */
   readSniperConfig(sniper: Address, keys: readonly Address[]): Promise<SniperConfigState>;
   getTransactionCount(address: Address, tag: 'latest' | 'pending'): Promise<number>;
@@ -70,7 +80,7 @@ export interface ChainClient {
   getBlockTimestamp(blockNumber: number): Promise<number>;
   /** TokenLaunched logs from the factory (ws). Optional: without ws we poll receipts. */
   watchLaunches?(cb: (log: RawLog) => void): () => void;
-  /** CurveBuy/CurveSell/CurveCompleted on `curve` and Transfer on `token` (ws). */
+  /** CurveBuy/CurveSell/CurveCompleted/SnipeTaxExempted on `curve` and Transfer on `token` (ws). */
   watchToken?(token: Address, curve: Address, cb: (log: RawLog) => void): () => void;
 }
 
@@ -87,8 +97,9 @@ export class ViemChain implements ChainClient {
   private readonly http: PublicClient;
   private readonly ws: PublicClient | null;
 
-  constructor(opts: { httpUrl: string; wsUrl?: string }) {
-    this.http = createPublicClient({ transport: http(opts.httpUrl, { batch: false, retryCount: 1, timeout: 5000 }) });
+  /** `transport` replaces the http transport (tests). */
+  constructor(opts: { httpUrl: string; wsUrl?: string; transport?: Transport }) {
+    this.http = createPublicClient({ transport: opts.transport ?? http(opts.httpUrl, { batch: false, retryCount: 1, timeout: 5000 }) });
     this.ws = opts.wsUrl ? createPublicClient({ transport: webSocket(opts.wsUrl, { keepAlive: true, reconnect: true }) }) : null;
   }
 
@@ -111,9 +122,11 @@ export class ViemChain implements ChainClient {
   }
 
   async readSniper(sniper: Address, token: Address): Promise<SniperHolding> {
+    // N11: both reads pinned to one block, or a buy landing in between gives bought=false + balance>0
+    const blockNumber = await this.http.getBlockNumber({ cacheTime: 0 });
     const [bought, balance] = await Promise.all([
-      this.http.readContract({ address: sniper, abi: sniperAbi, functionName: 'bought', args: [token] }),
-      this.http.readContract({ address: token, abi: tokenAbi, functionName: 'balanceOf', args: [sniper] }),
+      this.http.readContract({ address: sniper, abi: sniperAbi, functionName: 'bought', args: [token], blockNumber }),
+      this.http.readContract({ address: token, abi: tokenAbi, functionName: 'balanceOf', args: [sniper], blockNumber }),
     ]);
     return { bought, balance };
   }
@@ -122,11 +135,17 @@ export class ViemChain implements ChainClient {
     return this.http.readContract({ address: curve, abi: curveAbi, functionName: 'graduated' });
   }
 
-  estimateGas(tx: { from: Address; to: Address; data: Hex; value?: bigint }): Promise<bigint> {
-    return this.http.estimateGas({ account: tx.from, to: tx.to, data: tx.data, value: tx.value ?? 0n });
+  estimateGas(tx: { from: Address; to: Address; data: Hex; value?: bigint; stateOverride?: StateOverride }): Promise<bigint> {
+    return this.http.estimateGas({
+      account: tx.from,
+      to: tx.to,
+      data: tx.data,
+      value: tx.value ?? 0n,
+      ...(tx.stateOverride ? { stateOverride: tx.stateOverride } : {}),
+    });
   }
 
-  async recentLaunch(lookbackBlocks: number): Promise<{ token: Address; curve: Address } | null> {
+  async recentLaunches(lookbackBlocks: number, limit: number): Promise<RecentLaunch[]> {
     const head = await this.http.getBlockNumber();
     const logs = await this.http.getLogs({
       address: PONS_V2.factory as Address,
@@ -134,10 +153,13 @@ export class ViemChain implements ChainClient {
       fromBlock: head > BigInt(lookbackBlocks) ? head - BigInt(lookbackBlocks) : 0n,
       toBlock: head,
     });
-    const last = logs.at(-1);
-    if (!last) return null;
-    const p = parseTokenLaunchedLog(toRaw(last as Log));
-    return { token: p.token as Address, curve: p.curve as Address };
+    return logs
+      .slice(-limit)
+      .reverse()
+      .map((l) => {
+        const p = parseTokenLaunchedLog(toRaw(l as Log));
+        return { token: p.token as Address, curve: p.curve as Address, block: Number(l.blockNumber ?? 0n) };
+      });
   }
 
   async readSniperConfig(sniper: Address, keys: readonly Address[]): Promise<SniperConfigState> {
@@ -229,6 +251,7 @@ export class ViemChain implements ChainClient {
         getAbiItem({ abi: curveAbi, name: 'CurveBuy' }),
         getAbiItem({ abi: curveAbi, name: 'CurveSell' }),
         getAbiItem({ abi: curveAbi, name: 'CurveCompleted' }),
+        getAbiItem({ abi: curveAbi, name: 'SnipeTaxExempted' }),
       ],
       onLogs: (logs) => logs.forEach((l) => cb(toRaw(l as Log))),
     });
@@ -242,4 +265,18 @@ export class ViemChain implements ChainClient {
       b();
     };
   }
+}
+
+/**
+ * State override giving `holder` a `balance` of an OpenZeppelin-layout ERC-20 (`_balances` at
+ * slot 0, `_allowances` at slot 1) and a max allowance to `spender`. Used to estimate an exit
+ * on a curve the contract does not hold (N15). If the token uses another layout the estimate
+ * simply reverts (NothingToSell) and the caller reports that.
+ */
+export function erc20HoldingOverride(token: Address, holder: Address, spender: Address, balance: bigint): StateOverride {
+  const balSlot = keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], [holder, 0n]));
+  const inner = keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], [holder, 1n]));
+  const allowSlot = keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'bytes32' }], [spender, inner]));
+  const word = (v: bigint): Hex => `0x${v.toString(16).padStart(64, '0')}`;
+  return [{ address: token, stateDiff: [{ slot: balSlot, value: word(balance) }, { slot: allowSlot, value: word((1n << 256n) - 1n) }] }];
 }
