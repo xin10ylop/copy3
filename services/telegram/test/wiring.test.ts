@@ -1,6 +1,8 @@
+import type { BacktestArgs, PlayFinderArgs, ScoutArgs } from '@hood/agent';
+import type { WatchSpec } from '@hood/tracker';
 import { describe, expect, it } from 'vitest';
 import { JobRunner } from '../src/jobs.js';
-import { normalizeAgentResult, normalizeWatchPlay, ServiceUnavailableError } from '../src/ports.js';
+import { normalizeAgentResult, normalizeWatchPlay, ServiceUnavailableError, type ScoutInput, type WatchPlayInput } from '../src/ports.js';
 import { buildWatchPlayLocal } from '../src/stubs/tracker.js';
 import { loadAgentPort, loadTrackerPort } from '../src/wiring.js';
 import { FUNDER, silentLog } from './helpers.js';
@@ -88,3 +90,13 @@ describe('contract with the real services (default loader, no network)', () => {
     expect(p).toMatchObject({ name: 'contract', trigger: { armedWallet: { funders: [FUNDER], minEth: 0.01, maxEth: 0.015, freshOnly: true } }, preset: { buyEth: 0.07 } });
   });
 });
+
+// Compile-time contract: what the bot passes must be assignable to the real argument types.
+
+type Assert<T extends true> = T;
+export type ArgContracts = [
+  Assert<{ ca: string } extends PlayFinderArgs ? true : false>,
+  Assert<ScoutInput extends ScoutArgs ? true : false>,
+  Assert<{ playId: number } extends BacktestArgs ? true : false>,
+  Assert<WatchPlayInput extends WatchSpec ? true : false>,
+];

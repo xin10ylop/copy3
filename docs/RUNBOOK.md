@@ -79,7 +79,7 @@ the reason this project exists.
 
 `hood-stack` runs `migrate` (packages/db migrations) before any app service starts. To check:
 ```bash
-cd /opt/hoodsniper && sudo -u hood infra/compose.sh ps            # migrate: exited (0)
+cd /opt/hoodsniper && sudo -u hood infra/compose.sh ps -a         # migrate: exited (0)
 sudo -u hood infra/compose.sh exec postgres psql -U hood -d hood -c '\dt'
 ```
 Set the ETH/USD rate used for USD columns, then update it when the price moves a lot:

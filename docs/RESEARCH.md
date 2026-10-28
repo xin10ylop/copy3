@@ -210,7 +210,7 @@ within ~100-200 ms, far inside the 1-second window.
 
 ## 6. Cherry Servers (API `https://api.cherryservers.com/v1/plans`, public)
 
-Chicago, US bare-metal plans relevant to a Robinhood Chain node (monthly USD, measured 2026-10-28):
+Chicago, US bare-metal plans relevant to a Robinhood Chain node (monthly **EUR** as listed by the API, measured 2026-10-28; e.g. Ryzen 7950X €199 ≈ $233; stock varies daily – the 7950X and 9375F were out of stock in Chicago on 2026-10-28, `infra/cherry/provision.sh` checks stock and falls back):
 
 | Plan | CPU | RAM | Storage | NIC | $/mo |
 |---|---|---|---|---|---|
@@ -224,6 +224,14 @@ Chicago, US bare-metal plans relevant to a Robinhood Chain node (monthly USD, me
 | AMD EPYC 9375F | 32c | 384 GB | 2x1 TB + 2x4 TB NVMe | 3 Gbps | 989 |
 | AMD EPYC 9654P | 96c | 768 GB | 2x4 TB NVMe | 3 Gbps | 999 |
 | Cloud VDS / Premium VDS (EPYC 9554P) 2-8 vCPU | | 16-64 GB | 100-400 GB NVMe | 1 Gbps | 69-149 |
+
+**Disk sizing (measured 2026-10-28)**: the pruned full-node snapshot (2026-10-20) is
+1,051 GB and grows ≈5.3 GB/day; nitro's own restore needs ≈2.2 TB free, which
+`infra/node/run-node.sh snapshot` avoids by streaming the parts into place. A 2×1 TB
+box reaches 85 % full in ≈3 months; prefer a plan with 2×4 TB NVMe (Threadripper
+PRO 7975WX or EPYC 9375F) or a custom 7950X with added NVMe. The snapshot was
+written by nitro v3.12.1-rc.2, so the node image defaults to `v3.12.2-5f02f3f`
+(newer than the v3.11.2 the docs page pins).
 
 Also present: Cloud VPS from $3/mo, custom servers with more NVMe, Terraform/Ansible/CLI
 support, 100 TB egress included.
