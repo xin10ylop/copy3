@@ -2,6 +2,7 @@ import type { ArmedCandidate, LaunchEvent } from '@hood/core';
 import { parseEther } from 'viem';
 import { describe, expect, it } from 'vitest';
 import { Rules, compileRegex } from '../src/rules.js';
+import type { LaunchSecondStage, LaunchSecondStats } from '../src/types.js';
 import { play } from './helpers/fixtures.js';
 
 const DEV = '0x81eb508048220493549302d8ea5ef73a3fde1784' as const;
@@ -39,11 +40,18 @@ const armed = (over: Partial<ArmedCandidate> = {}): ArmedCandidate => ({
 
 const armedRule = { funders: [FUNDER], minEth: 0.01, maxEth: 0.015, freshOnly: true, maxAgeSec: 3600, contractMode: false };
 
+/** Launch-second totals: team ETH, team buyers (default 1 when team > 0), dev ETH. */
+const tot = (team = 0, buyers = team > 0 ? 1 : 0, dev = 0) => ({ teamBuyEth: team, teamBuyers: buyers, devBuyEth: dev });
+const ls = (seen: ReturnType<typeof tot>, confirmed: ReturnType<typeof tot> = seen, exemptOut = 0): LaunchSecondStats => ({ seen, confirmed, exemptOut, pending: 0 });
+
 interface Case {
   name: string;
   trigger: Record<string, unknown>;
   event?: Partial<LaunchEvent>;
   armed?: ArmedCandidate[];
+  /** launch-second ledger totals passed to evaluate */
+  ls?: LaunchSecondStats;
+  stage?: LaunchSecondStage;
   expect: boolean;
   reason?: RegExp;
 }
@@ -87,6 +95,44 @@ const cases: Case[] = [
   // safety
   { name: 'no identity matcher never matches', trigger: { launchKind: 'any' }, expect: false, reason: /no identity matcher/ },
   { name: 'bad regex is reported, never matches', trigger: { nameRegex: '(' }, expect: false, reason: /bad regex/ },
+  // launchSecond: minTeamBuyEth
+  { name: 'launchSecond.minTeamBuyEth: team bought 0.19 ≥ 0.1', trigger: { launchSecond: { minTeamBuyEth: 0.1 } }, ls: ls(tot(0.19)), expect: true, reason: /launchSecond: team 0\.19 ETH by 1 wallet\(s\), dev 0 ETH \(seen\)/ },
+  { name: 'launchSecond.minTeamBuyEth: team bought 0.05 < 0.1', trigger: { launchSecond: { minTeamBuyEth: 0.1 } }, ls: ls(tot(0.05)), expect: false, reason: /team buy 0\.05 ETH < min 0\.1/ },
+  { name: 'launchSecond.minTeamBuyEth: exactly at the threshold', trigger: { launchSecond: { minTeamBuyEth: 0.1 } }, ls: ls(tot(0.1)), expect: true },
+  { name: 'launchSecond: no ledger data yet never matches', trigger: { launchSecond: { minTeamBuyEth: 0.1 } }, expect: false, reason: /no launch-second data yet/ },
+  // maxTeamBuyEth
+  { name: 'launchSecond.maxTeamBuyEth: 1.5 > 1', trigger: { launchSecond: { minTeamBuyEth: 0.1, maxTeamBuyEth: 1 } }, ls: ls(tot(1.5)), expect: false, reason: /team buy 1\.5 ETH > max 1/ },
+  { name: 'launchSecond.maxTeamBuyEth: 0.5 within [0.1, 1]', trigger: { launchSecond: { minTeamBuyEth: 0.1, maxTeamBuyEth: 1 } }, ls: ls(tot(0.5)), expect: true },
+  // minTeamBuyers
+  { name: 'launchSecond.minTeamBuyers: 1 buyer < 2', trigger: { launchSecond: { minTeamBuyers: 2 } }, ls: ls(tot(0.4, 1)), expect: false, reason: /1 team buyer\(s\) < min 2/ },
+  { name: 'launchSecond.minTeamBuyers: 2 buyers', trigger: { launchSecond: { minTeamBuyers: 2 } }, ls: ls(tot(0.38, 2)), expect: true, reason: /by 2 wallet/ },
+  // minDevBuyEth / maxDevBuyEth / requireNoDevBuy
+  { name: 'launchSecond.minDevBuyEth: dev 0.1 ≥ 0.05', trigger: { launchSecond: { minDevBuyEth: 0.05 } }, ls: ls(tot(0, 0, 0.1)), expect: true, reason: /dev 0\.1 ETH/ },
+  { name: 'launchSecond.minDevBuyEth: dev 0.01 < 0.05', trigger: { launchSecond: { minDevBuyEth: 0.05 } }, ls: ls(tot(0, 0, 0.01)), expect: false, reason: /dev buy 0\.01 ETH < min 0\.05/ },
+  { name: 'launchSecond.maxDevBuyEth: dev 0.1 > 0.05', trigger: { launchSecond: { minTeamBuyEth: 0.1, maxDevBuyEth: 0.05 } }, ls: ls(tot(0.2, 1, 0.1)), expect: false, reason: /dev buy 0\.1 ETH > max 0\.05/ },
+  { name: 'launchSecond.maxDevBuyEth: dev 0.02 ≤ 0.05', trigger: { launchSecond: { minTeamBuyEth: 0.1, maxDevBuyEth: 0.05 } }, ls: ls(tot(0.2, 1, 0.02)), expect: true },
+  { name: 'launchSecond.requireNoDevBuy: dev bought', trigger: { launchSecond: { minTeamBuyEth: 0.1, requireNoDevBuy: true } }, ls: ls(tot(0.2, 1, 0.01)), expect: false, reason: /requireNoDevBuy but dev bought 0\.01 ETH/ },
+  { name: 'launchSecond.requireNoDevBuy: no dev buy', trigger: { launchSecond: { minTeamBuyEth: 0.1, requireNoDevBuy: true } }, ls: ls(tot(0.2)), expect: true },
+  { name: 'launchSecond without an ETH demand is only a filter: alone it never matches', trigger: { launchSecond: { requireNoDevBuy: true, maxTeamBuyEth: 5 } }, ls: ls(tot(0.2)), expect: false, reason: /no identity matcher/ },
+  { name: 'launchSecond without an ETH demand filters an identity matcher', trigger: { deployerIn: [DEV], launchSecond: { requireNoDevBuy: true } }, ls: ls(tot(0, 0, 0.3)), expect: false, reason: /requireNoDevBuy/ },
+  // stages: hint (feed, seen) vs confirm (minimums need CurveBuy-proven buys)
+  { name: 'launchSecond confirm stage: seen 0.19 but nothing confirmed', trigger: { launchSecond: { minTeamBuyEth: 0.1 } }, ls: ls(tot(0.19), tot(0)), stage: 'confirm', expect: false, reason: /team buy 0 ETH < min 0\.1 \(confirmed\)/ },
+  { name: 'launchSecond hint stage: the same unconfirmed feed buy is enough to schedule', trigger: { launchSecond: { minTeamBuyEth: 0.1 } }, ls: ls(tot(0.19), tot(0)), stage: 'hint', expect: true },
+  { name: 'launchSecond confirm stage: maximums use everything seen', trigger: { launchSecond: { minTeamBuyEth: 0.1, maxTeamBuyEth: 1 } }, ls: ls(tot(2), tot(0.5)), stage: 'confirm', expect: false, reason: /team buy 2 ETH > max 1 \(confirmed\)/ },
+  { name: 'launchSecond confirm stage: confirmed 0.19', trigger: { launchSecond: { minTeamBuyEth: 0.1 } }, ls: ls(tot(0.19)), stage: 'confirm', expect: true, reason: /\(confirmed\)/ },
+  // launchSecond is always AND; identity matchers keep their OR / require semantics
+  { name: 'launchSecond AND deployerIn: deployer misses', trigger: { deployerIn: [OTHER], launchSecond: { minTeamBuyEth: 0.1 } }, ls: ls(tot(0.19)), expect: false, reason: /none of deployerIn matched/ },
+  { name: 'launchSecond AND deployerIn: team buy misses', trigger: { deployerIn: [DEV], launchSecond: { minTeamBuyEth: 0.1 } }, ls: ls(tot(0.01)), expect: false, reason: /team buy 0\.01 ETH < min 0\.1/ },
+  { name: 'launchSecond AND deployerIn: both hit', trigger: { deployerIn: [DEV], launchSecond: { minTeamBuyEth: 0.1 } }, ls: ls(tot(0.19)), expect: true, reason: /launchSecond.*deployerIn/ },
+  { name: "require: ['launchSecond'] is accepted", trigger: { launchSecond: { minTeamBuyEth: 0.1 }, require: ['launchSecond'] }, ls: ls(tot(0.19)), expect: true },
+  // blacklists
+  { name: 'deployerNotIn: blacklisted deployer never matches', trigger: { launchSecond: { minTeamBuyEth: 0.1 }, deployerNotIn: [DEV] }, ls: ls(tot(0.19)), expect: false, reason: /deployerNotIn: 0x81eb.* is blacklisted/ },
+  { name: 'deployerNotIn: blacklisted tx sender (launchTokenFor)', trigger: { launchSecond: { minTeamBuyEth: 0.1 }, deployerNotIn: [DEV] }, event: { deployer: OTHER, txFrom: DEV }, ls: ls(tot(0.19)), expect: false, reason: /deployerNotIn/ },
+  { name: 'deployerNotIn: wins over a deployerIn hit', trigger: { deployerIn: [DEV], deployerNotIn: [DEV] }, expect: false, reason: /blacklisted/ },
+  { name: 'deployerNotIn: other deployers still match', trigger: { launchSecond: { minTeamBuyEth: 0.1 }, deployerNotIn: [OTHER] }, ls: ls(tot(0.19)), expect: true },
+  { name: 'teamWalletsNotIn: blacklisted team wallet in the exemptions', trigger: { launchSecond: { minTeamBuyEth: 0.1 }, teamWalletsNotIn: [TEAM] }, ls: ls(tot(0.19)), expect: false, reason: /teamWalletsNotIn: 0x3e57.* is blacklisted/ },
+  { name: 'teamWalletsNotIn: blacklisted creatorFeeRecipient', trigger: { deployerIn: [DEV], teamWalletsNotIn: [FEE_RCPT] }, event: { exemptions: [DEV] }, expect: false, reason: /teamWalletsNotIn/ },
+  { name: 'teamWalletsNotIn: unrelated wallet does not block', trigger: { launchSecond: { minTeamBuyEth: 0.1 }, teamWalletsNotIn: [OTHER] }, ls: ls(tot(0.19)), expect: true },
 ];
 
 describe('Rules.evaluate (table, paper mode: every identity matcher arms a run)', () => {
@@ -96,10 +142,10 @@ describe('Rules.evaluate (table, paper mode: every identity matcher arms a run)'
       r.setPlays([play({ id: 1, trigger: c.trigger })]);
       r.setArmed(c.armed ?? []);
       const ev = launch(c.event);
-      const got = r.evaluate(ev, NOW);
+      const got = r.evaluate(ev, NOW, c.ls, c.stage);
       expect(got.length > 0).toBe(c.expect);
       if (c.reason) {
-        const reasons = c.expect ? got[0]!.reasons : r.explain(ev, NOW)[0]!.reasons;
+        const reasons = c.expect ? got[0]!.reasons : r.explain(ev, NOW, c.ls, c.stage)[0]!.reasons;
         expect(reasons.join(' | ')).toMatch(c.reason);
       }
     });
@@ -131,6 +177,21 @@ describe('H1: live plays need a non-spoofable matcher', () => {
     expect(live({ deployerIn: [DEV], nameRegex: 'doge', require: ['deployerIn', 'nameRegex'] }).evaluate(launch(), NOW)).toHaveLength(0);
     expect(live({ deployerIn: [OTHER], nameRegex: 'shiba' }).evaluate(launch(), NOW)).toHaveLength(0); // OR hit only on the name
   });
+  it('launchSecond that demands ETH is a live-eligible matcher (real curve buys, confirmed before signing)', () => {
+    const stats = ls(tot(0.19));
+    expect(live({ launchSecond: { minTeamBuyEth: 0.1 } }).evaluate(launch(), NOW, stats)).toHaveLength(1);
+    expect(live({ launchSecond: { minTeamBuyers: 1 } }).evaluate(launch(), NOW, stats)).toHaveLength(1);
+    expect(live({ launchSecond: { minDevBuyEth: 0.05 } }).evaluate(launch(), NOW, ls(tot(0, 0, 0.1)))).toHaveLength(1);
+    // it anchors a spoofable identity matcher too
+    expect(live({ teamWalletsAny: [TEAM], launchSecond: { minTeamBuyEth: 0.1 } }).evaluate(launch(), NOW, stats)).toHaveLength(1);
+    // a launch-second rule without an ETH demand anchors nothing
+    const r = live({ nameRegex: 'shiba', launchSecond: { maxTeamBuyEth: 5 } });
+    expect(r.evaluate(launch(), NOW, stats)).toHaveLength(0);
+    expect(r.explain(launch(), NOW, stats)[0]!.reasons.join()).toMatch(/non-spoofable/);
+    // and without the ledger nothing fires
+    expect(live({ launchSecond: { minTeamBuyEth: 0.1 } }).evaluate(launch(), NOW)).toHaveLength(0);
+  });
+
   it('the default mode is live (fail closed)', () => {
     const r = new Rules();
     r.setPlays([play({ id: 1, trigger: { nameRegex: 'shiba' } })]);
@@ -173,6 +234,24 @@ describe('Rules state', () => {
     // eslint-disable-next-line no-console
     console.log(`[rules] 50 plays: ${us.toFixed(1)} µs/evaluate`);
     expect(us).toBeLessThan(500);
+  });
+
+  it('hasLaunchSecondPlays tells the sniper whether to keep launch-second ledgers', () => {
+    const r = new Rules();
+    r.setPlays([play({ id: 1, trigger: { deployerIn: [DEV] } })]);
+    expect(r.hasLaunchSecondPlays).toBe(false);
+    r.setPlays([play({ id: 1, trigger: { deployerIn: [DEV] } }), play({ id: 2, trigger: { launchSecond: { minTeamBuyEth: 0.1 } } })]);
+    expect(r.hasLaunchSecondPlays).toBe(true);
+    r.setPlays([{ ...play({ id: 2, trigger: { launchSecond: { minTeamBuyEth: 0.1 } } }), enabled: false }]);
+    expect(r.hasLaunchSecondPlays).toBe(false);
+  });
+
+  it('evaluatePlay re-checks one play against the ledger (confirm stage)', () => {
+    const r = new Rules();
+    r.setPlays([play({ id: 4, trigger: { launchSecond: { minTeamBuyEth: 0.1 } } })]);
+    expect(r.evaluatePlay(4, launch(), NOW, ls(tot(0.19), tot(0)), 'confirm').matched).toBe(false);
+    expect(r.evaluatePlay(4, launch(), NOW, ls(tot(0.19)), 'confirm').matched).toBe(true);
+    expect(r.evaluatePlay(5, launch(), NOW, ls(tot(0.19))).reasons).toEqual(['play no longer enabled']);
   });
 
   it('compileRegex supports /pat/flags and drops g', () => {

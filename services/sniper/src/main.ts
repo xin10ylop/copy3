@@ -79,7 +79,8 @@ async function main(): Promise<void> {
       keys: live.keys.map((k) => k.address),
       estimateFrom: live.burstKeys[0]!.address,
       gasLimit: plays.length ? Math.min(...plays.map((p) => p.preset.gasLimit)) : 300_000,
-      ...(plays.length ? { maxBuyEth: Math.max(...plays.map((p) => p.preset.buyEth)) } : {}),
+      // bankroll sizing can buy up to sizing.maxEth: warn when that exceeds the contract's maxQuoteIn
+      ...(plays.length ? { maxBuyEth: Math.max(...plays.map((p) => (p.preset.sizing.mode === 'bankroll' ? p.preset.sizing.maxEth : p.preset.buyEth))) } : {}),
       allowHotOwner: cfg.ALLOW_HOT_OWNER,
       gasCheck: cfg.GAS_CHECK,
       lookbackBlocks: cfg.GAS_CHECK_LOOKBACK_BLOCKS,
@@ -113,6 +114,8 @@ async function main(): Promise<void> {
     rttMs,
     maxConcurrent: cfg.MAX_CONCURRENT,
     dailyLossLimitEth: cfg.DAILY_LOSS_LIMIT_ETH,
+    dailyLossLimitPct: cfg.DAILY_LOSS_LIMIT_PCT,
+    paperBankrollEth: cfg.PAPER_BANKROLL_ETH,
     maxGasPriceGwei: cfg.MAX_GAS_PRICE_GWEI,
     deadlineBlocks: cfg.DEADLINE_BLOCKS,
     addressTimeoutMs: cfg.ADDRESS_TIMEOUT_MS,

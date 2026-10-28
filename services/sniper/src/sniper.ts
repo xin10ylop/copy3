@@ -47,6 +47,7 @@ import { Recorder } from './recorder.js';
 import { Risk } from './risk.js';
 import { Rules } from './rules.js';
 import type { Scheduler } from './scheduler.js';
+import { PaperBankroll, sizeBuy } from './sizing.js';
 import type { ActiveSnipe, ChangeChannel, SniperStore } from './store.js';
 import type { Decision, DetectedLaunch, Fill, SnipeRun } from './types.js';
 
@@ -61,7 +62,12 @@ export interface SniperOptions {
   detector?: LaunchDetector;
   rttMs: () => number;
   maxConcurrent?: number;
-  dailyLossLimitEth?: number;
+  /** fixed daily loss limit (ETH). Unset with `dailyLossLimitPct` set = percentage of the day's starting bankroll. */
+  dailyLossLimitEth?: number | undefined;
+  /** DAILY_LOSS_LIMIT_PCT: used when `dailyLossLimitEth` is unset (neither set = 0.5 ETH fixed) */
+  dailyLossLimitPct?: number | undefined;
+  /** paper bankroll for `sizing.mode = 'bankroll'`: PAPER_BANKROLL_ETH + realised paper PnL. Default 0.1. */
+  paperBankrollEth?: number;
   maxGasPriceGwei?: number;
   deadlineBlocks?: number;
   addressTimeoutMs?: number;
@@ -116,6 +122,8 @@ export class Sniper {
   };
   lastError: string | null = null;
   lastDecideUs = 0;
+  /** paper mode: the simulated contract balance for bankroll sizing */
+  readonly paperBank: PaperBankroll | null;
   private readonly runs = new Map<string, SnipeRun>();
   /** live runs whose outcome could not be read from the chain yet (H3) */
   private readonly unresolvedRuns = new Map<string, SnipeRun>();
@@ -139,9 +147,11 @@ export class Sniper {
     this.risk = new Risk({
       mode: o.mode,
       maxConcurrent: o.maxConcurrent ?? 3,
-      dailyLossLimitEth: o.dailyLossLimitEth ?? 0.5,
+      dailyLossLimitEth: o.dailyLossLimitEth ?? (o.dailyLossLimitPct === undefined ? 0.5 : undefined),
+      dailyLossLimitPct: o.dailyLossLimitPct,
       maxGasPriceGwei: o.maxGasPriceGwei ?? 1,
     });
+    this.paperBank = o.mode === 'paper' ? new PaperBankroll(parseEther(String(o.paperBankrollEth ?? 0.1))) : null;
     this.detector = o.detector ?? new LaunchDetector();
     this.recorder = new Recorder(o.store, o.logger, { recordFeedBlocks: o.recordFeedBlocks ?? true });
     this.positions = new Positions({
@@ -161,6 +171,7 @@ export class Sniper {
         p.run.ended = true;
         this.counters.closed!++;
         this.risk.onPositionClosed(pnl);
+        this.paperBank?.close(p.key, pnl);
         this.runs.delete(p.key);
         this.recorder.snipe(p.run, p, 'snipe_closed');
         o.logger.info({ key: p.key, pnlEth: pnl }, 'position closed');
@@ -172,6 +183,16 @@ export class Sniper {
         this.alert(type, { key: p.key, snipeId: p.run.id, token: p.token, curve: p.curve, phase: p.phase, ...detail }, type === 'sale_from_chain' ? 'warn' : 'error');
       },
     });
+  }
+
+  /** Bankroll for sizing: the cached contract ETH balance (live) or the paper bankroll. Memory-only. */
+  bankrollWei(): bigint | null {
+    return this.paperBank ? this.paperBank.balanceWei() : (this.o.backend.bankrollWei?.() ?? null);
+  }
+
+  private feedBankroll(): void {
+    const b = this.bankrollWei();
+    this.risk.setBankroll(b === null ? null : Number(b) / 1e18);
   }
 
   /** Creator tax for a curve we have seen launch (paper fills/exits). */
@@ -203,6 +224,8 @@ export class Sniper {
     await this.reconcileStartup();
     const stats = await store.loadSnipeStats(new Date(Math.floor(Date.now() / 86_400_000) * 86_400_000), this.o.mode);
     this.risk.seed(stats);
+    this.paperBank?.seedRealized(stats.realizedPnlTotal ?? 0);
+    this.feedBankroll();
     this.statsLoaded = true;
     this.o.logger.info({ plays: plays.length, armed: armed.length, positions: this.positions.open.length, unresolved: this.unresolvedRows.size }, 'state loaded');
     const off = await store.onChange((c, p) => {
@@ -238,6 +261,7 @@ export class Sniper {
       this.timers.push(t);
     };
     every(this.o.gasPollMs ?? 5000, async () => {
+      this.feedBankroll();
       this.risk.gasPriceWei = await this.o.chain.getGasPrice();
     }, 'gas poll');
     every(this.o.reservesPollMs ?? 500, () => this.pollReserves(), 'reserves poll');
@@ -601,7 +625,9 @@ export class Sniper {
 
   // ------------------------------------------------------------------ decide + execute
   private newRun(l: DetectedLaunch, d: Decision): SnipeRun {
-    const quoteIn = parseEther(String(d.preset.buyEth));
+    // Preset.sizing: fixed buyEth, or a share of the bankroll (cached balance, memory only)
+    const sizing = sizeBuy(d.preset, d.preset.sizing?.mode === 'bankroll' ? this.bankrollWei() : null, this.risk.maxConcurrent);
+    const quoteIn = sizing.quoteIn;
     const maxTaxBps = Math.max(0, Math.min(MAX_TAX_BPS, Math.floor(d.preset.maxTaxBps)));
     const run: SnipeRun = {
       id: 0,
@@ -618,8 +644,10 @@ export class Sniper {
       deadlineBlock: l.block + (this.o.deadlineBlocks ?? 40),
       burst: [],
       notes: [],
+      sizing,
     };
     if (maxTaxBps !== d.preset.maxTaxBps) run.notes.push(`maxTaxBps ${d.preset.maxTaxBps} clamped to ${maxTaxBps} (M3)`);
+    if (sizing.mode === 'bankroll') run.notes.push(`size: ${sizing.note}`);
     return run;
   }
 
@@ -673,6 +701,7 @@ export class Sniper {
       return run;
     }
     this.risk.reserve();
+    this.paperBank?.commit(run.key, run.quoteIn);
     this.runs.set(run.key, run);
     this.recorder.snipe(run, undefined, 'snipe_decided');
     try {
@@ -693,6 +722,7 @@ export class Sniper {
     run.notes.push(why);
     this.counters[final]!++;
     this.risk.release(run.playId, run.confirmed === true);
+    this.paperBank?.release(run.key);
     this.runs.delete(run.key);
     this.unresolvedRuns.delete(run.key);
     this.recorder.snipe(run, undefined, final === 'failed' ? 'snipe_failed' : 'snipe_aborted');
@@ -1135,6 +1165,7 @@ export class Sniper {
     this.recorder.adopt(run);
     this.runs.set(run.key, run);
     this.risk.adoptPosition(run.playId, token, event.deployer);
+    this.paperBank?.commit(run.key, quoteIn);
     const pos = this.positions.openPosition(run, fill, preset, event.exemptions, {
       tokensHeld: balance,
       realizedQuote: realized,
@@ -1153,6 +1184,11 @@ export class Sniper {
     return [...this.runs.values()];
   }
 
+  /** The launch-second ledger of a launch tx (while it is kept, ~10 s after the launch second). */
+  ledger(launchTxHash: string): LaunchSecondLedger | undefined {
+    return this.ledgers.get(launchTxHash.toLowerCase());
+  }
+
   health(feed: HealthState['feed']): HealthState {
     const positions = this.positions.open.map((p: PositionEntry) => ({
       key: p.key,
@@ -1168,7 +1204,16 @@ export class Sniper {
       feed,
       clock: this.o.clock.snapshot(),
       rttMs: this.o.rttMs(),
-      counters: { ...this.counters, decide_us_last: Math.round(this.lastDecideUs), rule_evaluations: this.rules.stats.evaluations, ledgers_open: this.ledgers.size },
+      counters: {
+        ...this.counters,
+        decide_us_last: Math.round(this.lastDecideUs),
+        rule_evaluations: this.rules.stats.evaluations,
+        ledgers_open: this.ledgers.size,
+        ...((): Record<string, number> => {
+          const b = this.bankrollWei();
+          return b === null ? {} : { bankroll_eth: Number(b) / 1e18, daily_loss_limit_eth: this.risk.dailyLossLimitEth };
+        })(),
+      },
       positions,
       lastError: this.lastError,
       nonce: this.o.nonce?.() ?? null,

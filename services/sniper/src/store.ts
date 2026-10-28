@@ -49,6 +49,8 @@ export interface SnipeStats {
   countsByPlay: Record<number, number>;
   openCount: number;
   realizedPnlSince: number;
+  /** all-time realised PnL of this mode (paper bankroll); optional for older stores */
+  realizedPnlTotal?: number;
   tokens: string[];
   playDeployers: { playId: number; deployer: string }[];
 }
@@ -127,6 +129,7 @@ export class MemoryStore implements SniperStore {
       countsByPlay,
       openCount: all.filter((s) => s.status === 'open' || s.status === 'pending').length,
       realizedPnlSince: all.filter((s) => s.closedAt && s.closedAt >= since).reduce((a, s) => a + (s.realizedPnlEth ?? 0), 0),
+      realizedPnlTotal: all.reduce((a, s) => a + (s.realizedPnlEth ?? 0), 0),
       tokens: all.filter((s) => played(s) && s.token).map((s) => s.token),
       playDeployers: [...deployers.values()],
     };

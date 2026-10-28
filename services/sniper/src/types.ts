@@ -2,6 +2,7 @@
 import type { LaunchEvent, Play, Preset, Reserves } from '@hood/core';
 import type { Address, Hex } from 'viem';
 import type { LaunchSecondLedger } from './ledger.js';
+import type { SizeDecision } from './sizing.js';
 
 /** A launch seen on the feed (or recovered from a TokenLaunched log in fallback mode). */
 export interface DetectedLaunch {
@@ -129,4 +130,6 @@ export interface SnipeRun {
   signer?: Address;
   /** launch-second ledger of the launch (launch-second plays: confirmation + last-moment re-check) */
   ledger?: LaunchSecondLedger;
+  /** how `quoteIn` was sized (Preset.sizing) */
+  sizing?: SizeDecision;
 }

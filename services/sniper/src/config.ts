@@ -13,6 +13,8 @@ const csv = z
   );
 
 const num = (d: number) => z.coerce.number().default(d);
+/** optional positive number; unset or '' = undefined */
+const optNum = z.preprocess((v) => (v === '' || v === undefined || v === null ? undefined : v), z.coerce.number().positive().optional());
 const bool = (d: boolean) =>
   z
     .string()
@@ -44,7 +46,12 @@ export const ConfigSchema = z
     /** extra launcher contracts (Pons whitelisted launchers) besides the factory and the launch router (H1) */
     LAUNCHERS: csv,
     MAX_GAS_PRICE_GWEI: num(1),
-    DAILY_LOSS_LIMIT_ETH: num(0.5),
+    /** fixed daily loss limit (realised live PnL, UTC day); unset = DAILY_LOSS_LIMIT_PCT of the day's starting bankroll */
+    DAILY_LOSS_LIMIT_ETH: optNum,
+    /** daily loss limit as % of the bankroll (contract ETH balance) at the start of the UTC day, when DAILY_LOSS_LIMIT_ETH is unset */
+    DAILY_LOSS_LIMIT_PCT: z.coerce.number().positive().max(100).default(15),
+    /** paper mode: starting bankroll for `sizing.mode = 'bankroll'`; grows with realised paper PnL */
+    PAPER_BANKROLL_ETH: z.coerce.number().positive().default(0.1),
     MAX_CONCURRENT: num(3),
     /** fixed RTT to the sequencer (ms); 0 = measure against the primary send endpoint */
     RTT_MS: num(0),

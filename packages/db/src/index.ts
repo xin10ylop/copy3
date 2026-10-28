@@ -14,6 +14,7 @@ export { fromPostgres, fromPglite } from './sql.js';
 export * from './types.js';
 export * from './helpers.js';
 export { applyMigrations, loadMigrations, MIGRATIONS_DIR } from './migrate.js';
+export { seed, seedPlays, genericPreset, GENERIC_OPERATOR, DEFAULT_AUTO_APPROVE, KILL_SWITCH_OFF, type AutoApprovePolicy, type SeedPlay, type SeedResult } from './seed.js';
 
 /** NOTIFY channel names (SPEC §2). */
 export const CHANNELS = {

@@ -13,6 +13,12 @@
  *    token and the deployer stay marked (the launch was real and has been played).
  *  - positions (incl. ones rebuilt at startup) hold their slot until closed.
  *  - `sendCheck()` (kill switch, daily loss) runs at decide time AND right before the first send.
+ *
+ * Daily loss limit (realised live PnL of the UTC day): `settings.daily_loss_limit_eth`, else
+ * DAILY_LOSS_LIMIT_ETH, else a percentage (`settings.daily_loss_limit_pct`, else
+ * DAILY_LOSS_LIMIT_PCT, default 15 %) of the bankroll at the start of the day (the first bankroll
+ * figure seen that UTC day: contract ETH balance live, paper bankroll in paper mode). Until a
+ * bankroll is known the percentage mode falls back to 0.5 ETH.
  */
 import { mcapFromReserves, type Preset, type Reserves } from '@hood/core';
 import { formatEther } from 'viem';
@@ -20,10 +26,16 @@ import type { Decision, DetectedLaunch } from './types.js';
 
 export interface RiskOptions {
   maxConcurrent: number;
-  dailyLossLimitEth: number;
+  /** fixed limit (ETH); undefined = percentage of the day's starting bankroll */
+  dailyLossLimitEth?: number | undefined;
+  /** percentage mode (default 15) */
+  dailyLossLimitPct?: number | undefined;
   maxGasPriceGwei: number;
   mode: 'live' | 'paper';
 }
+
+/** Percentage mode before any bankroll figure is known. */
+export const FALLBACK_DAILY_LOSS_ETH = 0.5;
 
 export interface RiskVerdict {
   ok: boolean;
@@ -47,6 +59,8 @@ export class Risk {
   private openCount = 0;
   private realizedTodayEth = 0;
   private day = utcDay(Date.now());
+  /** first bankroll figure of the current UTC day (ETH) */
+  private dayBankrollEth: number | null = null;
   private readonly countsByPlay = new Map<number, number>();
   private readonly tokens = new Set<string>();
   private readonly playDeployers = new Set<string>();
@@ -72,7 +86,26 @@ export class Risk {
 
   get dailyLossLimitEth(): number {
     const s = this.settings.daily_loss_limit_eth;
-    return typeof s === 'number' ? s : this.opts.dailyLossLimitEth;
+    if (typeof s === 'number') return s;
+    if (this.opts.dailyLossLimitEth !== undefined) return this.opts.dailyLossLimitEth;
+    this.rollDay();
+    if (this.dayBankrollEth === null) return FALLBACK_DAILY_LOSS_ETH;
+    return (this.dailyLossLimitPct / 100) * this.dayBankrollEth;
+  }
+
+  get dailyLossLimitPct(): number {
+    const s = this.settings.daily_loss_limit_pct;
+    return typeof s === 'number' ? s : (this.opts.dailyLossLimitPct ?? 15);
+  }
+
+  /** Feed the current bankroll (ETH); the first figure of each UTC day is the percentage base. */
+  setBankroll(eth: number | null, now = Date.now()): void {
+    this.rollDay(now);
+    if (eth !== null && Number.isFinite(eth) && this.dayBankrollEth === null) this.dayBankrollEth = eth;
+  }
+
+  get bankrollAtDayStart(): number | null {
+    return this.dayBankrollEth;
   }
 
   get maxConcurrent(): number {
@@ -98,6 +131,7 @@ export class Risk {
     if (d !== this.day) {
       this.day = d;
       this.realizedTodayEth = 0;
+      this.dayBankrollEth = null;
     }
   }
 

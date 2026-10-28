@@ -80,6 +80,7 @@ export class PgStore implements SniperStore {
     );
     const open = await this.sql.query<{ n: string }>(`SELECT count(*)::text AS n FROM snipes WHERE mode = $1 AND status IN ('pending','open')`, [mode]);
     const pnl = await this.sql.query<{ s: number | null }>(`SELECT sum(realized_pnl_eth) AS s FROM snipes WHERE mode = $1 AND closed_at >= $2`, [mode, since]);
+    const total = await this.sql.query<{ s: number | null }>(`SELECT sum(realized_pnl_eth) AS s FROM snipes WHERE mode = $1`, [mode]);
     // token cap / firstBuyOnly: launches that were played (open/closed) or receipt-confirmed (H1:
     // a spoofed, never-confirmed launch must not block the real one after a restart)
     const toks = await this.sql.query<{ token: string }>(
@@ -96,6 +97,7 @@ export class PgStore implements SniperStore {
       countsByPlay: Object.fromEntries(counts.map((c) => [c.play_id, Number(c.n)])),
       openCount: Number(open[0]?.n ?? 0),
       realizedPnlSince: Number(pnl[0]?.s ?? 0),
+      realizedPnlTotal: Number(total[0]?.s ?? 0),
       tokens: toks.map((t) => t.token),
       playDeployers: pd.filter((r) => r.deployer).map((r) => ({ playId: r.play_id, deployer: r.deployer! })),
     };

@@ -5,6 +5,7 @@
 export {
   PresetSchema,
   PlayTriggerSchema,
+  launchSecondIsMatcher,
   quoteBuy,
   quoteSell,
   snipeTaxBps,

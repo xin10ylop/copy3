@@ -20,7 +20,7 @@
  */
 import type { Db } from './db.js';
 import type { BacktestItem, BacktestTrade, BacktestTransfer } from './backtest.js';
-import type { LaunchContext, WalletFunding } from './trigger.js';
+import { identityConditions, matchTrigger, type LaunchContext, type LaunchSecondFacts, type TriggerLike, type WalletFunding } from './trigger.js';
 
 export type { Db };
 
@@ -761,7 +761,32 @@ export async function exemptFlow(sql: Db, token: string): Promise<ExemptFlow | n
 // Operator fingerprints (launch kind, team-wallet overlap, funder overlap, names)
 // ---------------------------------------------------------------------------
 
-/** Per-launch context for trigger matching and clustering: deployer + team wallets with their first funding. */
+/**
+ * Launch-second totals (docs/BACKTEST.md fingerprint), as lateral joins on `launches l`:
+ *  - `tw.team`: exempt set minus the deployer (exemptions ∪ creator_fee_recipient);
+ *  - `ls`: buys in second 0 (block timestamp == launch timestamp) outside the launch tx:
+ *    team = recipient ∈ tw.team, dev = recipient = deployer (+ launches.dev_buy_quote).
+ * Same classification as the sniper's ledger (services/sniper/src/ledger.ts).
+ */
+const launchSecondJoins = (sql: Db) => sql`
+    cross join lateral (
+      select array(select distinct a from unnest(coalesce(l.exemptions, '{}'::text[]) || array[l.creator_fee_recipient]) a
+                   where a is not null and a <> l.deployer) as team
+    ) tw
+    left join lateral (
+      select coalesce(sum(t.quote::float8) filter (where t.recipient = any(tw.team)), 0) / 1e18 as team_eth,
+             count(distinct t.recipient) filter (where t.recipient = any(tw.team))::int as team_buyers,
+             coalesce(sum(t.quote::float8) filter (where t.recipient = l.deployer), 0) / 1e18 as dev_eth
+      from curve_trades t
+      where t.token = l.token and t.side = 'buy' and t.tx_hash is distinct from l.tx_hash
+        and (t.seconds_since_launch = 0 or (t.seconds_since_launch is null and t.ts = l.ts))
+    ) ls on true`;
+
+const launchSecondCols = (sql: Db) => sql`
+      coalesce(ls.team_eth, 0)::float8 as "lsTeamEth", coalesce(ls.team_buyers, 0)::int as "lsTeamBuyers",
+      (coalesce(l.dev_buy_quote, 0)::float8 / 1e18 + coalesce(ls.dev_eth, 0))::float8 as "lsDevEth"`;
+
+/** Per-launch context for trigger matching and clustering: deployer + team wallets with their first funding, and the launch-second totals. */
 export async function launchContexts(sql: Db, tokens: readonly string[]): Promise<LaunchContext[]> {
   if (tokens.length === 0) return [];
   const rows = await sql<
@@ -770,13 +795,19 @@ export async function launchContexts(sql: Db, tokens: readonly string[]): Promis
       name: string | null;
       symbol: string | null;
       deployer: string;
+      txFrom: string | null;
+      ts: number | null;
       launchKind: string | null;
       devBuyEth: number | null;
       teamWallets: string[];
       fundings: WalletFunding[] | string;
+      lsTeamEth: number;
+      lsTeamBuyers: number;
+      lsDevEth: number;
     }>
   >`
-    select l.token, l.name, l.symbol, l.deployer, l.launch_kind as "launchKind", (l.dev_buy_quote::float8 / 1e18) as "devBuyEth",
+    select l.token, l.name, l.symbol, l.deployer, l.tx_from as "txFrom", extract(epoch from l.ts)::float8 as ts,
+      l.launch_kind as "launchKind", (l.dev_buy_quote::float8 / 1e18) as "devBuyEth", ${launchSecondCols(sql)},
       array(select distinct a from unnest(coalesce(l.exemptions, '{}'::text[]) || array[l.creator_fee_recipient]) a
             where a is not null and a <> l.deployer) as "teamWallets",
       coalesce((
@@ -794,18 +825,90 @@ export async function launchContexts(sql: Db, tokens: readonly string[]): Promis
         left join lateral (select c.from_addr from eth_transfers c where c.to_addr = coalesce(w.first_funder, fi.from_addr)
                            and c.kind = 'create' limit 1) cr on true
       ), '[]'::jsonb) as fundings
-    from launches l where l.token = any(${[...tokens]}::text[])
+    from launches l ${launchSecondJoins(sql)}
+    where l.token = any(${[...tokens]}::text[])
     order by l.ts`;
   return rows.map((r) => ({
     token: r.token,
     name: r.name,
     symbol: r.symbol,
     deployer: r.deployer,
+    txFrom: r.txFrom,
+    ts: r.ts,
     launchKind: r.launchKind,
     devBuyEth: r.devBuyEth,
     teamWallets: [...(r.teamWallets ?? [])],
     fundings: typeof r.fundings === 'string' ? (JSON.parse(r.fundings) as WalletFunding[]) : r.fundings,
+    launchSecond: { teamBuyEth: Number(r.lsTeamEth), teamBuyers: Number(r.lsTeamBuyers), devBuyEth: Number(r.lsDevEth) } satisfies LaunchSecondFacts,
   }));
+}
+
+const ETH_PAIR = '0x0000000000000000000000000000000000000000';
+
+/**
+ * ETH-paired launches in [sinceTs, untilTs) whose launch-second totals pass a launchSecond rule
+ * and that are not blacklisted, pushed down into SQL (the candidate set of a generic
+ * fingerprint play such as `team-buy-0.1`: ~270 of ~3,700 launches over 3 days).
+ */
+export async function launchSecondCandidates(
+  sql: Db,
+  t: Pick<TriggerLike, 'launchSecond' | 'deployerNotIn' | 'teamWalletsNotIn'>,
+  opts: { sinceTs: number; untilTs?: number | undefined; limit?: number | undefined },
+): Promise<string[]> {
+  const r = t.launchSecond ?? {};
+  const num = (x: number | undefined): number | null => (x === undefined ? null : x);
+  const rows = await sql<Array<{ token: string }>>`
+    select l.token from launches l ${launchSecondJoins(sql)}
+    where l.ts >= to_timestamp(${opts.sinceTs}::float8) and l.ts < to_timestamp(${opts.untilTs ?? 4_102_444_800}::float8)
+      and coalesce(l.pair_token, ${ETH_PAIR}) = ${ETH_PAIR}
+      and (${num(r.minTeamBuyEth)}::float8 is null or coalesce(ls.team_eth, 0) >= ${num(r.minTeamBuyEth)}::float8 - 1e-12)
+      and (${num(r.maxTeamBuyEth)}::float8 is null or coalesce(ls.team_eth, 0) <= ${num(r.maxTeamBuyEth)}::float8 + 1e-12)
+      and (${num(r.minTeamBuyers)}::int is null or coalesce(ls.team_buyers, 0) >= ${num(r.minTeamBuyers)}::int)
+      and (${num(r.minDevBuyEth)}::float8 is null
+           or coalesce(l.dev_buy_quote, 0)::float8 / 1e18 + coalesce(ls.dev_eth, 0) >= ${num(r.minDevBuyEth)}::float8 - 1e-12)
+      and (${num(r.maxDevBuyEth)}::float8 is null
+           or coalesce(l.dev_buy_quote, 0)::float8 / 1e18 + coalesce(ls.dev_eth, 0) <= ${num(r.maxDevBuyEth)}::float8 + 1e-12)
+      and (not ${r.requireNoDevBuy === true}::boolean or (coalesce(l.dev_buy_quote, 0) = 0 and coalesce(ls.dev_eth, 0) = 0))
+      and not (l.deployer = any(${[...(t.deployerNotIn ?? [])].map((a) => a.toLowerCase())}::text[]))
+      and not (coalesce(l.tx_from, '') = any(${[...(t.deployerNotIn ?? [])].map((a) => a.toLowerCase())}::text[]))
+      and not (tw.team && ${[...(t.teamWalletsNotIn ?? [])].map((a) => a.toLowerCase())}::text[])
+    order by l.ts limit ${Math.min(5000, Math.max(1, opts.limit ?? 2000))}`;
+  return rows.map((x) => x.token);
+}
+
+/**
+ * Launches matching a PlayTrigger in [sinceTs, untilTs) (backtests, the nightly refit): an SQL
+ * superset (identity conditions via `triggerCandidates`, or the launch-second filter for a
+ * generic fingerprint play), refined with the exact `matchTrigger` semantics, which include the
+ * launchSecond fields (team buys = curve_trades in second 0 joined with the launch's exempt set)
+ * and the blacklists.
+ */
+export async function launchesMatchingTrigger(
+  sql: Db,
+  trigger: TriggerLike,
+  opts: { sinceTs: number; untilTs?: number | undefined; limit?: number | undefined },
+): Promise<{ tokens: string[]; candidates: number; contexts: LaunchContext[] }> {
+  const until = opts.untilTs ?? 4_102_444_800;
+  const cands =
+    identityConditions(trigger).length > 0
+      ? await triggerCandidates(
+          sql,
+          {
+            deployers: [...(trigger.deployerIn ?? [])],
+            team: [...(trigger.teamWalletsAny ?? [])],
+            funders: [...(trigger.armedWallet?.funders ?? [])],
+            nameRegex: trigger.nameRegex ?? null,
+            symbolRegex: trigger.symbolRegex ?? null,
+          },
+          opts.sinceTs,
+          opts.limit ?? 2000,
+        )
+      : trigger.launchSecond
+        ? await launchSecondCandidates(sql, trigger, opts)
+        : [];
+  const ctxs = (await launchContexts(sql, cands)).filter((c) => c.ts === undefined || c.ts === null || c.ts < until);
+  const contexts = ctxs.filter((c) => matchTrigger(c, trigger).matched);
+  return { tokens: contexts.map((c) => c.token), candidates: cands.length, contexts };
 }
 
 /** Launches since `sinceTs` that could match a trigger (SQL superset; refine with matchTrigger). */
@@ -1030,3 +1133,60 @@ export async function updatePlayStats(sql: Db, playId: number, stats: unknown): 
   await sql`update plays set stats = coalesce(stats, '{}'::jsonb) || ${JSON.stringify(stats)}::jsonb, updated_at = now() where id = ${playId}::int`;
 }
 
+/** Enabled plays (the nightly job's work list). */
+export async function enabledPlays(sql: Db): Promise<PlayRecord[]> {
+  const rows = await sql<PlayRecord[]>`
+    select p.id::float8 as id, p.operator_id::float8 as "operatorId", o.name as "operatorName", o.status as "operatorStatus",
+      p.name, p.enabled, p.trigger, p.preset, p.stats
+    from plays p left join operators o on o.id = p.operator_id
+    where p.enabled order by p.id`;
+  return rows.map((r) => ({ ...r, trigger: parseJson(r.trigger), preset: parseJson(r.preset), stats: parseJson(r.stats) }));
+}
+
+export async function countEnabledPlays(sql: Db): Promise<number> {
+  const rows = await sql<Array<{ n: number }>>`select count(*)::int as n from plays where enabled`;
+  return Number(rows[0]?.n ?? 0);
+}
+
+/** Enable a play and activate its operator (what the Telegram approve button does). */
+export async function enablePlay(sql: Db, playId: number, operatorId: number | null): Promise<void> {
+  await sql.begin(async (tx) => {
+    await tx`update plays set enabled = true, updated_at = now() where id = ${playId}::int`;
+    if (operatorId !== null) await tx`update operators set status = 'active' where id = ${operatorId}::int`;
+  });
+}
+
+export async function disablePlay(sql: Db, playId: number): Promise<void> {
+  await sql`update plays set enabled = false, updated_at = now() where id = ${playId}::int`;
+}
+
+export async function updatePlayPreset(sql: Db, playId: number, preset: unknown): Promise<void> {
+  await sql`update plays set preset = ${JSON.stringify(preset)}::jsonb, updated_at = now() where id = ${playId}::int`;
+}
+
+export async function updatePlayTrigger(sql: Db, playId: number, trigger: unknown): Promise<void> {
+  await sql`update plays set trigger = ${JSON.stringify(trigger)}::jsonb, updated_at = now() where id = ${playId}::int`;
+}
+
+/** Realised PnL (ETH) of a play's last `limit` closed snipes, paper or live, newest first. */
+export async function recentRealizedPnls(sql: Db, playId: number, limit = 30): Promise<number[]> {
+  const rows = await sql<Array<{ pnl: number }>>`
+    select realized_pnl_eth::float8 as pnl from snipes
+    where play_id = ${playId}::int and status = 'closed' and realized_pnl_eth is not null
+    order by closed_at desc nulls last, id desc limit ${Math.max(1, Math.floor(limit))}::int`;
+  return rows.map((r) => Number(r.pnl));
+}
+
+/** A settings value as stored (jsonb), or null. */
+export async function getSettingValue(sql: Db, key: string): Promise<unknown> {
+  const rows = await sql<Array<{ value: unknown }>>`select value from settings where key = ${key}`;
+  const v = rows[0]?.value;
+  if (typeof v === 'string') {
+    try {
+      return JSON.parse(v) as unknown;
+    } catch {
+      return v;
+    }
+  }
+  return v ?? null;
+}

@@ -81,6 +81,8 @@ export interface ExecutionBackend {
   onFeedBlock(b: FeedBlock): void;
   /** L8: reasons the next burst must not be sent (cached balances, free slot); [] = ok. Memory-only. */
   preflight?(o: PreflightInput): string[];
+  /** Bankroll for `sizing.mode = 'bankroll'` (live: the cached contract ETH balance). Memory-only. */
+  bankrollWei?(): bigint | null;
 }
 
 export class NonceManager {
@@ -300,6 +302,11 @@ export class LiveExecutor implements ExecutionBackend {
 
   private freeBurstKey(): ExecutorKey | undefined {
     return this.burstKeys.find((k) => !k.inBurst);
+  }
+
+  /** Sizing: the same cached contract balance the L8 pre-check uses (null until the first read). */
+  bankrollWei(): bigint | null {
+    return this.contractBalanceWei;
   }
 
   preflight(o: PreflightInput): string[] {

@@ -52,8 +52,26 @@ export const TrailingSchema = z.object({
 });
 export type Trailing = z.infer<typeof TrailingSchema>;
 
+/**
+ * Position sizing. `fixed` buys `buyEth` every time (default). `bankroll` compounds: the buy is
+ * `clamp(bankroll × fraction / maxConcurrent, minEth, maxEth)`, rounded down to 0.001 ETH, where
+ * the bankroll is the PonsSniper contract's ETH balance (live) or PAPER_BANKROLL_ETH + realised
+ * paper PnL (paper). Tax and fees are proportional to size, so the per-trade edge does not depend
+ * on it; gas (~0.00004 ETH per burst) makes 0.01 ETH the practical floor.
+ */
+export const SizingSchema = z.object({
+  mode: z.enum(['fixed', 'bankroll']).default('fixed'),
+  /** share of the bankroll committed across MAX_CONCURRENT positions (0.25 → each gets 25 % / maxConcurrent). */
+  fraction: z.number().positive().max(1).default(0.25),
+  minEth: z.number().positive().default(0.01),
+  maxEth: z.number().positive().default(0.3),
+});
+export type Sizing = z.infer<typeof SizingSchema>;
+
 export const PresetSchema = z.object({
+  /** buy size in `fixed` sizing mode (and the fallback label in `bankroll` mode). */
   buyEth: z.number().positive().default(0.07),
+  sizing: SizingSchema.default({ mode: 'fixed', fraction: 0.25, minEth: 0.01, maxEth: 0.3 }),
   /** max snipe tax tolerated ("tax protection"), bps. 1000 = 10 %. */
   // ≥ 9900 would disable the gate (launch-second tax is 9900); anything above ~700 is pointless
   // because the schedule only takes 9900 / 618 / 19 / 0. PonsSniper also refuses ≥ 9900.

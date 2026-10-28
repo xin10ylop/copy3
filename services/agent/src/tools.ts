@@ -39,6 +39,7 @@ import {
   getTrades,
   insertProposedPlay,
   launchContexts,
+  launchesMatchingTrigger,
   loadBacktestItems,
   MAX_ROWS,
   recentLaunches,
@@ -48,7 +49,6 @@ import {
   tokensByDeployer,
   tokensByName,
   transfers,
-  triggerCandidates,
   walletSummary,
   walletTrades,
   type AgentRunKind,
@@ -169,6 +169,17 @@ export const triggerInputSchema = z.object({
   launchKind: z.enum(['any', 'noDevBuy', 'devBuy']).optional(),
   minDevBuyEth: z.number().min(0).optional(),
   maxDevBuyEth: z.number().min(0).optional(),
+  launchSecond: z
+    .object({
+      minTeamBuyEth: z.number().min(0).max(100).optional(),
+      maxTeamBuyEth: z.number().min(0).max(100).optional(),
+      minTeamBuyers: z.number().int().min(0).max(50).optional(),
+      minDevBuyEth: z.number().min(0).max(100).optional(),
+      maxDevBuyEth: z.number().min(0).max(100).optional(),
+      requireNoDevBuy: z.boolean().optional(),
+    })
+    .optional()
+    .describe('launch-second fingerprint, always AND: ETH bought in the launch second by exempt non-deployer (team) wallets / by the deployer'),
   require: z
     .array(z.enum(['armedWallet', 'deployerIn', 'teamWalletsAny', 'nameRegex', 'symbolRegex']))
     .describe('conditions that must all hold; the other specified conditions are OR-ed'),
@@ -337,20 +348,10 @@ export function defaultGrid(derived: DerivedPreset | null): GridSpec {
   return { tp: [...tp].sort((a, b) => a - b), trailing, sl: [...sl].sort((a, b) => a - b), timeoutSec: [60, 120, 300] };
 }
 
+/** Launches since `sinceTs` matching a trigger, launch-second fingerprint and blacklists included. */
 export async function tokensForTrigger(sql: Db, trigger: PlayTrigger, sinceTs: number): Promise<{ tokens: string[]; candidates: number }> {
-  const cands = await triggerCandidates(
-    sql,
-    {
-      deployers: trigger.deployerIn ?? [],
-      team: trigger.teamWalletsAny ?? [],
-      funders: trigger.armedWallet?.funders ?? [],
-      nameRegex: trigger.nameRegex ?? null,
-      symbolRegex: trigger.symbolRegex ?? null,
-    },
-    sinceTs,
-  );
-  const ctxs = await launchContexts(sql, cands);
-  return { tokens: ctxs.filter((c) => matchTrigger(c, trigger).matched).map((c) => c.token), candidates: cands.length };
+  const { tokens, candidates } = await launchesMatchingTrigger(sql, trigger, { sinceTs });
+  return { tokens, candidates };
 }
 
 function validRegex(s: string): boolean {
@@ -715,7 +716,7 @@ export function buildTools(ctx: ToolContext): AgentTools {
       if (ctx.state.proposedPlays.length >= maxProposals) throw new Error(`at most ${maxProposals} proposals per run`);
       const trigger = PlayTriggerSchema.parse(i.trigger);
       if (specifiedConditions(trigger).length === 0) {
-        throw new Error('the trigger needs at least one condition: armedWallet, deployerIn, teamWalletsAny, nameRegex or symbolRegex');
+        throw new Error('the trigger needs at least one condition: armedWallet, deployerIn, teamWalletsAny, nameRegex, symbolRegex or a launchSecond rule that demands ETH');
       }
       for (const re of [trigger.nameRegex, trigger.symbolRegex]) if (re !== undefined && !validRegex(re)) throw new Error(`invalid regex: ${re}`);
       const { trailing, timeoutSec, maxEntryMcapEth, minQuoteReserveEth, exitIfExemptSellsPct, ...rest } = i.preset ?? {};

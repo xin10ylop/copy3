@@ -15,6 +15,14 @@ describe('parsePreset defaults (SPEC §4)', () => {
     expect(p.exitIfExemptSellsPct).toBe(0); // dump exit on the first exempt transfer-out/sell
     expect(p.abortIfExemptSellInLaunchBlock).toBe(true);
     expect(p.firstBuyOnly).toBe(true);
+    expect(p.sizing).toEqual({ mode: 'fixed', fraction: 0.25, minEth: 0.01, maxEth: 0.3 });
+  });
+
+  it('sizing: bankroll mode with defaults filled, bad fractions refused', () => {
+    expect(parsePreset({ sizing: { mode: 'bankroll' } }).sizing).toEqual({ mode: 'bankroll', fraction: 0.25, minEth: 0.01, maxEth: 0.3 });
+    expect(parsePreset({ sizing: { mode: 'bankroll', fraction: 0.5, maxEth: 0.1 } }).sizing.maxEth).toBe(0.1);
+    for (const fraction of [0, -0.1, 1.5]) expect(() => parsePreset({ sizing: { mode: 'bankroll', fraction } })).toThrow();
+    expect(() => parsePreset({ sizing: { mode: 'kelly' } })).toThrow();
   });
 
   it('M3: maxTaxBps is capped at 5000 (≥ 9900 would disable the tax gate)', () => {
