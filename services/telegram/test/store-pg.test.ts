@@ -161,7 +161,7 @@ describe('notifier end to end on the real triggers', () => {
         listen: (channel, cb) => pg.listen(channel, cb),
         log: silentLog,
       },
-      { pollMs: 3_600_000, dailySummaryHour: 23, tz: 'UTC', links: new Links(), ignoreSources: ['telegram'], armedBurstLimit: 10 },
+      { pollMs: 3_600_000, dailySummaryHour: 25 /* never reached: keeps this test deterministic at any time of day */, tz: 'UTC', links: new Links(), ignoreSources: ['telegram'], armedBurstLimit: 10 },
     );
     await notifier.start();
     const s = await insertSnipe(sql, { playId: id, token: TOKEN, curve: CURVE, mode: 'paper', burst: [{ nonce: 1, sentAt: 1, endpoint: 'https://rpc.mainnet.chain.robinhood.com', status: 'sent' }] });
