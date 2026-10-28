@@ -3,6 +3,14 @@
  * getReserves → ExecutionBackend (live burst / paper) → Positions → Recorder. Everything on the
  * decide path is memory; config arrives via NOTIFY into memory.
  *
+ * Launch-second plays (`trigger.launchSecond`): while such a play is enabled, every launch seen
+ * in the feed gets a `LaunchSecondLedger` that every later feed block of the launch second (and
+ * node CurveBuy/Transfer logs) updates. Each change re-runs `rules.evaluate` with the ledger's
+ * totals (µs); a match schedules the burst for the T+1 boundary exactly like an immediate match.
+ * Before signing, the buys behind the match must be confirmed by CurveBuy logs (receipts) of the
+ * receipt-proven curve, and right before the first send the play is re-checked (maximums, exempt
+ * outflows) — see rules.ts for the H1 reasoning.
+ *
  * Run lifecycle: decided (risk slot reserved) → confirmed (receipt: TokenLaunched from the
  * factory with the same deployer; play state recorded) → armed → filled (position) or ended
  * (`endRun`: slot released exactly once). A fill always opens a position, even after an abort
@@ -18,6 +26,7 @@ import {
   parsePreset,
   parseTokenLaunchedLog,
   type ArmedCandidate,
+  type DecodedTx,
   type FeedBlock,
   type LaunchEvent,
   type LaunchKind,
@@ -30,6 +39,7 @@ import type { ChainClient } from './chain.js';
 import { LaunchDetector, verifyLaunchReceipt, type ReceiptVerdict } from './detector.js';
 import { decodeSniped, snipeTaxFromLogs, type ExecutionBackend } from './executor.js';
 import type { HealthState } from './health.js';
+import { LEDGER_SELECTORS, LaunchSecondLedger, SEL_SELL, SEL_TRANSFER, SEL_TRANSFER_FROM, outflowFrom } from './ledger.js';
 import type { Logger } from './log.js';
 import { Positions, type PositionEntry, type SaleRecord } from './positions.js';
 import { DEFAULT_LAUNCH_RESERVES, MAX_TAX_BPS, launchReserves, planMinOut, worstTaxBps } from './pricing.js';
@@ -76,9 +86,6 @@ export interface SniperOptions {
 }
 
 
-const SEL_SELL = '0xd04c6983';
-const SEL_TRANSFER = '0xa9059cbb';
-const SEL_TRANSFER_FROM = '0x23b872dd';
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 type RecoverResult = Fill | null | 'unknown';
@@ -103,6 +110,9 @@ export class Sniper {
     positions_rebuilt: 0,
     alerts: 0,
     errors: 0,
+    ledger_launches: 0,
+    ledger_matches: 0,
+    launch_second_unconfirmed: 0,
   };
   lastError: string | null = null;
   lastDecideUs = 0;
@@ -113,6 +123,11 @@ export class Sniper {
   private readonly unresolvedRows = new Map<number, ActiveSnipe>();
   private readonly blockTs = new Map<number, number>();
   private readonly curveTax = new Map<string, number>();
+  /** launch tx hash → launch-second ledger (only while a launch-second play is enabled) */
+  private readonly ledgers = new Map<string, LaunchSecondLedger>();
+  /** block timestamp → feed txs with a ledger selector (buy/sell/transfer), last few seconds */
+  private readonly secondTxs = new Map<number, { block: number; tx: DecodedTx }[]>();
+  private ledgerSecond = 0;
   private readonly timers: NodeJS.Timeout[] = [];
   private unsubs: (() => void | Promise<void>)[] = [];
   private seq = 0;
@@ -232,6 +247,8 @@ export class Sniper {
 
   async stop(): Promise<void> {
     for (const t of this.timers) clearInterval(t);
+    for (const lg of this.ledgers.values()) lg.unwatch?.();
+    this.ledgers.clear();
     for (const u of this.unsubs) await u();
     await this.recorder.stop();
   }
@@ -261,6 +278,11 @@ export class Sniper {
       this.error('feed block bookkeeping', e);
     }
     this.positions.onFeedBlock(b).catch((e: unknown) => this.error('positions feed', e));
+    try {
+      this.ledgerFeed(b);
+    } catch (e) {
+      this.error('launch-second ledger', e);
+    }
     if (this.runs.size) this.checkLaunchSecondDumps(b).catch((e: unknown) => this.error('launch-second dump check', e));
     let launchy = false;
     for (const tx of b.txs) {
@@ -320,6 +342,174 @@ export class Sniper {
     this.o.logger.warn({ key: run.key, why, cancelled }, 'snipe aborted');
   }
 
+  // ------------------------------------------------------------------ launch-second ledger
+  /**
+   * Feed block → per-second buffer of buy/sell/transfer-shaped txs, and every ledger of that
+   * second (memory only). The buffer lets a ledger catch up on blocks it saw before the launch
+   * was registered or before its curve address was known (CREATE2: only the receipt / the
+   * TokenLaunched log tells).
+   */
+  private ledgerFeed(b: FeedBlock): void {
+    if (this.ledgers.size === 0 && !this.rules.hasLaunchSecondPlays) return;
+    let mine: DecodedTx[] | null = null;
+    for (const tx of b.txs) if (tx.selector !== null && LEDGER_SELECTORS.has(tx.selector)) (mine ??= []).push(tx);
+    if (mine) {
+      const list = this.secondTxs.get(b.timestamp) ?? [];
+      for (const tx of mine) list.push({ block: b.block, tx });
+      this.secondTxs.set(b.timestamp, list);
+    }
+    if (b.timestamp > this.ledgerSecond) {
+      this.ledgerSecond = b.timestamp;
+      for (const ts of [...this.secondTxs.keys()]) if (ts < b.timestamp - 3) this.secondTxs.delete(ts);
+      for (const [k, lg] of [...this.ledgers]) {
+        if (lg.ts >= b.timestamp - 10) continue;
+        lg.unwatch?.();
+        lg.unwatch = null;
+        this.ledgers.delete(k); // a run still holds its ledger for the guard
+      }
+    }
+    for (const lg of this.ledgers.values()) {
+      if (b.timestamp > lg.ts) {
+        if (!lg.secondOver) {
+          lg.secondOver = true;
+          lg.firstBlockAfter = b.block;
+        }
+        continue;
+      }
+      if (!mine || b.timestamp !== lg.ts || b.block < lg.launch.block) continue;
+      let changed = false;
+      for (const tx of mine) changed = this.ledgerIngest(lg, tx, b.block) || changed;
+      if (changed) this.onLedgerChanged(lg);
+    }
+  }
+
+  /** One feed tx into a ledger. Outflows whose sender is unknown are recovered off the decide path. */
+  private ledgerIngest(lg: LaunchSecondLedger, tx: DecodedTx, block: number): boolean {
+    const r = lg.ingestTx(tx, block);
+    if (r === 'out-needs-sender') {
+      const kind = tx.selector === SEL_SELL ? 'sell' : 'transfer';
+      const apply = (from: string): void => {
+        if (lg.addOut(tx.hash, from, kind)) this.onLedgerChanged(lg);
+      };
+      const known = outflowFrom(tx);
+      if (known) apply(known);
+      else tx.recoverFrom().then(apply, () => undefined);
+      return false;
+    }
+    return r === 'buy' || r === 'out';
+  }
+
+  private openLedger(l: DetectedLaunch): LaunchSecondLedger {
+    const lg = new LaunchSecondLedger(l);
+    this.ledgers.set(l.txHash.toLowerCase(), lg);
+    this.counters.ledger_launches!++;
+    // addresses from an early TokenLaunched log: replay now (handleLaunch evaluates right after)
+    if (l.token && l.curve && (l.addressSource === 'log' || l.addressSource === 'receipt')) this.ledgerAddresses(lg, l.token, l.curve);
+    this.resolveLedger(lg).catch((e: unknown) => this.error('launch-second ledger: launch receipt', e));
+    return lg;
+  }
+
+  /** Set token/curve once (trusted source), replay the buffered feed txs of the launch second, watch node logs. */
+  private ledgerAddresses(lg: LaunchSecondLedger, token: string, curve: string): boolean {
+    if (!lg.setAddresses(token, curve)) return false;
+    let changed = false;
+    for (const { block, tx } of this.secondTxs.get(lg.ts) ?? []) if (block >= lg.launch.block) changed = this.ledgerIngest(lg, tx, block) || changed;
+    const unwatch = this.o.chain.watchToken?.(lg.token as Address, lg.curve as Address, (log) => {
+      try {
+        this.ledgerLog(lg, log);
+      } catch (e) {
+        this.error('launch-second ledger: node log', e); // never throw into the ws client (M2)
+      }
+    });
+    lg.unwatch = unwatch ?? null;
+    return changed;
+  }
+
+  /** CurveBuy / CurveSell / Transfer from the node: only blocks of the launch second count. */
+  private ledgerLog(lg: LaunchSecondLedger, log: RawLog): void {
+    if (lg.dead || log.blockNumber === null || log.blockNumber === undefined) return;
+    const b = Number(log.blockNumber);
+    if (!lg.inSecond(b, this.blockTs.get(b))) return;
+    if (lg.ingestLog(log)) this.onLedgerChanged(lg);
+  }
+
+  /**
+   * The launch receipt for a ledger (every launch, not only matched ones): token, curve, the
+   * exempt set (SnipeTaxExempted) and the launchAndBuy dev buy. Woken early by the TokenLaunched
+   * ws log; gives up after ~2.5 s (the launch second is long over by then).
+   */
+  private async resolveLedger(lg: LaunchSecondLedger): Promise<void> {
+    const l = lg.launch;
+    const poll = this.o.receiptPollMs ?? 20;
+    const until = this.o.scheduler.now() + 2500;
+    const realUntil = Date.now() + 2500 + poll;
+    for (;;) {
+      const r = await this.o.chain.getReceipt(l.txHash).catch(() => null);
+      if (r) {
+        const v = verifyLaunchReceipt(r, l, this.detector.factory);
+        if (!v.ok) {
+          lg.dead = true; // spoofed or reverted: never fire from this ledger
+          return;
+        }
+        const c = v.confirmation;
+        this.ledgerAddresses(lg, c.token, c.curve);
+        lg.setExemptions(c.exemptions);
+        lg.applyReceipt(r);
+        this.onLedgerChanged(lg);
+        return;
+      }
+      if (this.o.scheduler.now() >= until || Date.now() >= realUntil || lg.dead) return;
+      const known = l.token !== undefined && l.curve !== undefined && l.addressSource !== undefined;
+      await (known ? sleep(poll) : Promise.race([sleep(poll), this.detector.waitAddresses(l, poll)]));
+    }
+  }
+
+  /** The ledger changed: re-run the rules for launch-second plays (memory, µs) and fire on a match. */
+  private onLedgerChanged(lg: LaunchSecondLedger): void {
+    if (lg.decided || lg.dead) return;
+    const t0 = performance.now();
+    const stats = lg.stats();
+    const ds = this.rules.evaluate(lg.launch.event, Date.now(), stats, 'hint').filter((d) => d.play.trigger.launchSecond);
+    if (ds.length === 0) return;
+    lg.decided = true;
+    // abortIfExemptSellInLaunchBlock: the team already moved tokens in the launch second
+    const d = ds.find((x) => !(stats.exemptOut > 0 && x.preset.abortIfExemptSellInLaunchBlock));
+    if (!d) {
+      this.o.logger.info({ tx: lg.launch.txHash, outflows: lg.outflows }, 'launch-second match refused: exempt outflow already seen in the launch second');
+      return;
+    }
+    this.counters.ledger_matches!++;
+    this.decide(lg.launch, d, t0, lg, 'launch-second').catch((e: unknown) => this.error('launch-second decision', e));
+  }
+
+  /**
+   * H1 for launch-second plays: re-evaluate with minimums against CONFIRMED buys only (CurveBuy
+   * logs of the receipt-proven curve), fetching the receipts of pending feed hints, until the
+   * play holds or `until` (scheduler ms) passes. A buy that reverted never counts.
+   */
+  private async confirmLaunchSecond(run: SnipeRun, until: number): Promise<{ ok: boolean; reason: string }> {
+    const lg = run.ledger;
+    if (!lg) return { ok: false, reason: 'launch-second play without a ledger (the feed did not show the launch second)' };
+    const poll = this.o.receiptPollMs ?? 20;
+    const realUntil = Date.now() + Math.max(0, until - this.o.scheduler.now()) + poll;
+    for (;;) {
+      const v = this.rules.evaluatePlay(run.playId, run.launch.event, Date.now(), lg.stats(), 'confirm');
+      if (v.matched) {
+        run.notes.push(`launch-second confirmed: ${v.reasons.join('; ')}`);
+        return { ok: true, reason: '' };
+      }
+      const pending = lg.pendingHints();
+      if (pending.length === 0) return { ok: false, reason: `launch-second fingerprint not confirmed: ${v.reasons.join('; ')}` };
+      if (this.o.scheduler.now() >= until || Date.now() >= realUntil) {
+        return { ok: false, reason: `launch-second buys not confirmed in time (${pending.length} pending): ${v.reasons.join('; ')}` };
+      }
+      const receipts = await Promise.all(pending.map((h) => this.o.chain.getReceipt(h).catch(() => null)));
+      let progressed = false;
+      for (const r of receipts) if (r) progressed = lg.applyReceipt(r) || progressed;
+      if (!progressed) await sleep(Math.max(1, Math.min(poll, until - this.o.scheduler.now())));
+    }
+  }
+
   // ------------------------------------------------------------------ node logs
   onTokenLaunchedLog(log: RawLog): void {
     if (log.topics[0] !== TOPICS.TokenLaunched || log.address.toLowerCase() !== this.detector.factory) return;
@@ -332,6 +522,10 @@ export class Sniper {
     if (!parsed.txHash) return;
     const hash = parsed.txHash;
     const known = this.detector.resolve(hash, { token: parsed.token, curve: parsed.curve, source: 'log', deployer: parsed.deployer });
+    const lg = this.ledgers.get(hash.toLowerCase());
+    if (lg && parsed.deployer.toLowerCase() === lg.launch.event.deployer.toLowerCase() && this.ledgerAddresses(lg, parsed.token, parsed.curve)) {
+      this.onLedgerChanged(lg);
+    }
     if (known || this.detector.get(hash)) return;
     // the feed has not shown this launch (yet): fallback after a short grace period
     const t = setTimeout(() => {
@@ -437,19 +631,37 @@ export class Sniper {
       this.counters.spoof_rejected!++;
       return null; // H1 defence in depth (the detector already filters on tx.to)
     }
-    const decisions = this.rules.evaluate(l.event, Date.now());
+    // every feed launch gets a ledger while a launch-second play is enabled: later blocks of the
+    // launch second can still make it match (onLedgerChanged)
+    const ledger = l.source === 'feed' && this.rules.hasLaunchSecondPlays ? this.openLedger(l) : undefined;
+    const decisions = this.rules.evaluate(l.event, Date.now(), ledger?.stats());
     if (decisions.length === 0) {
       this.lastDecideUs = (performance.now() - t0) * 1000;
-      this.o.logger.debug({ tx: l.txHash, name: l.event.name, deployer: l.event.deployer }, 'launch: no play');
+      this.o.logger.debug({ tx: l.txHash, name: l.event.name, deployer: l.event.deployer, ledger: ledger !== undefined }, 'launch: no play');
       return null;
     }
-    const d = decisions[0]!;
+    if (ledger) ledger.decided = true;
+    return this.decide(l, decisions[0]!, t0, ledger, 'launch');
+  }
+
+  /** A play matched (at the launch block or later from the launch-second ledger): risk, then execute. */
+  private async decide(l: DetectedLaunch, d: Decision, t0: number, ledger: LaunchSecondLedger | undefined, source: 'launch' | 'launch-second'): Promise<SnipeRun> {
     const run = this.newRun(l, d);
+    if (ledger) run.ledger = ledger;
     const verdict = this.risk.preCheck(d, l);
     this.lastDecideUs = (performance.now() - t0) * 1000;
     this.counters.decisions!++;
     this.o.logger.info(
-      { key: run.key, play: d.play.id, name: l.event.name, symbol: l.event.symbol, reasons: d.reasons, risk: verdict.reasons, decideUs: Math.round(this.lastDecideUs) },
+      {
+        key: run.key,
+        play: d.play.id,
+        name: l.event.name,
+        symbol: l.event.symbol,
+        reasons: d.reasons,
+        risk: verdict.reasons,
+        decideUs: Math.round(this.lastDecideUs),
+        source,
+      },
       'launch matched',
     );
     if (!verdict.ok) {
@@ -488,10 +700,24 @@ export class Sniper {
     return run;
   }
 
-  /** Last memory-only checks, evaluated again right before the first member is sent (L2). */
-  private sendGuard(): string | null {
+  /**
+   * Last memory-only checks, evaluated again right before the first member is sent (L2). For a
+   * launch-second play also the ledger: an exempt outflow in the launch second, or a maximum the
+   * later blocks of the second pushed us over, blocks the burst.
+   */
+  private sendGuard(run?: SnipeRun): string | null {
     const v = this.risk.sendCheck();
-    return v.ok ? null : v.reasons.join('; ');
+    if (!v.ok) return v.reasons.join('; ');
+    const lg = run?.ledger;
+    if (run && lg && run.decision.play.trigger.launchSecond) {
+      const s = lg.stats();
+      if (s.exemptOut > 0 && run.decision.preset.abortIfExemptSellInLaunchBlock) {
+        return `exempt wallet ${lg.outflows[0]?.from ?? '?'} moved tokens in the launch second`;
+      }
+      const m = this.rules.evaluatePlay(run.playId, run.launch.event, Date.now(), s, 'confirm');
+      if (!m.matched) return `launch-second fingerprint no longer holds: ${m.reasons.join('; ')}`;
+    }
+    return null;
   }
 
   private async execute(run: SnipeRun): Promise<void> {
@@ -530,11 +756,29 @@ export class Sniper {
     l.event = { ...l.event, token: c.token, curve: c.curve, exemptions: c.exemptions };
     run.notes.push(...verdict.notes);
     this.curveTax.set(c.curve, l.event.creatorTaxBps);
+    const lg = run.ledger;
+    if (lg) {
+      lg.setExemptions(c.exemptions);
+      this.ledgerAddresses(lg, c.token, c.curve);
+    }
     // the deployer is proven equal; only the team set can differ from the calldata → re-match then
     if (teamChanged) {
-      const again = this.rules.evaluatePlay(run.playId, l.event, Date.now());
+      const again = this.rules.evaluatePlay(run.playId, l.event, Date.now(), lg?.stats());
       if (!again.matched) {
         this.endRun(run, 'aborted', `play no longer matches the confirmed launch: ${again.reasons.join('; ')}`);
+        return;
+      }
+    }
+    // launch-second plays: the buys behind the match must be proven before anything is signed
+    if (run.decision.play.trigger.launchSecond) {
+      const lc = await this.confirmLaunchSecond(run, plan.latestMs);
+      if (run.status !== 'pending') {
+        this.endRun(run, 'aborted', `aborted before the burst: ${run.abortReason ?? ''}`);
+        return;
+      }
+      if (!lc.ok) {
+        this.counters.launch_second_unconfirmed!++;
+        this.endRun(run, 'aborted', lc.reason);
         return;
       }
     }
@@ -560,9 +804,15 @@ export class Sniper {
       return null;
     })();
     const start = (this.o.launchReserves ?? DEFAULT_LAUNCH_RESERVES)[String(l.event.launchConfigId)];
-    const derived = start ? launchReserves(start, l.event.devBuyQuoteIn, l.event.creatorTaxBps) : null;
+    const afterLaunch = start ? launchReserves(start, l.event.devBuyQuoteIn, l.event.creatorTaxBps) : null;
+    // the ledger knows the launch-second buys (team buys move the price; the node may lag)
+    const ledgerBasis = afterLaunch !== null && lg !== undefined && lg.priceMovingBuys > 0;
+    const derived = ledgerBasis ? lg.reservesAfter(afterLaunch, l.event.creatorTaxBps) : afterLaunch;
     let reserves: Reserves | null;
-    if (derived) {
+    if (derived && ledgerBasis) {
+      reserves = derived;
+      run.notes.push(`reserves: launch config + ${lg.priceMovingBuys} launch-second buy(s) from the ledger`);
+    } else if (derived) {
       const wait = this.o.reservesWaitMs ?? 5;
       reserves = (await Promise.race([rpcReserves, sleep(wait).then(() => null)])) ?? derived;
       rpcReserves.then(
@@ -619,7 +869,7 @@ export class Sniper {
       gasLimit: p.gasLimit,
       maxFeeGwei: this.risk.maxFeeGwei(p),
       priorityFeeGwei: p.priorityFeeGwei,
-      guard: () => this.sendGuard(),
+      guard: () => this.sendGuard(run),
     });
     if (fill) {
       this.onFill(run, fill);
@@ -918,7 +1168,7 @@ export class Sniper {
       feed,
       clock: this.o.clock.snapshot(),
       rttMs: this.o.rttMs(),
-      counters: { ...this.counters, decide_us_last: Math.round(this.lastDecideUs), rule_evaluations: this.rules.stats.evaluations },
+      counters: { ...this.counters, decide_us_last: Math.round(this.lastDecideUs), rule_evaluations: this.rules.stats.evaluations, ledgers_open: this.ledgers.size },
       positions,
       lastError: this.lastError,
       nonce: this.o.nonce?.() ?? null,

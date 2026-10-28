@@ -32,6 +32,8 @@ export function snipeRecord(run: SnipeRun, p?: PositionEntry): SnipeRecord {
           signer: run.signer,
           abortReason: run.abortReason,
           recovered: run.fill?.recovered === true,
+          // launch-second plays: what the ledger knew (team/dev buys, confirmations, exempt outflows)
+          launchSecond: run.ledger && run.decision.play.trigger.launchSecond ? run.ledger.snapshot() : undefined,
         },
         bigintReplacer,
       ),
