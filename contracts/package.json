@@ -3,10 +3,17 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
   "scripts": {
     "build": "node script/compile.mjs",
-    "typecheck": "echo skip",
-    "test": "vitest run --passWithNoTests"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "deploy": "tsx script/deploy.ts"
   },
   "dependencies": {
     "viem": "^2.45.0"
@@ -17,6 +24,7 @@
     "@ethereumjs/common": "^10.1.0",
     "@ethereumjs/util": "^10.1.0",
     "@ethereumjs/tx": "^10.1.0",
-    "@ethereumjs/evm": "^10.1.0"
+    "@ethereumjs/evm": "^10.1.0",
+    "@ethereumjs/block": "^10.1.0"
   }
 }
