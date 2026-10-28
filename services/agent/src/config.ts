@@ -32,5 +32,10 @@ export const AgentEnvSchema = z.object({
 export type AgentEnv = z.infer<typeof AgentEnvSchema>;
 
 export function loadEnv(env: NodeJS.ProcessEnv = process.env): AgentEnv {
-  return AgentEnvSchema.parse(env);
+  const r = AgentEnvSchema.safeParse(env);
+  if (!r.success) {
+    const problems = r.error.issues.map((i) => `${i.path.join('.') || 'env'}: ${i.message}`).join('; ');
+    throw new Error(`invalid agent environment (${problems})`);
+  }
+  return r.data;
 }

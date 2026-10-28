@@ -4,8 +4,7 @@
  * creator of a disperse contract that did the funding) with union-find, then drop the
  * clusters an existing play already covers.
  */
-import type { PlayTrigger } from './deps.js';
-import { matchTrigger, type LaunchContext } from './trigger.js';
+import { matchTrigger, type LaunchContext, type TriggerLike } from './trigger.js';
 
 /** Infra that funds or touches everyone and must never link two operators (RESEARCH §3). */
 export const INFRA_ADDRESSES: readonly string[] = [
@@ -62,7 +61,7 @@ export interface RunnerCluster {
 
 export interface PlayCoverage {
   playId: number;
-  trigger: PlayTrigger;
+  trigger: TriggerLike;
 }
 
 class UnionFind {

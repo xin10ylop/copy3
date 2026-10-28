@@ -6,9 +6,25 @@
  * specified conditions are OR-ed (at least one must hold when any exist). `launchKind`
  * and the dev-buy range are hard filters. A trigger with no condition matches nothing.
  */
-import type { PlayTrigger } from './deps.js';
-
 export type TriggerCondition = 'armedWallet' | 'deployerIn' | 'teamWalletsAny' | 'nameRegex' | 'symbolRegex';
+
+/**
+ * Structural view of SPEC §4 PlayTrigger: core's parsed `PlayTrigger` (defaults applied)
+ * and plain objects from tools/tests are both assignable.
+ */
+export interface TriggerLike {
+  armedWallet?:
+    | { funders: readonly string[]; minEth: number; maxEth: number; freshOnly: boolean; contractMode: boolean; maxAgeSec?: number | undefined }
+    | undefined;
+  deployerIn?: readonly string[] | undefined;
+  teamWalletsAny?: readonly string[] | undefined;
+  nameRegex?: string | undefined;
+  symbolRegex?: string | undefined;
+  launchKind?: 'any' | 'noDevBuy' | 'devBuy' | undefined;
+  minDevBuyEth?: number | undefined;
+  maxDevBuyEth?: number | undefined;
+  require?: readonly TriggerCondition[] | undefined;
+}
 
 export interface WalletFunding {
   wallet: string;
@@ -27,6 +43,7 @@ export interface LaunchContext {
   name: string | null;
   symbol: string | null;
   deployer: string;
+  /** launches.launch_kind: the entry point (launchToken | launchAndBuy | launchTokenFor) */
   launchKind: string | null;
   devBuyEth: number | null;
   /** exemptions ∪ creator_fee_recipient (lower-case) */
@@ -50,10 +67,10 @@ function safeRegex(src: string | undefined): RegExp | null {
 }
 
 export function isDevBuy(ctx: Pick<LaunchContext, 'launchKind' | 'devBuyEth'>): boolean {
-  return (ctx.devBuyEth ?? 0) > 0 || ctx.launchKind === 'devBuy';
+  return (ctx.devBuyEth ?? 0) > 0 || ctx.launchKind === 'launchAndBuy' || ctx.launchKind === 'devBuy';
 }
 
-export function specifiedConditions(trigger: PlayTrigger): TriggerCondition[] {
+export function specifiedConditions(trigger: TriggerLike): TriggerCondition[] {
   const out: TriggerCondition[] = [];
   if (trigger.armedWallet) out.push('armedWallet');
   if (trigger.deployerIn && trigger.deployerIn.length) out.push('deployerIn');
@@ -63,7 +80,7 @@ export function specifiedConditions(trigger: PlayTrigger): TriggerCondition[] {
   return out;
 }
 
-export function matchTrigger(ctx: LaunchContext, trigger: PlayTrigger): TriggerMatch {
+export function matchTrigger(ctx: LaunchContext, trigger: TriggerLike): TriggerMatch {
   const kind = trigger.launchKind ?? 'any';
   const devBuy = isDevBuy(ctx);
   if (kind === 'devBuy' && !devBuy) return { matched: false, hits: [], reason: 'launchKind' };
@@ -98,7 +115,7 @@ export function matchTrigger(ctx: LaunchContext, trigger: PlayTrigger): TriggerM
   };
 
   const hits = conds.filter((c) => test[c]());
-  const required = trigger.require.filter((c) => conds.includes(c));
+  const required = (trigger.require ?? []).filter((c) => conds.includes(c));
   if (!required.every((c) => hits.includes(c))) return { matched: false, hits, reason: 'require' };
   const optional = conds.filter((c) => !required.includes(c));
   if (optional.length > 0 && !optional.some((c) => hits.includes(c))) return { matched: false, hits, reason: 'no optional hit' };

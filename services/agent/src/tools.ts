@@ -56,7 +56,7 @@ import {
   type TokenRow,
 } from './queries.js';
 import { buildCsvRow, dateRange, renderReport, resolveEthUsd, toCsv, writeOutput, type CsvRow, type EthUsd, type PlayPattern } from './report.js';
-import { matchTrigger } from './trigger.js';
+import { matchTrigger, specifiedConditions } from './trigger.js';
 
 export const MAX_OUTPUT_CHARS = 40_000;
 
@@ -189,6 +189,7 @@ const simPresetPatch = z.object({
 type SimPresetPatch = z.infer<typeof simPresetPatch>;
 
 const presetPatch = simPresetPatch.extend({
+  trailing: trailingSchema.optional().describe('a play always has a trailing stop; a very high activatePct makes it inert'),
   slippageBps: z.number().int().min(0).max(9900).optional(),
   stopAfter: z.number().int().min(0).max(100).optional(),
   firstBuyOnly: z.boolean().optional(),
@@ -556,7 +557,7 @@ export function buildTools(ctx: ToolContext): AgentTools {
   const backtestTool = tool(
     ctx,
     'backtest_play',
-    "Simulates sniping each coin at +1 s (in front of the first taxed buyer; 6.18 % snipe tax on top, 1 % fee, creator tax, own price impact) and exiting with the preset's take-profit ladder, trailing stop, stop loss, timeout and exempt-disposal exit, over the stored trade paths. Pass the operator's coins in `tokens` (or a `trigger` to select launches since since_days). Returns win rate, average/median PnL, max drawdown, expectancy per snipe, exit reasons, the preset derived from the peak distribution and, with grid=true, the best presets by expectancy (needs >= 5 coins).",
+    "Simulates sniping each coin at +1 s (in front of the first taxed buyer; 6.18 % snipe tax, 1 % fee and the creator tax taken from the buy, plus own price impact) and exiting with the preset's take-profit ladder, trailing stop, stop loss, timeout and exempt-disposal exit, over the stored trade paths. Pass the operator's coins in `tokens` (or a `trigger` to select launches since since_days). Returns win rate, average/median PnL, max drawdown, expectancy per snipe, exit reasons, the preset derived from the peak distribution and, with grid=true, the best presets by expectancy (needs >= 5 coins).",
     z.object({
       tokens: z.array(addressSchema).min(1).max(MAX_ROWS).optional(),
       trigger: triggerInputSchema.optional(),
@@ -713,6 +714,10 @@ export function buildTools(ctx: ToolContext): AgentTools {
     async (i) => {
       if (ctx.state.proposedPlays.length >= maxProposals) throw new Error(`at most ${maxProposals} proposals per run`);
       const trigger = PlayTriggerSchema.parse(i.trigger);
+      if (specifiedConditions(trigger).length === 0) {
+        throw new Error('the trigger needs at least one condition: armedWallet, deployerIn, teamWalletsAny, nameRegex or symbolRegex');
+      }
+      for (const re of [trigger.nameRegex, trigger.symbolRegex]) if (re !== undefined && !validRegex(re)) throw new Error(`invalid regex: ${re}`);
       const { trailing, timeoutSec, maxEntryMcapEth, minQuoteReserveEth, exitIfExemptSellsPct, ...rest } = i.preset ?? {};
       const merged: Record<string, unknown> = { ...DEFAULT_PRESET, ...rest };
       const nullable = { trailing, timeoutSec, maxEntryMcapEth, minQuoteReserveEth, exitIfExemptSellsPct };

@@ -105,6 +105,9 @@ export function fromPglite(db: PgliteClient): Sql {
     async query<T = Row>(text: string, params: readonly unknown[] = []): Promise<T[]> {
       return (await db.query<T>(text, params as unknown[])).rows;
     },
+    async exec(text: string): Promise<void> {
+      await db.exec(text);
+    },
     begin<T>(fn: (tx: Sql) => Promise<T>): Promise<T> {
       return db.transaction((tx) => fn(txWrap(tx)));
     },

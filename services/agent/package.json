@@ -27,7 +27,6 @@
     "viem": "^2.45.0",
     "zod": "^4.1.12",
     "pino": "^9.14.0",
-    "postgres": "^3.4.7",
     "@anthropic-ai/sdk": "^0.90.0"
   },
   "devDependencies": {

@@ -11,13 +11,18 @@
  *  - every list is paginated: `limit` is clamped to MAX_ROWS and one extra row is
  *    fetched to compute `nextOffset`.
  * The agent deliberately keeps its own SQL (instead of importing services/indexer's
- * funding helpers) so the two services stay decoupled.
+ * funding helpers) so the two services stay decoupled. `Db` (src/db.ts) turns these
+ * templates into `query(text, params)` calls on @hood/db's driver-agnostic `Sql`.
+ *
+ * Money conventions (core curve math): for buys `quote` is the gross quoteIn the buyer
+ * sent; `fee` (1 %) INCLUDES the snipe tax, which is also stored separately in
+ * `snipe_tax`; `tax` is the creator tax. For sells `quote` is the net quoteOut.
  */
-import type { Sql } from 'postgres';
+import type { Db } from './db.js';
 import type { BacktestItem, BacktestTrade, BacktestTransfer } from './backtest.js';
 import type { LaunchContext, WalletFunding } from './trigger.js';
 
-export type Db = Sql;
+export type { Db };
 
 export const MAX_ROWS = 200;
 export const DEFAULT_ROWS = 50;
@@ -254,16 +259,20 @@ export async function tokensByName(sql: Db, regex: string, opts: Page & { sinceT
   return paged(rows, p);
 }
 
+/** SQL predicate: the launch included a dev buy (launchAndBuy, or a recorded dev_buy_quote). */
+const devBuyPredicate = (sql: Db) => sql`(coalesce(l.dev_buy_quote, 0) > 0 or l.launch_kind in ('launchAndBuy', 'devBuy'))`;
+
 export async function recentLaunches(
   sql: Db,
-  opts: Page & { sinceTs: number; launchKind?: string | undefined },
+  opts: Page & { sinceTs: number; launchKind?: 'devBuy' | 'noDevBuy' | undefined },
 ): Promise<Paged<LaunchSummary>> {
   const p = pageOf(opts);
   const kind = opts.launchKind ?? null;
   const rows = await sql<LaunchSummary[]>`
     select ${summaryCols(sql)}
     from launches l left join token_metrics m on m.token = l.token
-    where l.ts >= to_timestamp(${opts.sinceTs}::float8) and (${kind}::text is null or l.launch_kind = ${kind}::text)
+    where l.ts >= to_timestamp(${opts.sinceTs}::float8)
+      and (${kind}::text is null or (${kind}::text = 'devBuy') = ${devBuyPredicate(sql)})
     order by l.ts desc limit ${p.limit + 1} offset ${p.offset}`;
   return paged(rows, p);
 }
@@ -346,7 +355,7 @@ export interface TradeRow {
 const tradeCols = (sql: Db) => sql`
   t.id::float8 as id, t.block::float8 as block, extract(epoch from t.ts)::float8 as ts, t.log_index::int as "logIndex",
   t.seconds_since_launch::int as "secondsSinceLaunch", t.side, t.trader, t.recipient, t.tx_from as "txFrom", t.tx_hash as "txHash",
-  (t.quote::float8 / 1e18) as "quoteEth", (t.tokens::float8 / 1e18) as tokens, (coalesce(t.fee, 0)::float8 / 1e18) as "feeEth",
+  (t.quote::float8 / 1e18) as "quoteEth", (t.tokens::float8 / 1e18) as tokens, (greatest(coalesce(t.fee, 0) - coalesce(t.snipe_tax, 0), 0)::float8 / 1e18) as "feeEth",
   (coalesce(t.tax, 0)::float8 / 1e18) as "creatorTaxEth", (coalesce(t.snipe_tax, 0)::float8 / 1e18) as "snipeTaxEth",
   t.price_after::float8 as "priceAfter", coalesce(t.exempt, false) as exempt`;
 
@@ -385,18 +394,18 @@ export interface WalletTokenPnl {
   snipeTaxEth: number;
 }
 
-/** A wallet's curve activity per token (matched as recipient for buys and as trader/recipient/tx.from for sells). */
+/** A wallet's curve activity per token (matched as recipient for buys and as trader/recipient/tx.from for sells). ETH in is the gross quote sent, snipe tax included. */
 export async function walletTrades(sql: Db, wallet: string, page: Page = {}): Promise<Paged<WalletTokenPnl> & { totals: { pnlEth: number; tokens: number } }> {
   const p = pageOf(page);
   const rows = await sql<WalletTokenPnl[]>`
     select t.token, l.name, l.symbol,
       count(*) filter (where t.side = 'buy')::int as buys, count(*) filter (where t.side = 'sell')::int as sells,
-      coalesce(sum(t.quote::float8 + coalesce(t.snipe_tax, 0)::float8) filter (where t.side = 'buy'), 0) / 1e18 as "ethIn",
+      coalesce(sum(t.quote::float8) filter (where t.side = 'buy'), 0) / 1e18 as "ethIn",
       coalesce(sum(t.quote::float8) filter (where t.side = 'sell'), 0) / 1e18 as "ethOut",
       coalesce(sum(t.tokens::float8) filter (where t.side = 'buy'), 0) / 1e18 as "tokensBought",
       coalesce(sum(t.tokens::float8) filter (where t.side = 'sell'), 0) / 1e18 as "tokensSold",
       (coalesce(sum(t.quote::float8) filter (where t.side = 'sell'), 0)
-        - coalesce(sum(t.quote::float8 + coalesce(t.snipe_tax, 0)::float8) filter (where t.side = 'buy'), 0)) / 1e18 as "pnlEth",
+        - coalesce(sum(t.quote::float8) filter (where t.side = 'buy'), 0)) / 1e18 as "pnlEth",
       min(extract(epoch from t.ts))::float8 as "firstTs", max(extract(epoch from t.ts))::float8 as "lastTs",
       min(t.seconds_since_launch) filter (where t.side = 'buy')::int as "firstBuySecondsSinceLaunch",
       coalesce(sum(coalesce(t.snipe_tax, 0)::float8), 0) / 1e18 as "snipeTaxEth"
@@ -987,7 +996,8 @@ export interface ProposedPlayRecord {
 
 /**
  * Writes a candidate operator + disabled play + an `events` row for Telegram approval,
- * atomically, then NOTIFYs `plays_changed` (the play stays disabled until approved).
+ * atomically. The `plays` NOTIFY trigger (migration 0001) announces it on `plays_changed`;
+ * the play stays disabled until approved.
  */
 export async function insertProposedPlay(
   sql: Db,
@@ -1008,7 +1018,6 @@ export async function insertProposedPlay(
     const ev = await tx<Array<{ id: number }>>`
       insert into events (ts, level, source, type, payload)
       values (now(), 'info', 'agent', 'play_proposed', ${JSON.stringify(payload)}::jsonb) returning id::float8 as id`;
-    await tx`select pg_notify('plays_changed', ${JSON.stringify({ op: 'proposed', playId })})`;
     return { operatorId, playId, eventId: ev[0]!.id };
   }) as Promise<ProposedPlayRecord>;
 }

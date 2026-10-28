@@ -76,7 +76,7 @@ describe('launch row from the real launchToken tx fixture', () => {
   });
 });
 
-describe('parseLaunchCall (stub ABI) matches the measured selectors', () => {
+describe('parseLaunchCall (@hood/core) on calldata encoded from the RESEARCH signatures', () => {
   const abi = parseAbi([
     'struct S { string a; string b; string c; string d; string e; }',
     'struct P { string name; string symbol; string logo; string description; S socials; address creatorFeeRecipient; uint16 creatorTaxBps; bool buybackEnabled; bytes32 salt1; bytes32 salt2; }',
@@ -109,11 +109,12 @@ describe('parseLaunchCall (stub ABI) matches the measured selectors', () => {
     ]);
   });
 
-  it('4-arg launchToken carries explicit exemptions; deployer = tx.from', () => {
+  it('4-arg launchToken carries explicit exemptions (deployer comes from TokenLaunched)', () => {
     const input = encodeFunctionData({ abi, functionName: 'launchToken', args: [params, 0n, '0x0000000000000000000000000000000000000000', team] });
     expect(input.slice(0, 10)).toBe('0xa72101af');
     const c = parseLaunchCall({ from, input });
-    expect(c).toMatchObject({ kind: 'launchToken', name: 'Amlil', creatorTaxBps: 200, exemptions: team, deployer: from, devBuyQuoteIn: 0n });
+    expect(c).toMatchObject({ kind: 'launchToken', name: 'Amlil', creatorTaxBps: 200, exemptions: team, devBuyQuoteIn: 0n });
+    expect(c?.deployer).toBeUndefined();
   });
 
   it('launchAndBuy carries the dev buy, launchTokenFor an explicit deployer', () => {

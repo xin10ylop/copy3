@@ -17,6 +17,9 @@ export const PONS_V2 = {
   uniswapV4PoolManager: '0x8366a39cc670b4001a1121b8f6a443a643e40951',
   v1Factory: '0xa5aab3f0c6eeadf30ef1d3eb997108e976351feb',
   tradeRouterProxy: '0x65050a9b7e5075a2ba5ced7b1b64ee66262c40dc',
+  // read live from factory getters 2026-10-28
+  positionManager: '0x58daec3116aae6d93017baaea7749052e8a04fa7',
+  permit2: '0x000000000000000000000022d473030f116ddee9f6b43ac78ba3',
 } as const;
 
 /** Canonical multicall3 (verified deployed on this chain 2026-10-28, codeLen 3808). */

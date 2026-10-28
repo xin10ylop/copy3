@@ -24,3 +24,5 @@ export { simulateSnipe, backtestPlay, gridSearch, derivePresetFromPeaks, peakSta
 export type { BacktestItem, BacktestLaunch, BacktestTrade, BacktestTransfer, SimPreset, SnipeResult, BacktestSummary } from './backtest.js';
 export { CSV_COLUMNS, type CsvRow } from './report.js';
 export { DEFAULT_PRESET } from './defaults.js';
+export { loadEnv, type AgentEnv } from './config.js';
+export { tagged, type Db, type Queryable } from './db.js';

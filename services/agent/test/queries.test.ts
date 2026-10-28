@@ -61,6 +61,8 @@ describe('tokens', () => {
     const p1 = await recentLaunches(db.sql, { sinceTs: T - 10 * 86_400, limit: 2 });
     expect(p1.rows).toHaveLength(2);
     expect(p1.nextOffset).toBe(2);
+    expect((await recentLaunches(db.sql, { sinceTs: T - 10 * 86_400, launchKind: 'devBuy' })).rows).toHaveLength(0);
+    expect((await recentLaunches(db.sql, { sinceTs: T - 10 * 86_400, launchKind: 'noDevBuy' })).rows).toHaveLength(4);
     const p2 = await recentLaunches(db.sql, { sinceTs: T - 10 * 86_400, limit: 2, offset: 2 });
     expect(p2.nextOffset).toBeNull();
     expect(new Set([...p1.rows, ...p2.rows].map((r) => r.token)).size).toBe(4);
@@ -88,17 +90,19 @@ describe('trades', () => {
     const taxed = r.rows.find((x) => x.snipeTaxEth > 0)!;
     expect(taxed.secondsSinceLaunch).toBe(1);
     expect(taxed.snipeTaxEth / taxed.quoteEth).toBeCloseTo(0.0618, 6);
+    expect(taxed.feeEth / taxed.quoteEth).toBeCloseTo(0.01, 6); // raw CurveBuy.fee includes the snipe tax; feeEth excludes it
     expect(taxed.creatorTaxEth / taxed.quoteEth).toBeCloseTo(0.02, 6);
     expect(r.rows.filter((x) => x.exempt)).toHaveLength(2);
   });
 
-  it('get_wallet_trades aggregates PnL per token including the snipe tax paid', async () => {
+  it('get_wallet_trades aggregates PnL per token (quote-in is gross, snipe tax included)', async () => {
     const r = await walletTrades(db.sql, A.FIRST_TAXED);
     expect(r.rows).toHaveLength(2);
     const t1 = r.rows.find((x) => x.token === A.TOKEN1)!;
-    expect(t1.ethIn).toBeCloseTo(0.035 * 1.0618, 9);
+    expect(t1.ethIn).toBeCloseTo(0.035, 9);
+    expect(t1.snipeTaxEth).toBeCloseTo(0.035 * 0.0618, 9);
     expect(t1.ethOut).toBeCloseTo(0.09, 9);
-    expect(t1.pnlEth).toBeCloseTo(0.09 - 0.035 * 1.0618, 9);
+    expect(t1.pnlEth).toBeCloseTo(0.09 - 0.035, 9);
     expect(t1.firstBuySecondsSinceLaunch).toBe(1);
   });
 });

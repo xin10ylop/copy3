@@ -5,7 +5,7 @@
  * creation row (kind 'create', value may be 0: the creator is the lineage of a
  * disperse contract). The *first* such row is the address's first funder.
  */
-import type { Queryable } from './stubs/db.js';
+import type { Sql } from './stubs/db.js';
 import type { Address, Hex, TransferKind } from './types.js';
 
 export interface FundingHop {
@@ -35,14 +35,16 @@ interface TransferDbRow {
 
 const toSec = (since: Date | number): number => (since instanceof Date ? since.getTime() / 1000 : since);
 
-async function firstIncoming(sql: Queryable, wallet: Address): Promise<TransferDbRow | null> {
-  const rows = await sql<TransferDbRow[]>`
-    select from_addr, to_addr, value::text as value, kind, tx_hash, trace_addr, block::float8 as block,
-      extract(epoch from ts)::float8 as ts
-    from eth_transfers
-    where to_addr = ${wallet} and (value > 0 or kind = 'create') and from_addr <> to_addr
-    order by block, id
-    limit 1`;
+async function firstIncoming(sql: Sql, wallet: Address): Promise<TransferDbRow | null> {
+  const rows = await sql.query<TransferDbRow>(
+    `select from_addr, to_addr, value::text as value, kind, tx_hash, trace_addr, block::float8 as block,
+       extract(epoch from ts)::float8 as ts
+     from eth_transfers
+     where to_addr = $1 and (value > 0 or kind = 'create') and from_addr <> to_addr
+     order by block, id
+     limit 1`,
+    [wallet],
+  );
   return rows[0] ?? null;
 }
 
@@ -50,7 +52,7 @@ async function firstIncoming(sql: Queryable, wallet: Address): Promise<TransferD
  * wallet <- funder <- funder ... following each address's FIRST funding transfer
  * (any kind: tx, internal, create), up to `depth` hops; stops on cycles.
  */
-export async function fundingPath(sql: Queryable, wallet: string, depth = 5): Promise<FundingHop[]> {
+export async function fundingPath(sql: Sql, wallet: string, depth = 5): Promise<FundingHop[]> {
   const out: FundingHop[] = [];
   const seen = new Set<string>();
   let cur = wallet.toLowerCase() as Address;
@@ -99,35 +101,36 @@ interface SiblingDbRow extends TransferDbRow {
 /**
  * Wallets funded by `funder` since `since` (Date or unix seconds): directly, through
  * a contract the funder created (contract / disperse mode) or by an internal transfer
- * inside a tx the funder sent. One row per wallet (its earliest such funding).
+ * inside a tx the funder sent. One row per wallet (its earliest such funding);
+ * contracts (created ones, or wallets rows with is_contract) are not siblings.
  */
-export async function siblingsOf(sql: Queryable, funder: string, since: Date | number = 0): Promise<Sibling[]> {
-  const f = funder.toLowerCase();
-  const sinceSec = toSec(since);
-  const rows = await sql<SiblingDbRow[]>`
-    with created as (
-      select to_addr from eth_transfers where from_addr = ${f} and kind = 'create'
-    ), funder_txs as (
-      select tx_hash from eth_transfers where from_addr = ${f} and trace_addr = ''
-    ), cand as (
-      select t.*, case
-          when t.from_addr = ${f} then 'direct'
-          when t.from_addr in (select to_addr from created) then 'contract'
-          else 'sameTx' end as via
-      from eth_transfers t
-      where t.ts >= to_timestamp(${sinceSec}) and t.value > 0 and t.kind <> 'create' and t.to_addr <> ${f}
-        and (t.from_addr = ${f}
-             or t.from_addr in (select to_addr from created)
-             or (t.kind = 'internal' and t.tx_hash in (select tx_hash from funder_txs)))
-    ), firsts as (
-      select distinct on (to_addr) * from cand order by to_addr, block, id
-    )
-    select c.from_addr, c.to_addr, c.value::text as value, c.kind, c.tx_hash, c.trace_addr, c.block::float8 as block,
-      extract(epoch from c.ts)::float8 as ts, c.via, w.first_funding_tx, w.tx_count_at_first_funding
-    from firsts c
-    left join wallets w on w.address = c.to_addr
-    where c.to_addr not in (select to_addr from created)
-    order by c.block, c.id`;
+export async function siblingsOf(sql: Sql, funder: string, since: Date | number = 0): Promise<Sibling[]> {
+  const rows = await sql.query<SiblingDbRow>(
+    `with created as (
+       select to_addr from eth_transfers where from_addr = $1 and kind = 'create'
+     ), funder_txs as (
+       select tx_hash from eth_transfers where from_addr = $1 and trace_addr = ''
+     ), cand as (
+       select t.*, case
+           when t.from_addr = $1 then 'direct'
+           when t.from_addr in (select to_addr from created) then 'contract'
+           else 'sameTx' end as via
+       from eth_transfers t
+       where t.ts >= to_timestamp($2) and t.value > 0 and t.kind <> 'create' and t.to_addr <> $1
+         and (t.from_addr = $1
+              or t.from_addr in (select to_addr from created)
+              or (t.kind = 'internal' and t.tx_hash in (select tx_hash from funder_txs)))
+     ), firsts as (
+       select distinct on (to_addr) * from cand order by to_addr, block, id
+     )
+     select c.from_addr, c.to_addr, c.value::text as value, c.kind, c.tx_hash, c.trace_addr, c.block::float8 as block,
+       extract(epoch from c.ts)::float8 as ts, c.via, w.first_funding_tx, w.tx_count_at_first_funding
+     from firsts c
+     left join wallets w on w.address = c.to_addr
+     where c.to_addr not in (select to_addr from created) and coalesce(w.is_contract, false) = false
+     order by c.block, c.id`,
+    [funder.toLowerCase(), toSec(since)],
+  );
   return rows.map((r) => ({
     wallet: r.to_addr as Address,
     via: r.via as Sibling['via'],
@@ -142,14 +145,16 @@ export async function siblingsOf(sql: Queryable, funder: string, since: Date | n
 }
 
 /** All incoming funding transfers of a wallet (newest last), for the agent's get_wallet_funding. */
-export async function incomingTransfers(sql: Queryable, wallet: string, limit = 100): Promise<FundingHop[]> {
-  const rows = await sql<TransferDbRow[]>`
-    select from_addr, to_addr, value::text as value, kind, tx_hash, trace_addr, block::float8 as block,
-      extract(epoch from ts)::float8 as ts
-    from eth_transfers
-    where to_addr = ${wallet.toLowerCase()} and (value > 0 or kind = 'create')
-    order by block, id
-    limit ${limit}`;
+export async function incomingTransfers(sql: Sql, wallet: string, limit = 100): Promise<FundingHop[]> {
+  const rows = await sql.query<TransferDbRow>(
+    `select from_addr, to_addr, value::text as value, kind, tx_hash, trace_addr, block::float8 as block,
+       extract(epoch from ts)::float8 as ts
+     from eth_transfers
+     where to_addr = $1 and (value > 0 or kind = 'create')
+     order by block, id
+     limit $2`,
+    [wallet.toLowerCase(), limit],
+  );
   return rows.map((r) => ({
     depth: 1,
     wallet: r.to_addr as Address,

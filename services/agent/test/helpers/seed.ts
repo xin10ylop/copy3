@@ -61,14 +61,14 @@ function launch(o: {
   sec: number;
   exemptions: string[];
   creatorTaxBps?: number;
-  kind?: 'devBuy' | 'noDevBuy';
+  kind?: 'launchToken' | 'launchAndBuy' | 'launchTokenFor';
   devBuyEth?: number;
 }): string {
   return `insert into launches (token, curve, deployer, launcher, launch_kind, creator_fee_recipient, creator_tax_bps, name, symbol, pair_token,
             exemptions, dev_buy_quote, block, ts, tx_hash, tx_from, start_price, start_mcap_eth)
-          values ('${o.token}', '${o.curve}', '${o.deployer}', '0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e', '${o.kind ?? 'noDevBuy'}', '${o.deployer}',
+          values ('${o.token}', '${o.curve}', '${o.deployer}', '0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e', '${o.kind ?? 'launchToken'}', '${o.deployer}',
             ${o.creatorTaxBps ?? 200}, '${o.name}', '${o.symbol}', '0x0000000000000000000000000000000000000000',
-            ${arr(o.exemptions)}, ${o.devBuyEth ? wei(o.devBuyEth) : 'null'}, 100, ${ts(o.sec)}, '${tx()}', '${o.deployer}', 1.68e-9, 1.68);`;
+            ${arr(o.exemptions)}, ${o.devBuyEth ? wei(o.devBuyEth) : '0'}, 100, ${ts(o.sec)}, '${tx()}', '${o.deployer}', 1.68e-9, 1.68);`;
 }
 
 let logIdx = 0;
@@ -87,7 +87,7 @@ function trade(
   return `insert into curve_trades (token, curve, block, ts, tx_hash, log_index, side, trader, recipient, tx_from, quote, tokens, fee, tax, snipe_tax,
             price_after, seconds_since_launch, exempt)
           values ('${token}', '${curve}', ${1000 + dt * 10 + (logIdx % 10)}, ${ts(launchSec + dt)}, '${tx()}', ${logIdx++}, '${side}', '${who}', '${who}', '${who}',
-            ${wei(quoteEth)}, ${wei(tokens)}, ${wei(quoteEth * 0.01)}, ${wei(quoteEth * 0.02)}, ${wei(o.snipeTaxEth ?? 0)},
+            ${wei(quoteEth)}, ${wei(tokens)}, ${wei(quoteEth * 0.01 + (o.snipeTaxEth ?? 0))}, ${wei(quoteEth * 0.02)}, ${wei(o.snipeTaxEth ?? 0)},
             ${priceAfter}, ${dt}, ${o.exempt ?? false});`;
 }
 

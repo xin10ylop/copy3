@@ -59,7 +59,7 @@ async function main(): Promise<void> {
   await pipeline.run(ac.signal);
   ws?.stop();
   server.close();
-  await sql.end({ timeout: 5 });
+  await sql.end();
 }
 
 main().catch((err: unknown) => {

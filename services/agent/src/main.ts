@@ -30,9 +30,13 @@ async function main(argv: string[]): Promise<number> {
     },
   });
   const [cmd, arg] = positionals;
-  if (values.help || !cmd) {
+  if (values.help) {
     console.log(USAGE);
-    return cmd ? 0 : 1;
+    return 0;
+  }
+  if (!cmd) {
+    console.error(USAGE);
+    return 1;
   }
   const env = loadEnv();
   const deps = createAgentDeps(env);
@@ -76,7 +80,7 @@ async function main(argv: string[]): Promise<number> {
         return 1;
     }
   } finally {
-    if (cmd !== 'serve') await deps.sql.end({ timeout: 5 });
+    if (cmd !== 'serve') await deps.sql.end();
     logger.flush();
   }
 }
@@ -130,7 +134,7 @@ async function serve(env: ReturnType<typeof loadEnv>, deps: ReturnType<typeof cr
     process.once('SIGTERM', shutdown);
   });
   while (running) await new Promise((r) => setTimeout(r, 250));
-  await deps.sql.end({ timeout: 5 });
+  await deps.sql.end();
   return 0;
 }
 

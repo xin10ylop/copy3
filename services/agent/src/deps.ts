@@ -1,24 +1,20 @@
 /**
- * Single switch point for workspace dependencies.
- *
- * packages/core and packages/db are built concurrently by other tasks; until their
- * exports exist the agent uses the SPEC-named stubs under ./stubs/. To switch, change
- * the two `from` clauses below to '@hood/core' / '@hood/db' (adjusting names if the
- * real modules differ) and delete src/stubs/.
+ * Single import point for workspace dependencies (packages/core, packages/db), so a
+ * rename there touches one file here.
  */
 export {
-  TOKEN_SUPPLY,
   PresetSchema,
   PlayTriggerSchema,
-  TakeProfitSchema,
   quoteBuy,
   quoteSell,
   snipeTaxBps,
-  priceFromReserves,
-  mcapFromReserves,
-  type CurveReserves,
+  snipeTaxWeiFor,
+  type Reserves as CurveReserves,
   type Preset,
   type PlayTrigger,
   type TakeProfit,
-} from './stubs/core.js';
-export { createDb } from './stubs/db.js';
+} from '@hood/core';
+export { createDb, fromPglite, applyMigrations, type Sql as HoodSql } from '@hood/db';
+
+/** Launch supply in whole tokens (core: LAUNCH_SUPPLY_WHOLE) for mcap = price * supply. */
+export const TOKEN_SUPPLY = 1_000_000_000;

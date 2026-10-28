@@ -25,10 +25,10 @@
     "zod": "^4.1.12",
     "pino": "^9.14.0",
     "ws": "^8.18.3",
-    "@hood/contracts": "workspace:*",
-    "postgres": "^3.4.7"
+    "@hood/contracts": "workspace:*"
   },
   "devDependencies": {
-    "@types/ws": "^8.18.1"
+    "@types/ws": "^8.18.1",
+    "@electric-sql/pglite": "^0.3.14"
   }
 }

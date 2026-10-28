@@ -11,15 +11,16 @@
  *    -> 618 bps for the default 10 % tax protection). The pre-trade state is the
  *    market price after the last trade before that second (the launch-second
  *    tax-free buys), i.e. we stand in front of the first taxed buyer.
- *  - Fee accounting measured on the Amlil fixture (docs/EXAMPLES.md), which replays
- *    exactly through constant product with Q0 = 1.68 ETH, T0 = 1e9 tokens:
- *      buy : CurveBuy.quoteIn = q reaches the curve; the snipe tax (SnipeTaxCharged)
- *            = q * snipeBps is paid ON TOP of q; tokens = CP(q * (1 - fee - creatorTax)).
- *            So a total spend B gives q = B / (1 + snipeBps).
- *      sell: fee (100 bps) + creator tax are taken from the gross CP proceeds.
- *    The fill uses core's `quoteBuy(reserves, q, 100, creatorTaxBps)` and
- *    `quoteSell(reserves, tokens, 100 + creatorTaxBps)`, so our own price impact is
- *    included on both sides.
+ *  - Fee accounting (core's curve math; the Amlil fixture, docs/EXAMPLES.md, replays
+ *    exactly through constant product with Q0 = 1.68 ETH, T0 = 1e9 tokens):
+ *      buy : quoteIn = what the buyer sends; fee (100 bps), the creator tax and the
+ *            snipe tax (SnipeTaxCharged = quoteIn * snipeBps) are all taken from it,
+ *            tokens = CP(quoteIn - fee - creatorTax - snipeTax). CurveBuy.fee includes
+ *            the snipe tax; CurveBuy.tax is the creator tax.
+ *      sell: fee + creator tax are taken from the gross constant-product proceeds.
+ *    The fill uses core's `quoteBuy(r, B, 100, creatorTaxBps, snipeTaxWeiFor(B, snipeBps))`
+ *    and `quoteSell(r, tokens, 100, creatorTaxBps)`, so our own price impact is included
+ *    on both sides.
  *  - Exit: walk the historical event sequence (curve trades + token transfers out of
  *    exempt wallets). Position value is tokens x market price; mark % = value / cost - 1.
  *    Rules are evaluated after each event in this order: exempt disposal (curve sell or
@@ -29,7 +30,7 @@
  *    historical curve state - we ignore the small upward shift our own buy would have
  *    caused, which is conservative.
  */
-import { quoteBuy, quoteSell, snipeTaxBps, TOKEN_SUPPLY, type Preset, type TakeProfit } from './deps.js';
+import { quoteBuy, quoteSell, snipeTaxBps, snipeTaxWeiFor, TOKEN_SUPPLY, type Preset, type TakeProfit } from './deps.js';
 
 export const CURVE_FEE_BPS = 100;
 /** Assumed virtual token reserve at launch (tokens). Override per launch when known. */
@@ -161,15 +162,15 @@ function fromBig(v: bigint): number {
   return Number(v) / WEI;
 }
 
-/** Tokens for a total spend `spendEth`: snipe tax on top of quoteIn, fee + creator tax inside. */
+/** Tokens for a total spend `spendEth` (fee, creator tax and snipe tax all taken from it). */
 export function buyTokens(r: { q: number; t: number }, spendEth: number, snipeTaxBps: number, creatorTaxBps: number): number {
-  const quoteIn = spendEth / (1 + snipeTaxBps / 10_000);
-  return fromBig(quoteBuy({ quote: toBig(r.q), token: toBig(r.t) }, toBig(quoteIn), CURVE_FEE_BPS, creatorTaxBps));
+  const quoteIn = toBig(spendEth);
+  return fromBig(quoteBuy({ quote: toBig(r.q), token: toBig(r.t) }, quoteIn, CURVE_FEE_BPS, creatorTaxBps, snipeTaxWeiFor(quoteIn, snipeTaxBps)));
 }
 
 /** Net ETH for selling `tokens`: fee + creator tax taken from the gross proceeds. */
 export function sellQuote(r: { q: number; t: number }, tokens: number, creatorTaxBps: number): number {
-  return fromBig(quoteSell({ quote: toBig(r.q), token: toBig(r.t) }, toBig(tokens), CURVE_FEE_BPS + creatorTaxBps));
+  return fromBig(quoteSell({ quote: toBig(r.q), token: toBig(r.t) }, toBig(tokens), CURVE_FEE_BPS, creatorTaxBps));
 }
 
 type PathEvent = { kind: 'trade'; ev: BacktestTrade } | { kind: 'transfer'; ev: BacktestTransfer };
@@ -602,7 +603,7 @@ export interface DerivedPreset {
   stats: PeakStats;
 }
 
-/** Converts a peak measured from the first taxed buyer's fill into our position mark (we pay tax + fee + impact on top). */
+/** Converts a peak measured from the first taxed buyer's fill into our position mark (our fill also pays snipe tax, fee, creator tax and impact). */
 export function peakToMark(peakPct: number, entryCostPct: number): number {
   return ((1 + peakPct / 100) / (1 + entryCostPct / 100) - 1) * 100;
 }

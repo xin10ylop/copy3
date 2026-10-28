@@ -238,3 +238,98 @@ support, 100 TB egress included.
 4. CREATE address prediction (token = CREATE(deployer, n), curve = n+1).
 5. Chain data size for a pruned full node (snapshot explorer).
 6. Actual feed→local and local→sequencer latencies from the chosen hosts.
+
+## Corrections / verification results (2026-10-28, build task @hood/core + @hood/db)
+
+All items below were measured live against the public RPC (latest state only; the
+node is non-archive, so `eth_getTransactionCount`/state at old blocks fails) or
+derived offline from the committed fixtures. They are reproduced by the unit
+tests (`test/abis.test.ts`, `test/curve.test.ts`, `test/launch.test.ts`) and the
+LIVE=1 tests under `packages/core/test/live/`.
+
+### Selectors (RESEARCH §3) — all confirmed
+Every function and custom-error selector in §3 matches viem `toFunctionSelector`
+(asserted in `test/abis.test.ts`). Additional live findings from the factory
+bytecode/getters:
+- `getLaunchedToken(address)` returns a **15-field LaunchInfo struct**, not just
+  the token (fields: token, curve, deployer, creatorFeeRecipient, launchConfigId,
+  graduationThreshold, then flags — trailing field semantics inferred).
+- `launchConfigCount() = 1`; `getLaunchConfig(0)` = (launchSupply 1e27, feeBps 100,
+  virtualQuote 1.68e18, graduationThreshold 4.2e18, 0, 200, nativeQuote=true);
+  `getLaunchConfig(1)` reverts `InvalidLaunchConfigId()` (0x68b42c59).
+- Factory also exposes: `maxCreatorTaxBps() = 1000`, `launchEnabled() = true`,
+  `positionManager() = 0x58daec3116aae6d93017baaea7749052e8a04fa7`,
+  `permit2() = 0x000000000000000000000022d473030f116ddee9f6b43ac78ba3` (canonical),
+  Ownable2Step (`owner`/`pendingOwner`/`acceptOwnership`) and the setters
+  `setSnipeTaxStartBps/Seconds`, `setLaunchFee`, `addLaunchConfig`, etc.
+- The `launchAndBuy` router (0xe33e9e47…) deployed bytecode exposes only
+  Ownable2Step + `factory()` + `rescue()`; it is the factory's `launchForwarder`
+  and forwards `launchAndBuy` (selector 0xf85f8e41, confirmed) through its fallback.
+
+### §8a — buy/sell parameter order: CONFIRMED
+`buy(uint256 quoteIn, uint256 minTokensOut, address recipient) payable` with
+`msg.value == quoteIn`; `sell(uint256 tokensIn, uint256 minQuoteOut, address recipient)`
+(value 0). Confirmed three ways: (1) real on-chain direct curve txs — a 0.002 ETH
+`buy` tx had args `[2e15, 2.5e23, recipient]` and value 2e15; `sell` txs had args
+`[tokensIn, minQuoteOut, recipient]` value 0; (2) eth_call with the args reversed
+reverts `NativeValueMismatch(10000000000000000, 0)` (selector 0xbc760cfe); (3) a
+buy with `minTokensOut = 1e30` reverts `SlippageExceeded(amountOut, 1e30)`
+(0x71c4efed).
+
+### §8b — contract callers are allowed: CONFIRMED
+`eth_call` of `buy{value:0.01 ETH}` from `PONS_V2.locker` (a contract) with a 1 ETH
+balance state-override returns tokensOut (≈4.3e24) and does not revert. There is
+**no `msg.sender == tx.origin` restriction** → the `PonsSniper` helper-contract
+burst design (ARCHITECTURE §3) is viable.
+
+### §8c — economics
+On a fresh launch curve: `feeBps = 100`, `creatorTaxBps` = per-launch (config
+default 100; AMLIL used 200), `maxInternalPriceImpactBps = 300`,
+`graduationThreshold = 4.2 ETH`, start state phantomQuote 1.68e18 / tokenReserve
+1e27 / realQuoteReserve ≈ 0.
+- **Start price 1.68e-9 ETH/token, start mcap 1.68 ETH.**
+- A **0.07 ETH buy** (1 % fee, exempt → 0 snipe tax) yields ≈ **39.6 M tokens**,
+  **≈ 840 bps (8.4 %) price impact**, mcap after ≈ 1.82 ETH. (On a curve that had
+  already taken ~0.26 ETH of real buys: mcap 2.25 ETH, 0.07 ETH impact 711 bps.)
+- `maxInternalPriceImpactBps` is **NOT enforced on external buys**: a 1 ETH buy
+  (>50 % impact) simulated successfully. Large buys on the snipe path do not need
+  splitting; the cap applies to internal/graduation swaps only.
+
+### §8d — multicall3: present
+Canonical multicall3 `0xcA11bde05977b3631167028862bE2a173976CA11` is deployed
+(code length 3808 bytes). `multicall3Abi` (aggregate3) is exported from
+`@hood/core`.
+
+### §4 — CREATE address prediction: DOES NOT WORK (deployer uses CREATE2)
+`predictLaunchAddresses(deployer, nonce)` (plain CREATE) does **not** reproduce
+launched addresses. A brute-force search over nonces 1..1,500,000 for both the
+launch deployer (`0x3711…`, live nonce 1,431,967) and the factory matched none of
+63 recent `TokenLaunched` token/curve addresses nor the SHIB fixture's. The
+deployer bytecode contains a CREATE2 (`0xf5`) opcode and `deployLaunch(params)` /
+`predictLaunchAddresses(params)` selectors, and the launch params carry
+`salt1`/`salt2` (bytes32). **Token and curve are deployed via CREATE2 (salted).**
+`predictLaunchAddresses` is kept for completeness, but production must take
+token/curve from the `TokenLaunched` receipt (arrives ~100–200 ms after the launch
+block, well inside the 1 s snipe window). Future work: implement
+CREATE2(deployer, salt, keccak(initCode)) once the init-code hash is pinned, to
+predict from the feed tx (which carries the salts).
+
+### Curve fee/tax order: CONFIRMED by full replay
+Replaying the entire AMLIL sequence (204 real trades) and the curve-logs 3-buy
+sequence through `quoteBuy`/`quoteSell` reproduces **every** tokensOut/quoteOut
+exactly (`test/curve.test.ts`). Order:
+- BUY: `net = quoteIn − fee − creatorTax − snipeTax` (all taken from the gross
+  quote-in; fee = quoteIn·feeBps/1e4, creatorTax = quoteIn·creatorBps/1e4,
+  snipeTax = the `SnipeTaxCharged` amount), then
+  `tokensOut = floor(tokenReserve · net / (quoteReserve + net))`.
+- SELL: `gross = floor(quoteReserve · tokensIn / (tokenReserve + tokensIn))`, then
+  `quoteOut = gross − fee − creatorTax` (sells pay no snipe tax).
+- `CurveBuy.tax` / `CurveSell.tax` is the **creator tax**; the snipe tax is the
+  separate `SnipeTaxCharged(recipient, amount)` log in the same tx. AMLIL's first
+  taxed buyer at +1 s paid 0.002163 ETH on 0.035 ETH = **6.18 %**, confirming
+  `snipeTaxBps(1) = 618`.
+
+### Public-RPC capabilities
+`debug_traceTransaction` and `trace_transaction` are **not available** on the
+public RPC (`-32601`). Internal-transfer tracing (indexer `callTracer`) requires
+our own nitro node, as ARCHITECTURE already assumes.

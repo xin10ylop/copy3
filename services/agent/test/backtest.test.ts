@@ -61,7 +61,7 @@ const slowCook = (): BacktestTrade[] => {
 };
 
 describe('simulateSnipe', () => {
-  it('enters at +1 s paying 6.18 % on top, and takes profit on the video pump', () => {
+  it('enters at +1 s paying the 6.18 % snipe tax, and takes profit on the video pump', () => {
     const r = simulateSnipe(launch('0xa'), videoPath(), base);
     expect(r.entered).toBe(true);
     expect(r.taxBps).toBe(618);
@@ -157,7 +157,7 @@ const fixture = JSON.parse(
   readFileSync(new URL('../../../packages/core/test/fixtures/amlil-trades.json', import.meta.url), 'utf8'),
 ) as AmlilFixture;
 
-/** Replays the fixture through constant product (Q0 1.68 ETH, T0 1e9) to get price_after. */
+/** Replays the fixture through constant product (Q0 1.68 ETH, T0 1e9) to get price_after. CurveBuy.fee includes the snipe tax. */
 function amlilItem(): BacktestItem & { raw: AmlilTrade[] } {
   const exempt = new Set(fixture.meta.exempt.map((a) => a.toLowerCase()));
   let Q = 1.68;

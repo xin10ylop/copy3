@@ -64,7 +64,7 @@ async function main(): Promise<void> {
       log.info({ from, to, ...stats }, 'log backfill done');
     }
   } finally {
-    await sql?.end({ timeout: 5 });
+    await sql?.end();
   }
 }
 

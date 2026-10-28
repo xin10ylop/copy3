@@ -17,7 +17,8 @@ import { createPublicClient, http } from 'viem';
 import { backtestPlay, gridSearch, peakStats } from './backtest.js';
 import { loadEnv, type AgentEnv } from './config.js';
 import { DEFAULT_LIMITS, DEFAULT_PRESET } from './defaults.js';
-import { createDb, PlayTriggerSchema, PresetSchema } from './deps.js';
+import { tagged } from './db.js';
+import { createDb, PlayTriggerSchema, PresetSchema, type HoodSql } from './deps.js';
 import { playFinderMessage, scoutMessage, SYSTEM_PROMPT } from './prompts.js';
 import {
   activePlays,
@@ -65,10 +66,14 @@ export interface AgentDeps {
   scout: { maxClusters: number; minClusterSize: number; ignore: string[] };
 }
 
-export function createAgentDeps(env: AgentEnv = loadEnv()): AgentDeps {
-  const logger = pino({ name: 'agent', level: env.LOG_LEVEL });
+/**
+ * Builds deps from env. A host service can pass its own `@hood/db` Sql (and logger)
+ * so the agent shares its connection pool.
+ */
+export function createAgentDeps(env: AgentEnv = loadEnv(), opts: { sql?: HoodSql; logger?: Logger } = {}): AgentDeps {
+  const logger = opts.logger ?? pino({ name: 'agent', level: env.LOG_LEVEL });
   return {
-    sql: createDb(env.DATABASE_URL),
+    sql: tagged(opts.sql ?? createDb(env.DATABASE_URL, { max: 4 })),
     client: new Anthropic(),
     rpc: env.NODE_HTTP ? createPublicClient({ transport: http(env.NODE_HTTP) }) : null,
     reportsDir: env.REPORTS_DIR,
@@ -152,14 +157,18 @@ function addUsage(t: UsageTotals, u: UsageLike, model: string | undefined): void
   t.costUsd += (input * p.input + output * p.output + read * p.cacheRead + w5m * p.cacheWrite5m + w1h * p.cacheWrite1h) / 1e6;
 }
 
-/** Adds one response's usage. With fallbacks, `usage.iterations` is the per-attempt source of truth. */
-export function accountMessage(t: UsageTotals, message: Pick<BetaMessage, 'usage' | 'model'>): void {
+/**
+ * Adds one response's usage. With fallbacks, `usage.iterations` is the per-attempt source
+ * of truth: attempts on the requested model are priced at its rates, `fallback_message`
+ * attempts at the serving model's (the entry's `model`, else the response's `model`).
+ */
+export function accountMessage(t: UsageTotals, message: Pick<BetaMessage, 'usage' | 'model'>, requestedModel: string = MODEL): void {
   const usage: BetaUsage = message.usage;
   const iterations = (usage.iterations ?? []) as UsageLike[];
   if (iterations.length > 0) {
     for (const it of iterations) {
       if (it.type === 'fallback_message') t.fallbacks++;
-      addUsage(t, it, message.model);
+      addUsage(t, it, it.type === 'fallback_message' ? message.model : requestedModel);
     }
   } else {
     addUsage(t, usage, message.model);
@@ -296,7 +305,7 @@ async function runModel(deps: AgentDeps, kind: AgentRunKind, runId: number, user
       // Tool input JSON that could not be parsed at all (eager input streaming): re-issue the turn.
       jsonRetries++;
       logger.warn({ runId, err: String(err), attempt: jsonRetries }, 'unparseable tool input; re-issuing the turn');
-      runner = client.beta.messages.toolRunner({ ...runner.params, stream: true });
+      runner = client.beta.messages.toolRunner({ ...runner.params, stream: true, max_iterations: Math.max(1, limits.maxRounds - rounds) });
     }
   }
 }
