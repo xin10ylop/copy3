@@ -64,7 +64,9 @@ exempt wallets sell in the launch block, or at `T+1` in the same block as our bu
 
 - **Mitigations.** `abortIfExemptSellInLaunchBlock` (default on) cancels the burst if an exempt
   wallet sells in the launch block. `exitIfExemptSellsPct` exits when the team dumps (CurveSell or
-  a transfer to a dump wallet). Stop loss (40 % default), trailing stop and timeout cap the damage.
+  a transfer to a dump wallet); its default of 0 exits on the first exempt outflow. Stop loss (40 %),
+  the trailing stop (+50 %/-20 %) and the 60 s timeout cap the damage. These are the defaults the
+  3-day walk-forward picked (`docs/BACKTEST.md`), and `null` turns an exit off per play.
   `maxEntryMcapEth` and `minQuoteReserveEth` skip launches that are already pumped. Plays are only
   approved when their history shows peaks after the first taxed entry.
 - **Residual.** A same-block dump cannot be seen in time. Size `buyEth` so that a 40-100 % loss on

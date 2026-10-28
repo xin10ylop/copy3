@@ -129,8 +129,16 @@ state and today's PnL. If the bot does not answer, check the logs:
    - The peaks at 2-5 s after entry pay for 6.18 % tax + 1 % fee + slippage.
    - No coin dumped into the first taxed block (`exempt_sold_within_sec` ≤ 1).
 3. Approve with the button or `/play_on <id>`. `/backtest <id>` re-checks a play on the indexed
-   history. `/preset <id> key=value …` tunes it, for example
-   `/preset 3 buyEth=0.02 trailing.activatePct=80 tp=100:50,200:100 timeoutSec=60`.
+   history. `/preset <id>` shows the play's preset; `/preset <id> key=value …` tunes it.
+   - **Defaults.** These come from the 3-day walk-forward in `docs/BACKTEST.md` (Backtest #2):
+     buy 0.07 ETH, `maxTaxBps` 1000 (the schema caps it at 5000), no fixed take-profit, trailing
+     +50 %/-20 %, stop loss 40 %, timeout 60 s, and `exitIfExemptSellsPct=0` (exit on the first
+     exempt-wallet transfer-out or sell).
+   - **Examples.** `/preset 3 buyEth=0.02 trailing.activatePct=80 timeoutSec=90` and
+     `/preset 3 tp=100:50,200:100`.
+   - **Turning exits off.** `trailing=off`, `timeoutSec=none` and `exitIfExemptSellsPct=none`
+     store `null`, which means that exit is off. Setting `trailing.activatePct` or
+     `trailing.dropPct` turns trailing back on from the 50/20 default.
 4. A known funder works without the agent:
    `/watch <funder> <minEth> <maxEth> [fresh|any] [name] [preset=<playId>]`. This is the Packet
    Tracker equivalent. It creates a **disabled** play with approval buttons.

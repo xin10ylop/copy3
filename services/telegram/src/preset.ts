@@ -134,7 +134,6 @@ function sanity(p: Preset, limits: PresetLimits): { errors: string[]; warnings: 
   const errors: string[] = [];
   const warnings: string[] = [];
   if (p.buyEth > limits.maxBuyEth) errors.push(`buyEth ${p.buyEth} is above the chat limit of ${limits.maxBuyEth} ETH (TELEGRAM_MAX_BUY_ETH)`);
-  if (p.maxTaxBps >= 9900) errors.push('maxTaxBps >= 9900 would accept the 99 % launch-second tax');
   if (p.slippageBps > 9900) errors.push('slippageBps must be <= 9900');
   if (p.burst.count > 50) errors.push('burst.count must be <= 50');
   if (p.burst.spacingMs > 500) errors.push('burst.spacingMs must be <= 500');
@@ -148,6 +147,8 @@ function sanity(p: Preset, limits: PresetLimits): { errors: string[]; warnings: 
   const sorted = [...p.takeProfits].sort((a, b) => a.pct - b.pct);
   if (sorted.some((tp, i) => tp !== p.takeProfits[i])) warnings.push('takeProfits are not in ascending pct order');
   if (p.takeProfits.length > 0 && !p.takeProfits.some((tp) => tp.sellPct === 100)) warnings.push('no take-profit sells 100 %: the rest exits via trailing/stop loss/timeout');
+  if (p.takeProfits.length === 0 && p.trailing === null) warnings.push('no take-profit and trailing off: only stop loss, timeout and the team-outflow exit can close a position');
+  if (p.timeoutSec === null) warnings.push('timeoutSec off: a position that never hits an exit is held indefinitely');
   return { errors, warnings };
 }
 

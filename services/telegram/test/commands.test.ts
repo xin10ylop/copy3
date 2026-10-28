@@ -15,27 +15,32 @@ describe('/preset', () => {
   it('shows the current preset as key=value lines', async () => {
     const h = setup();
     await h.send(commandUpdate('/preset 2'));
-    expect(h.texts()[0]).toContain('trailing.activatePct=100');
+    expect(h.texts()[0]).toContain('trailing.activatePct=50');
+    expect(h.texts()[0]).toContain('timeoutSec=60');
     expect(h.texts()[0]).toContain('buyEth=0.07');
   });
 
   it('updates nested keys, persists, NOTIFYs and reports the diff', async () => {
     const h = setup();
     await h.send(commandUpdate('/preset 2 trailing.activatePct=80 buy=0.05 tp=100:50,200:100'));
-    expect(h.store.plays.get(2)!.preset).toMatchObject({ buyEth: 0.05, trailing: { activatePct: 80, dropPct: 25 }, takeProfits: [{ pct: 100, sellPct: 50 }, { pct: 200, sellPct: 100 }] });
+    expect(h.store.plays.get(2)!.preset).toMatchObject({ buyEth: 0.05, trailing: { activatePct: 80, dropPct: 20 }, takeProfits: [{ pct: 100, sellPct: 50 }, { pct: 200, sellPct: 100 }] });
     expect(h.store.notifies).toContainEqual({ channel: 'plays_changed', payload: { op: 'preset', playId: 2 } });
     const text = h.texts()[0]!;
-    expect(text).toContain('trailing.activatePct: 100 → <b>80</b>');
+    expect(text).toContain('trailing.activatePct: 50 → <b>80</b>');
     expect(text).toContain('buyEth: 0.07 → <b>0.05</b>');
     expect(text).toContain('sniper reloads it');
     expect(h.store.events.find((e) => e.type === 'preset_changed')!.payload).toMatchObject({ playId: 2, by: '@owner' });
   });
 
-  it('accepts trailing=off and shows it in the diff', async () => {
+  it('turns exits off with trailing=off / timeoutSec=none / exitIfExemptSellsPct=none and shows it in the diff', async () => {
     const h = setup();
-    await h.send(commandUpdate('/preset 2 trailing=off'));
-    expect(h.store.plays.get(2)!.preset).toMatchObject({ trailing: null });
-    expect(h.texts()[0]).toContain('trailing: {"activatePct":100,"dropPct":25} → <b>off</b>');
+    await h.send(commandUpdate('/preset 2 trailing=off timeoutSec=none exitIfExemptSellsPct=none'));
+    expect(h.store.plays.get(2)!.preset).toMatchObject({ trailing: null, timeoutSec: null, exitIfExemptSellsPct: null });
+    const t = h.texts()[0]!;
+    expect(t).toContain('trailing: {"activatePct":50,"dropPct":20} → <b>off</b>');
+    expect(t).toContain('timeoutSec: 60 → <b>off</b>');
+    expect(t).toContain('exitIfExemptSellsPct: 0 → <b>off</b>');
+    expect(t).toContain('warning: no take-profit and trailing off');
   });
 
   it('rejects unknown keys and invalid values without writing', async () => {

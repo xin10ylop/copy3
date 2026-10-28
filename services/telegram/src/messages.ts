@@ -80,10 +80,12 @@ export function helpText(): string {
     code('/play 0x7c3a…'),
     code('/watch 0xfunder… 0.057 0.174 fresh "Amlil operator"'),
     code('/preset 3 buyEth=0.05 maxTaxBps=700 trailing.activatePct=80 tp=100:50,200:100'),
-    code('/preset 3 timeoutSec=none trailing=off'),
+    code('/preset 3 trailing=off timeoutSec=none exitIfExemptSellsPct=none'),
     '',
     'Preset keys: buyEth maxTaxBps slippageBps burst.startMs burst.spacingMs burst.count gasLimit maxFeeGwei priorityFeeGwei stopAfter firstBuyOnly tokenCap takeProfits trailing.activatePct trailing.dropPct stopLossPct timeoutSec minQuoteReserveEth maxEntryMcapEth abortIfExemptSellInLaunchBlock exitIfExemptSellsPct',
-    'Aliases: buy tax slippage sl tp timeout trail. <code>none</code> removes a key (defaults apply); <code>trailing=off</code> disables the trailing stop, setting trailing.activatePct/dropPct turns it back on.',
+    'Aliases: buy tax slippage sl tp timeout trail.',
+    '<code>off</code>/<code>none</code> turns off <code>trailing</code>, <code>timeoutSec</code> and <code>exitIfExemptSellsPct</code> (stored as null). Setting trailing.activatePct/dropPct turns trailing back on from the default 50/20. On other keys <code>none</code> removes the key, so the default applies.',
+    'Defaults: buy 0.07 ETH, tax ≤ 10 % (maxTaxBps ≤ 5000), no fixed TP, trailing +50 %/-20 %, SL 40 %, timeout 60 s, exit on the first team outflow (exitIfExemptSellsPct=0).',
   ].join('\n');
 }
 
@@ -119,11 +121,12 @@ export function presetSummary(raw: unknown): string {
   const parts = [
     `buy ${fmtEth(p.buyEth)}`,
     `tax≤${fmtBps(p.maxTaxBps)}`,
-    `TP ${p.takeProfits.map((tp) => `+${tp.pct}%→${tp.sellPct}%`).join(' ') || '-'}`,
+    `TP ${p.takeProfits.map((tp) => `+${tp.pct}%→${tp.sellPct}%`).join(' ') || 'none'}`,
     p.trailing ? `trail +${p.trailing.activatePct}%/-${p.trailing.dropPct}%` : 'trail off',
     `SL -${p.stopLossPct}%`,
   ];
-  if (p.timeoutSec != null) parts.push(`timeout ${fmtDuration(p.timeoutSec)}`);
+  parts.push(p.timeoutSec != null ? `timeout ${fmtDuration(p.timeoutSec)}` : 'timeout off');
+  if (p.exitIfExemptSellsPct != null) parts.push(p.exitIfExemptSellsPct === 0 ? 'exit on first team outflow' : `exit when team sold ≥${p.exitIfExemptSellsPct}%`);
   if (p.maxEntryMcapEth !== undefined) parts.push(`max entry ${p.maxEntryMcapEth} ETH mcap`);
   parts.push(`burst ${p.burst.count}×${p.burst.spacingMs}ms@${p.burst.startMs}ms`);
   if (p.stopAfter !== 1) parts.push(`stop after ${p.stopAfter}`);

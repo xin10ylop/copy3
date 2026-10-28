@@ -10,9 +10,16 @@ import { FakeStore, FUNDER, makePlay, makeSnipe, NOW, silentLog, TX, WALLET } fr
 const ctx: FormatCtx = { links: new Links(), ethUsd: 3000, tz: 'UTC', now: NOW };
 
 describe('preset summary', () => {
-  it('shows a disabled trailing stop as "trail off"', () => {
-    expect(presetSummary({ trailing: null })).toContain('trail off');
-    expect(presetSummary({})).toContain('trail +100%/-25%');
+  it('summarises the backtested defaults and shows disabled exits as off', () => {
+    expect(presetSummary({})).toBe(
+      'buy 0.0700 ETH · tax≤10.00% · TP none · trail +50%/-20% · SL -40% · timeout 1m 00s · exit on first team outflow · burst 10×15ms@-120ms',
+    );
+    const off = presetSummary({ trailing: null, timeoutSec: null, exitIfExemptSellsPct: null, takeProfits: [{ pct: 150, sellPct: 100 }] });
+    expect(off).toContain('TP +150%→100%');
+    expect(off).toContain('trail off');
+    expect(off).toContain('timeout off');
+    expect(off).not.toContain('team');
+    expect(presetSummary({ exitIfExemptSellsPct: 30 })).toContain('exit when team sold ≥30%');
   });
 });
 
