@@ -182,23 +182,8 @@ export const ponsEventsAbi = parseAbi([
   'event Transfer(address indexed from, address indexed to, uint256 value)',
 ]);
 
-/**
- * PonsSniper helper contract (our own; see contracts/ and ARCHITECTURE §3).
- * ABI defined here so @hood/core consumers can encode burst calls without the
- * contract being deployed yet. Signatures are our design, not on-chain-verified.
- */
-export const sniperAbi = parseAbi([
-  'function snipe(address curve, address token, uint256 quoteIn, uint256 minTokensOut, uint256 maxTaxBps, uint256 deadlineBlock) payable',
-  'function exit(address curve, address token, uint256 tokensIn, uint256 minQuoteOut)',
-  'function bought(address token) view returns (bool)',
-  'function sweep(address token, address to)',
-  'function owner() view returns (address)',
-  'event Sniped(address indexed token, address indexed curve, uint256 quoteIn, uint256 tokensOut)',
-  'event Exited(address indexed token, address indexed curve, uint256 tokensIn, uint256 quoteOut)',
-  'error AlreadyBought()',
-  'error TaxTooHigh(uint256 current, uint256 max)',
-  'error DeadlinePassed()',
-]);
+// The PonsSniper helper ABI lives in @hood/contracts (generated from the compiled artifact).
+
 
 /** Multicall3 (canonical address 0xcA11…CA11; presence verified live — see RESEARCH). */
 export const multicall3Abi = parseAbi([

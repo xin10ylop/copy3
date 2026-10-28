@@ -40,8 +40,9 @@ lists what is available. `--allow-fallback` picks the first in-stock plan from
 
 **Choose a 2x4 TB NVMe plan (EPYC 9375F, or the Threadripper PRO 7975WX that is in stock) when any of these holds:**
 
-1. The pruned DB is above ~1.3 TB. That is ~65 % of the 1.86 TiB RAID0. It is 1.05 TB today and grows
-   ≈160 GB/month, so this happens in about 2 months, and the box reaches 85 % in about 3-4 months.
+1. The pruned DB is above ~1.25 TB, which is ~65 % of the ≈1.9 TB RAID0 (2x1 TB minus the 100 GB OS
+   partition). It is 1.05 TB today and grows ≈160 GB/month, so this happens in about a month, and
+   the box reaches 85 % in about 3 months.
 2. You do not want to restore a fresh pruned snapshot every ~3 months. That restore takes a few hours
    of indexer downtime; the Ohio sniper keeps running on the public feed.
 3. You want the full/archive (path) DB (1.1-1.5 TB, larger every week), or room for months of

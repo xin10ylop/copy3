@@ -66,7 +66,8 @@ export const PresetSchema = z.object({
   firstBuyOnly: z.boolean().default(true),
   tokenCap: z.boolean().default(false),
   takeProfits: z.array(TakeProfitSchema).default([{ pct: 150, sellPct: 100 }]),
-  trailing: TrailingSchema.default({ activatePct: 100, dropPct: 25 }),
+  /** null disables the trailing stop; omitted = SPEC default. */
+  trailing: TrailingSchema.nullable().default({ activatePct: 100, dropPct: 25 }),
   stopLossPct: z.number().default(40),
   timeoutSec: z.number().positive().optional(),
   minQuoteReserveEth: z.number().optional(),

@@ -43,12 +43,15 @@ infra/node/run-node.sh status                 # local head vs public head
   `./l2chaindata`, …), so `run-node.sh snapshot` extracts into `$DATA_ROOT/nitro/robinhood/nitro/`.
 * Nitro's own `--init.url` / `--init.latest` downloads the whole archive before it extracts. That
   needs archive + DB ≈ **2.2 TB** at the same time, which does **not** fit the 2x1 TB RAID0 of the
-  Ryzen plans (≈1.86 TiB usable). `run-node.sh snapshot` streams resumable 2 GiB range chunks into
-  `tar` and checks each part against its published `.sha256`, so its peak is DB + 4 GiB.
+  Ryzen plans: cloud-init leaves a 100 GB OS partition, so the array has ≈1.9 TB. `run-node.sh
+  snapshot` streams resumable 2 GiB range chunks into `tar` and checks each part against its
+  published `.sha256`, so its peak is DB + 4 GiB.
 * The Robinhood docs ask for NVMe of 2x chain + 20 % (≈2.5 TB today). A 2x1 TB box starts at about
-  55 % full (DB plus ~50-100 GB of Postgres) and reaches 85 % in roughly 3-4 months. At that point,
-  restore a fresh pruned snapshot (a few hours of downtime for the indexer only; the sniper keeps
-  running on the public feed), or move to a plan with 2x4 TB NVMe (see `infra/cherry/README.md`).
+  60 % full (1.05 TB DB plus Postgres). At ~5.3 GB/day it reaches 65 % in about a month and 85 %
+  in about 3 months, sooner if `eth_transfers` grows fast (check `pg_database_size`). At that
+  point, restore a fresh pruned snapshot (a few hours of downtime for the indexer only; the Ohio
+  sniper keeps running on the public feed), or move to a plan with 2x4 TB NVMe (see
+  `infra/cherry/README.md`).
 
 ## Sync expectations
 

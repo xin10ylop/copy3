@@ -333,3 +333,26 @@ exactly (`test/curve.test.ts`). Order:
 `debug_traceTransaction` and `trace_transaction` are **not available** on the
 public RPC (`-32601`). Internal-transfer tracing (indexer `callTracer`) requires
 our own nitro node, as ARCHITECTURE already assumes.
+
+## 8. Additional verification results (integration pass, 2026-10-28)
+
+* **Feed requires compression**: `wss://feed.mainnet.chain.robinhood.com` rejects
+  clients that do not offer `permessage-deflate` (HTTP 400 "Compression is
+  required"). `FeedClient` enables it.
+* **Selling needs an approval**: `curve.sell` pulls tokens with `transferFrom`;
+  a holder with allowance 0 reverts `ERC20InsufficientAllowance(spender=curve)`.
+  The `PonsSniper` contract approves the curve right after each buy.
+* **Block numbers**: on Nitro `block.number` inside a contract is the L1 block;
+  the L2 block comes from the ArbSys precompile (`0x64`). `PonsSniper` uses it for
+  its deadline.
+* **CurveBuy.fee includes the snipe tax** (fee 0.002513 = 1 % of 0.035 + snipe
+  tax 0.002163 on the Amlil first taxed buy). Net quote into the pool =
+  `quoteIn − fee − creatorTax`. Do not subtract `SnipeTaxCharged` again.
+* **Measured hot-path numbers** (sandbox, not Ohio): feed decode 0.09-0.15 ms per
+  block, launch pre-filter 1.3 µs per tx, rules 78 µs per launch with 50 plays,
+  signing 0.73 ms per tx; gas: tax-too-high revert 37.6k, already-bought revert
+  27.5k, deadline revert 23.1k, successful snipe 172k, exit 90k (mock curve).
+* **Launch-second price moves**: team buys can lift the price ~50 % before the
+  first taxed block (Amlil +49 %); a 30 % slippage setting would revert there.
+  Use `maxEntryMcapEth` (enforced through `minTokensOut`) or 80-90 % slippage
+  like the video.
