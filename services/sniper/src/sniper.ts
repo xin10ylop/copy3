@@ -10,6 +10,7 @@ import {
   type ArmedCandidate,
   type FeedBlock,
   type RawLog,
+  type Reserves,
   type SequencerClock,
 } from '@hood/core';
 import { decodedTxFromRpc, launchEventFromCall, parseLaunchCall } from '@hood/core';
@@ -20,7 +21,7 @@ import type { ExecutionBackend } from './executor.js';
 import type { HealthState } from './health.js';
 import type { Logger } from './log.js';
 import { Positions, type PositionEntry } from './positions.js';
-import { planMinOut } from './pricing.js';
+import { DEFAULT_LAUNCH_RESERVES, launchReserves, planMinOut } from './pricing.js';
 import { Recorder } from './recorder.js';
 import { Risk } from './risk.js';
 import { Rules } from './rules.js';
@@ -50,6 +51,10 @@ export interface SniperOptions {
   fallbackDelayMs?: number;
   recordFeedBlocks?: boolean;
   nonce?: () => number | null;
+  /** start reserves per launchConfigId (default: config 0 = 1.68 ETH virtual quote / 1e27 tokens) */
+  launchReserves?: Readonly<Record<string, Reserves>>;
+  /** max wait for getReserves when start reserves are known. Default 5 ms. */
+  reservesWaitMs?: number;
 }
 
 const SEL_SELL = '0xd04c6983';
@@ -408,12 +413,28 @@ export class Sniper {
     if (!tc.ok && this.o.mode === 'live') return this.failRun(run, tc.reasons.join('; '), 'aborted');
     this.risk.onTokenKnown(token);
 
-    // 2) the single eth_call on the decide path: getReserves (node may lag the feed by a block)
-    let reserves = null;
-    for (let i = 0; i < 5 && !reserves; i++) {
-      reserves = await chain.getReserves(curve).catch(() => null);
-      if (!reserves) await new Promise((r) => setTimeout(r, 15));
-    }
+    // 2) the single eth_call on the decide path: getReserves (node may lag the feed by a block).
+    //    When the launch config's start reserves are known we do not wait more than
+    //    `reservesWaitMs` for it: config start + exact dev-buy math gives the same numbers.
+    const rpcReserves = (async (): Promise<Reserves | null> => {
+      for (let i = 0; i < 5; i++) {
+        const r = await chain.getReserves(curve).catch(() => null);
+        if (r) return r;
+        await new Promise((res) => setTimeout(res, 15));
+      }
+      return null;
+    })();
+    const start = (this.o.launchReserves ?? DEFAULT_LAUNCH_RESERVES)[String(l.event.launchConfigId)];
+    const derived = start ? launchReserves(start, l.event.devBuyQuoteIn, l.event.creatorTaxBps) : null;
+    let reserves: Reserves | null;
+    if (derived) {
+      const wait = this.o.reservesWaitMs ?? 5;
+      reserves = (await Promise.race([rpcReserves, new Promise<null>((res) => setTimeout(() => res(null), wait))])) ?? derived;
+      void rpcReserves.then((r) => {
+        if (r && (r.quote !== derived.quote || r.token !== derived.token))
+          this.o.logger.debug({ key: run.key, rpc: [r.quote.toString(), r.token.toString()] }, 'reserves differ from launch-config start (trades already landed)');
+      });
+    } else reserves = await rpcReserves;
     if (run.status !== 'pending') return run;
     if (!reserves) return this.failRun(run, 'getReserves failed', 'aborted');
     const rc = this.risk.reserveCheck(p, reserves);

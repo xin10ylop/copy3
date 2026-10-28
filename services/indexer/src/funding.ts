@@ -5,7 +5,7 @@
  * creation row (kind 'create', value may be 0: the creator is the lineage of a
  * disperse contract). The *first* such row is the address's first funder.
  */
-import type { Sql } from './stubs/db.js';
+import type { Sql } from '@hood/db';
 import type { Address, Hex, TransferKind } from './types.js';
 
 export interface FundingHop {

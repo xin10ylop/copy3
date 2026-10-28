@@ -109,6 +109,21 @@ describe('SequencerClock', () => {
     expect(Math.abs(plain.clock.predictBoundaryMs(ts) - plain.truth(ts))).toBeGreaterThan(err);
   });
 
+  it('no spurious drift from jittered latency (live-like: exp tail, late seals)', () => {
+    for (const seconds of [35, 150]) {
+      const r = rng(seconds);
+      const { clock, truth } = run({
+        seconds,
+        phaseMs: 8,
+        offset: () => 777,
+        latency: () => 3 + -Math.log(1 - r()) * 12,
+        sealDelay: () => (r() < 0.3 ? r() * 60 : 0),
+      });
+      expect(clock.driftPpm).toBe(0);
+      expect(Math.abs(clock.predictBoundaryMs(T0 + seconds + 1) - truth(T0 + seconds + 1))).toBeLessThan(BURST.spacingMs);
+    }
+  });
+
   it('ignores a backlog burst on connect (late arrivals cannot pull the estimate)', () => {
     const clock = new SequencerClock();
     // backlog: 30 old blocks delivered within 30 ms, 1-3 s late

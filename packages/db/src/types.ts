@@ -83,6 +83,8 @@ export interface TokenMetricsRow {
   n_buys_60s: number;
   n_sells_60s: number;
   exempt_sold_within_sec: number | null;
+  dump_wallets: string[];
+  operator_sell_eth: number;
   updated_at: Date;
 }
 

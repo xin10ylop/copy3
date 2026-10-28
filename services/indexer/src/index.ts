@@ -26,5 +26,3 @@ export type {
 export { startHealthServer, type HealthStatus } from './health.js';
 export { ethToWei, weiToEth } from './hex.js';
 export { silentLog, errMsg, type Log } from './log.js';
-/** db adapter (stub until @hood/db exports it; same shape as packages/db/src/sql.ts) */
-export { createDb, notify, listen, type Sql, type Row } from './stubs/db.js';

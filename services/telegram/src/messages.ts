@@ -267,7 +267,8 @@ function decisionNote(s: SnipeRow): string | null {
     if (Array.isArray(v) && v.length) return v.map(String).join('+');
     return null;
   };
-  const matched = pick('matched') ?? pick('matchedBy');
+  // services/sniper records the matched rules as decision.reasons (string[])
+  const matched = pick('reasons') ?? pick('matched') ?? pick('matchedBy');
   const reason = pick('reason');
   const parts = [matched ? `matched ${matched}` : null, reason].filter(Boolean);
   return parts.length ? escapeHtml(parts.join(' · ')) : null;
@@ -290,6 +291,14 @@ export function snipeSentMessage(s: SnipeRow, ctx: FormatCtx): string {
     .join('\n');
 }
 
+/** launch time: launches.ts, else the sniper's decision.launch.ts (unix seconds) */
+function launchTime(s: SnipeRow): Date | null {
+  if (s.launchTs) return s.launchTs;
+  const launch = s.decision.launch;
+  const ts = launch && typeof launch === 'object' ? (launch as Record<string, unknown>).ts : undefined;
+  return typeof ts === 'number' && ts > 0 ? new Date(ts * 1000) : null;
+}
+
 function entryMcapEth(s: SnipeRow): number | null {
   return mcapEthFromPrice(s.entryPrice);
 }
@@ -298,7 +307,7 @@ export function snipeFilledMessage(s: SnipeRow, ctx: FormatCtx): string {
   const quoteEth = s.quoteInWei !== null ? weiToEth(s.quoteInWei) : null;
   const taxEth = s.taxPaidWei !== null ? weiToEth(s.taxPaidWei) : null;
   const taxPct = quoteEth && taxEth !== null ? (taxEth / quoteEth) * 100 : null;
-  const after = secondsBetween(s.launchTs, s.buyTs);
+  const after = secondsBetween(launchTime(s), s.buyTs);
   const landed = burstItems(s).find((i) => i.status === 'mined' && i.hash);
   return [
     snipeHeader('FILLED', s),
@@ -427,7 +436,7 @@ export function statusMessage(s: StatusSnapshot, heads: ChainHeads, ctx: FormatC
   lines.push(`chain: ${nodeParts.join(' · ') || 'unknown'}`);
   lines.push(`positions: ${s.openPositions.live} live, ${s.openPositions.paper} paper`);
   lines.push(
-    `PnL today: live ${fmtEth(s.dailyPnl.live, { signed: true })}${usdSigned(s.dailyPnl.live, ctx)} · paper ${fmtEth(s.dailyPnl.paper, { signed: true })}`,
+    `PnL today (UTC): live ${fmtEth(s.dailyPnl.live, { signed: true })}${usdSigned(s.dailyPnl.live, ctx)} · paper ${fmtEth(s.dailyPnl.paper, { signed: true })}`,
   );
   lines.push(`plays: ${s.enabledPlays} enabled${s.pendingReview ? `, ${s.pendingReview} awaiting review` : ''} · armed wallets: ${s.armed}`);
   if (s.lastError) lines.push(`last error: ${escapeHtml(s.lastError.source)}/${escapeHtml(s.lastError.type)} at ${escapeHtml(fmtTime(s.lastError.ts, ctx.tz))}`);

@@ -159,8 +159,7 @@ export class LiveExecutor implements ExecutionBackend {
     this.nonces.set(await this.o.chain.getTransactionCount(this.o.account.address, 'pending'));
   }
 
-  /** Pre-sign one member per send time with consecutive nonces. */
-  async sign(order: SnipeOrder): Promise<BurstMember[]> {
+  private signer(order: SnipeOrder): { nonces: number[]; signOne: (i: number) => Promise<BurstMember> } {
     const { run } = order;
     const data = encodeFunctionData({
       abi: sniperAbi,
@@ -170,8 +169,7 @@ export class LiveExecutor implements ExecutionBackend {
     const nonces = this.nonces.take(order.times.length);
     const maxFeePerGas = parseGwei(String(order.maxFeeGwei));
     const maxPriorityFeePerGas = parseGwei(String(Math.min(order.priorityFeeGwei, order.maxFeeGwei)));
-    const members: BurstMember[] = [];
-    for (let i = 0; i < order.times.length; i++) {
+    const signOne = async (i: number): Promise<BurstMember> => {
       const raw = await this.o.account.signTransaction({
         chainId: this.o.chainId,
         type: 'eip1559',
@@ -183,42 +181,49 @@ export class LiveExecutor implements ExecutionBackend {
         maxFeePerGas,
         maxPriorityFeePerGas,
       });
-      members.push({ index: i, nonce: nonces[i]!, hash: keccak256(raw), raw, scheduledAt: order.times[i]!, sends: [], status: 'planned' });
-    }
+      return { index: i, nonce: nonces[i]!, hash: keccak256(raw), raw, scheduledAt: order.times[i]!, sends: [], status: 'planned' };
+    };
+    return { nonces, signOne };
+  }
+
+  /** Pre-sign one member per send time with consecutive nonces (reserves the nonces). */
+  async sign(order: SnipeOrder): Promise<BurstMember[]> {
+    const { signOne } = this.signer(order);
+    const members: BurstMember[] = [];
+    for (let i = 0; i < order.times.length; i++) members.push(await signOne(i));
     return members;
+  }
+
+  /** Schedule one member; resolves when its fan-out completed (or it was cancelled). */
+  private schedule(run: SnipeRun, m: BurstMember): Promise<void> {
+    let cancels = this.cancels.get(run.key);
+    if (!cancels) this.cancels.set(run.key, (cancels = []));
+    return new Promise<void>((resolve) => {
+      const cancel = this.o.scheduler.at(m.scheduledAt, () => {
+        m.sentAt = this.o.scheduler.now();
+        m.status = 'sent';
+        this.stats.members++;
+        const sends = this.o.senders.map((s) =>
+          s.sendRaw(m.raw).then((r) => {
+            this.stats.sends++;
+            if (!r.ok) this.stats.sendErrors++;
+            m.sends.push({ endpoint: r.endpoint, sentAt: r.sentAt, doneAt: r.doneAt, ok: r.ok, ...(r.error ? { error: r.error } : {}) });
+          }),
+        );
+        this.o.onSend?.(run, m);
+        void Promise.all(sends).then(() => resolve());
+      });
+      cancels.push(() => {
+        cancel();
+        if (m.status === 'planned') m.status = 'skipped';
+        resolve();
+      });
+    });
   }
 
   /** Schedule every member; resolves when all scheduled sends have completed (or were cancelled). */
   fire(run: SnipeRun, members: BurstMember[]): Promise<void> {
-    const done: Promise<void>[] = [];
-    const cancels: (() => void)[] = [];
-    for (const m of members) {
-      done.push(
-        new Promise<void>((resolve) => {
-          const cancel = this.o.scheduler.at(m.scheduledAt, () => {
-            m.sentAt = this.o.scheduler.now();
-            m.status = 'sent';
-            this.stats.members++;
-            const sends = this.o.senders.map((s) =>
-              s.sendRaw(m.raw).then((r) => {
-                this.stats.sends++;
-                if (!r.ok) this.stats.sendErrors++;
-                m.sends.push({ endpoint: r.endpoint, sentAt: r.sentAt, doneAt: r.doneAt, ok: r.ok, ...(r.error ? { error: r.error } : {}) });
-              }),
-            );
-            this.o.onSend?.(run, m);
-            void Promise.all(sends).then(() => resolve());
-          });
-          cancels.push(() => {
-            cancel();
-            if (m.status === 'planned') m.status = 'skipped';
-            resolve();
-          });
-        }),
-      );
-    }
-    this.cancels.set(run.key, cancels);
-    return Promise.all(done).then(() => {
+    return Promise.all(members.map((m) => this.schedule(run, m))).then(() => {
       this.cancels.delete(run.key);
     });
   }
@@ -292,15 +297,27 @@ export class LiveExecutor implements ExecutionBackend {
   async execute(order: SnipeOrder): Promise<Fill | null> {
     const { run } = order;
     this.stats.bursts++;
-    let members: BurstMember[];
+    // sign + schedule member by member: the first send is not held up by signing the rest
+    const { signOne } = this.signer(order);
+    run.burst = [];
+    const done: Promise<void>[] = [];
     try {
-      members = await this.sign(order);
+      for (let i = 0; i < order.times.length; i++) {
+        if (run.status !== 'pending') break; // aborted while signing
+        const m = await signOne(i);
+        run.burst.push(m);
+        done.push(this.schedule(run, m));
+      }
     } catch (e) {
       run.notes.push(`sign failed: ${(e as Error).message}`);
-      return null;
+      if (run.burst.length === 0) {
+        this.nonces.release();
+        return null;
+      }
     }
-    run.burst = members;
-    const sent = this.fire(run, members);
+    const sent = Promise.all(done).then(() => {
+      this.cancels.delete(run.key);
+    });
     return new Promise<Fill | null>((resolve) => {
       void (async () => {
         await sent;

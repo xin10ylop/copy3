@@ -24,8 +24,7 @@ async function indexScenario(store: PgStore | MemoryStore) {
 
 describe('PgStore round trip on PGlite (packages/db migration)', () => {
   it('writes every table, reads the curve back identically, checkpoints and notifies', async () => {
-    const { sql, db, source } = await pgliteSql();
-    expect(['packages/db', 'stub']).toContain(source);
+    const { sql, db } = await pgliteSql();
     const store = new PgStore(sql);
     const notes: string[] = [];
     await db.listen(TRANSFERS_CHANNEL, (p) => notes.push(p));
@@ -195,6 +194,12 @@ describe('LogBackfill (eth_getLogs ranges -> same processing path)', () => {
     expect(s2).toMatchObject({ launches: 0, trades: 0 });
     const [{ n }] = (await sql.query<{ n: number }>(`select count(*)::int n from curve_trades`)) as [{ n: number }];
     expect(n).toBe(9);
+
+    // a later re-run that covers only the launch block must not shrink the metrics to that block
+    const bf3 = new LogBackfill(chain, store, new BlockPipeline(chain, store, silentLog, {}), silentLog, { ...opts, to: LAUNCH_BLOCK, tokenTransfers: false });
+    await bf3.run();
+    const [m3] = await sql.query<{ n_buys_60s: number; exempt_sold_within_sec: number }>(`select n_buys_60s, exempt_sold_within_sec from token_metrics`);
+    expect(m3).toEqual({ n_buys_60s: 3, exempt_sold_within_sec: 5 });
     await sql.end();
   });
 });

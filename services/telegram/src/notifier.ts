@@ -199,8 +199,12 @@ export class Notifier {
         return this.serial('snipe_events', () => this.processSnipes(snipeIdsFromPayload(payload)));
       case 'armed_changed':
         return this.serial('armed_changed', () => this.processArmed());
-      case 'settings_changed':
+      case 'settings_changed': {
+        // the settings trigger sends {"op":…,"key":…}; only the kill switch matters here
+        const key = settingsKeyFromPayload(payload);
+        if (key !== null && key !== SETTINGS.killSwitch) return Promise.resolve();
         return this.serial('settings_changed', () => this.processKill());
+      }
       case 'plays_changed':
         return this.serial('plays_changed', () => this.processEvents());
     }
@@ -352,7 +356,7 @@ export class Notifier {
     if (this.lastSummaryDate === today || localHour(now, this.cfg.tz) < this.cfg.dailySummaryHour) return;
     const { store } = this.deps;
     const since = new Date(now.getTime() - 86_400_000);
-    const [pnl, status, errors] = await Promise.all([store.pnlSummary(since), store.getStatus(startOfLocalDay(now, this.cfg.tz)), store.countEventsSince(since, 'error')]);
+    const [pnl, status, errors] = await Promise.all([store.pnlSummary(since), store.getStatus(startOfLocalDay(now, 'UTC')), store.countEventsSince(since, 'error')]);
     const ctx = { ...(await this.fmtCtx()), ethUsd: status.ethUsd };
     if (!(await this.push(dailySummaryMessage(pnl, status, errors, ctx)))) return;
     this.lastSummaryDate = today;
@@ -370,6 +374,16 @@ function agentEventHtml(e: EventRow): string | null {
   if (typeof p.reportPath === 'string') parts.push(`report: <code>${escapeHtml(p.reportPath)}</code>`);
   if (Array.isArray(p.playIds) && p.playIds.length) parts.push(`proposed: ${p.playIds.map((i) => `#${String(i)}`).join(', ')}`);
   return parts.join('\n');
+}
+
+/** `{"op":"UPDATE","key":"kill_switch"}` → "kill_switch"; null when the payload has no key. */
+export function settingsKeyFromPayload(payload: string): string | null {
+  try {
+    const v = JSON.parse(payload) as unknown;
+    return v && typeof v === 'object' && typeof (v as Record<string, unknown>).key === 'string' ? ((v as Record<string, unknown>).key as string) : null;
+  } catch {
+    return null;
+  }
 }
 
 /** NOTIFY snipe_events payloads: `{"id":12}`, `{"snipeId":12,...}`, `12`, or anything else (ignored). */

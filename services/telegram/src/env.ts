@@ -83,7 +83,8 @@ export const EnvSchema = z.object({
   TELEGRAM_MAX_WATCH_ETH: numIn(0, 1000, 100),
   TELEGRAM_POLL_MS: intIn(500, 60_000, 5000),
   TELEGRAM_AGENT_CONCURRENCY: intIn(1, 4, 1),
-  SCOUT_SINCE_MINUTES: intIn(5, 10_080, 60),
+  /** shared with services/agent (same names): defaults for /scout */
+  SCOUT_SINCE_MIN: intIn(5, 10_080, 60),
   SCOUT_MIN_PEAK10_PCT: intIn(10, 100_000, 100),
   HEALTH_PORT: intIn(0, 65_535, 8080),
   NODE_HTTP: z.string().optional(),

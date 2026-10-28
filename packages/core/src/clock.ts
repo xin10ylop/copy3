@@ -43,8 +43,12 @@ export interface SequencerClockOptions {
   fallbackOffsetMs?: number;
   /** Fit and remove linear drift between local and sequencer clocks. Default true. */
   driftCompensation?: boolean;
-  /** Only apply a fitted drift above this magnitude (ppm). Default 20. */
+  /** Only apply a fitted drift above this magnitude (ppm). Default 50. */
   minDriftPpm?: number;
+  /** Clamp for the fitted drift (ppm). Default 500. */
+  maxDriftPpm?: number;
+  /** Minimum observed span before drift is fitted. Default 60 000 ms. */
+  minDriftSpanMs?: number;
   /** Arrivals closer than this to the previous one are backlog bursts (excluded from phase). */
   backlogGapMs?: number;
   /** How many recent seconds to keep for `snapshot().recentSeconds`. Default 20. */
@@ -127,7 +131,9 @@ export class SequencerClock {
       minSeconds: options.minSeconds ?? 5,
       fallbackOffsetMs: options.fallbackOffsetMs ?? 60,
       driftCompensation: options.driftCompensation ?? true,
-      minDriftPpm: options.minDriftPpm ?? 20,
+      minDriftPpm: options.minDriftPpm ?? 50,
+      maxDriftPpm: options.maxDriftPpm ?? 500,
+      minDriftSpanMs: options.minDriftSpanMs ?? 60_000,
       backlogGapMs: options.backlogGapMs ?? 20,
       historySeconds: options.historySeconds ?? 20,
     };
@@ -191,34 +197,32 @@ export class SequencerClock {
     if (s.length === 0) return null;
     const ref = s[s.length - 1]!.firstArrivalMs;
     let slope = 0;
-    if (this.o.driftCompensation && s.length >= 12) {
-      const span = s[s.length - 1]!.firstArrivalMs - s[0]!.firstArrivalMs;
-      if (span >= 30_000) {
-        // Lower envelope per bucket, least-squares line through the bucket minima.
-        const B = 6;
-        const pts: { t: number; o: number }[] = [];
-        for (let b = 0; b < B; b++) {
-          const lo = s[0]!.firstArrivalMs + (span * b) / B;
-          const hi = s[0]!.firstArrivalMs + (span * (b + 1)) / B;
-          let best: SecondRecord | undefined;
-          for (const r of s) {
-            if (r.firstArrivalMs < lo || (b < B - 1 ? r.firstArrivalMs >= hi : r.firstArrivalMs > hi)) continue;
-            if (!best || r.offsetMs < best.offsetMs) best = r;
-          }
-          if (best) pts.push({ t: best.firstArrivalMs - ref, o: best.offsetMs });
+    const span = s[s.length - 1]!.firstArrivalMs - s[0]!.firstArrivalMs;
+    if (this.o.driftCompensation && span >= this.o.minDriftSpanMs) {
+      // Lower envelope per ≥10 s bucket, Theil–Sen slope through the bucket minima (robust to
+      // latency spikes; short spans are too noisy and are ignored entirely).
+      const B = Math.max(3, Math.min(12, Math.floor(span / 10_000)));
+      const pts: { t: number; o: number }[] = [];
+      for (let b = 0; b < B; b++) {
+        const lo = s[0]!.firstArrivalMs + (span * b) / B;
+        const hi = s[0]!.firstArrivalMs + (span * (b + 1)) / B;
+        let best: SecondRecord | undefined;
+        for (const r of s) {
+          if (r.firstArrivalMs < lo || (b < B - 1 ? r.firstArrivalMs >= hi : r.firstArrivalMs > hi)) continue;
+          if (!best || r.offsetMs < best.offsetMs) best = r;
         }
-        if (pts.length >= 4) {
-          const mt = pts.reduce((a, p) => a + p.t, 0) / pts.length;
-          const mo = pts.reduce((a, p) => a + p.o, 0) / pts.length;
-          let num = 0;
-          let den = 0;
-          for (const p of pts) {
-            num += (p.t - mt) * (p.o - mo);
-            den += (p.t - mt) ** 2;
+        if (best) pts.push({ t: best.firstArrivalMs - ref, o: best.offsetMs });
+      }
+      if (pts.length >= 3) {
+        const slopes: number[] = [];
+        for (let i = 0; i < pts.length; i++)
+          for (let j = i + 1; j < pts.length; j++) {
+            const dt = pts[j]!.t - pts[i]!.t;
+            if (dt > 0) slopes.push((pts[j]!.o - pts[i]!.o) / dt);
           }
-          const fitted = den > 0 ? num / den : 0;
-          if (Math.abs(fitted) * 1e6 >= this.o.minDriftPpm) slope = Math.max(-2e-3, Math.min(2e-3, fitted));
-        }
+        const fitted = median(slopes);
+        const max = this.o.maxDriftPpm * 1e-6;
+        if (Number.isFinite(fitted) && Math.abs(fitted) * 1e6 >= this.o.minDriftPpm) slope = Math.max(-max, Math.min(max, fitted));
       }
     }
     let intercept = Infinity;

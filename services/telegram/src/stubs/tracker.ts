@@ -4,7 +4,8 @@
  * ============================================================================
  * Real implementation: services/tracker/src/watch.ts `buildWatchPlay`. This fallback builds the
  * same SPEC §4 play locally (Packet Tracker semantics): arm wallets that receive [minEth, maxEth]
- * from `funder` (fresh wallets only unless `any`), expire after 48 h, preset = given or defaults.
+ * from `funder` directly or via contracts it created (contract mode), fresh wallets only unless
+ * `any`, expire after 48 h, preset = given or defaults - mirroring the tracker's defaults.
  */
 import { PlayTriggerSchema, PresetSchema } from '@hood/core';
 import type { TrackerPort, WatchPlay, WatchPlayInput } from '../ports.js';
@@ -17,7 +18,7 @@ export function buildWatchPlayLocal(input: WatchPlayInput): WatchPlay {
       maxEth: input.maxEth,
       freshOnly: input.fresh,
       maxAgeSec: 48 * 3600,
-      contractMode: false,
+      contractMode: true,
     },
     launchKind: 'any',
     require: ['armedWallet'],

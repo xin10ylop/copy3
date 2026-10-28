@@ -62,6 +62,9 @@ describe('notification formatting from sample snipes', () => {
   it('aborted / failed: reason from notes or decision', () => {
     expect(snipeAbortedMessage(makeSnipe({ status: 'aborted', notes: 'exempt wallet sold in launch block', burst: [] }), ctx)).toContain('reason: exempt wallet sold in launch block');
     const f = snipeAbortedMessage(makeSnipe({ status: 'failed', decision: { abortReason: 'nonce too low' } }), ctx);
+    expect(snipeSentMessage(makeSnipe({ decision: { reasons: ['armedWallet', 'nameRegex'] } }), ctx)).toContain('matched armedWallet+nameRegex');
+    const fromDecision = snipeFilledMessage(makeSnipe({ status: 'open', launchTs: null, decision: { launch: { ts: 1_793_203_140 } }, buyTs: new Date(1_793_203_141_000) }), ctx);
+    expect(fromDecision).toContain('+1 s after launch');
     expect(f).toContain('<b>FAILED</b>');
     expect(f).toContain('nonce too low');
   });

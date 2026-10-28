@@ -13,7 +13,7 @@ import { PgStore } from './pg-store.js';
 import { BlockPipeline } from './pipeline.js';
 import { HttpRpc } from './rpc.js';
 import type { IndexerStore } from './store.js';
-import { createDb } from './stubs/db.js';
+import { createDb } from '@hood/db';
 
 async function main(): Promise<void> {
   let args;

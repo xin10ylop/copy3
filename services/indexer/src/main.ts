@@ -7,7 +7,7 @@ import { PgStore } from './pg-store.js';
 import { INDEXED_TOPICS } from './pons.js';
 import { BlockPipeline } from './pipeline.js';
 import { HttpRpc } from './rpc.js';
-import { createDb } from './stubs/db.js';
+import { createDb } from '@hood/db';
 import { WsSubscriber } from './ws.js';
 
 async function main(): Promise<void> {

@@ -1,8 +1,12 @@
 /** Persistence boundary of the tracker (SQL in PgTrackerStore; tests run it on PGlite). */
 import { PlayTriggerSchema, PresetSchema } from '@hood/core';
-import { fundingPath, notify, type Address, type FundingHop, type Hex, type Sql, type TransferKind } from '@hood/indexer';
+import { armCandidate, expireArmed, insertEvent, listArmed, listEnabledPlays, notify, type Sql } from '@hood/db';
+import { fundingPath, type Address, type FundingHop, type Hex, type TransferKind } from '@hood/indexer';
 import type { ArmDecision, ContractOrigin, RecipientFacts, TransferEvent, WatchPlay } from './match.js';
-import { armCandidate, expireArmed, insertEvent, listArmed, listEnabledPlays, type ArmedDbRow } from './stubs/db.js';
+
+/** JSON-safe copy (bigint -> string) for jsonb payloads / NOTIFY. */
+const jsonSafe = (v: unknown): Record<string, unknown> =>
+  JSON.parse(JSON.stringify(v ?? {}, (_k, x: unknown) => (typeof x === 'bigint' ? x.toString() : x))) as Record<string, unknown>;
 
 export const TRACKER_CHECKPOINT_KEY = 'tracker.checkpoint';
 export const ARMED_CHANNEL = 'armed_changed';
@@ -41,7 +45,13 @@ export interface TrackerStore {
   fundingPath(wallet: Address, depth: number): Promise<FundingHop[]>;
 }
 
-const toChange = (r: ArmedDbRow, status: CandidateChange['status']): CandidateChange => ({
+interface CandidateDbRow {
+  id: number | string;
+  play_id: number;
+  wallet: string;
+}
+
+const toChange = (r: CandidateDbRow, status: CandidateChange['status']): CandidateChange => ({
   id: Number(r.id),
   playId: Number(r.play_id),
   wallet: r.wallet as Address,
@@ -169,8 +179,9 @@ export class PgTrackerStore implements TrackerStore {
     return new Set(rows.map((r) => Number(r.play_id)));
   }
 
-  arm(d: ArmDecision): Promise<number | null> {
-    return armCandidate(this.sql, {
+  /** @hood/db armCandidate (callers check armedPlays first, so this is always a new arm). */
+  async arm(d: ArmDecision): Promise<number | null> {
+    const row = await armCandidate(this.sql, {
       playId: d.playId,
       wallet: d.wallet,
       sourceFunder: d.sourceFunder,
@@ -178,14 +189,15 @@ export class PgTrackerStore implements TrackerStore {
       fundedTx: d.txHash,
       expiresAt: d.expiresAt,
     });
+    return row ? Number(row.id) : null;
   }
 
-  insertEvent(type: string, payload: unknown, level: 'info' | 'warn' = 'info'): Promise<void> {
-    return insertEvent(this.sql, { level, source: 'tracker', type, payload });
+  async insertEvent(type: string, payload: unknown, level: 'info' | 'warn' = 'info'): Promise<void> {
+    await insertEvent(this.sql, { level, source: 'tracker', type, payload: jsonSafe(payload) });
   }
 
   notifyArmed(payload: unknown): Promise<void> {
-    return notify(this.sql, ARMED_CHANNEL, JSON.stringify(payload, (_k, v: unknown) => (typeof v === 'bigint' ? v.toString() : v)));
+    return notify(this.sql, ARMED_CHANNEL, jsonSafe(payload));
   }
 
   async armedTriggerInstalled(): Promise<boolean> {
@@ -199,8 +211,16 @@ export class PgTrackerStore implements TrackerStore {
     return this.triggerInstalled;
   }
 
+  /** rows that @hood/db expireArmed (count only) is about to expire, then expireArmed itself */
   async expire(now: Date): Promise<CandidateChange[]> {
-    return (await expireArmed(this.sql, now)).map((r) => toChange(r, 'expired'));
+    const due = await this.sql.query<CandidateDbRow>(
+      `select id::float8 as id, play_id, wallet from armed_candidates
+       where status = 'armed' and expires_at is not null and expires_at < $1 order by id`,
+      [now],
+    );
+    if (due.length === 0) return [];
+    await expireArmed(this.sql, now);
+    return due.map((r) => toChange(r, 'expired'));
   }
 
   async markFired(): Promise<CandidateChange[]> {
@@ -222,11 +242,11 @@ export class PgTrackerStore implements TrackerStore {
   async disarmExhausted(plays: readonly WatchPlay[]): Promise<CandidateChange[]> {
     const out: CandidateChange[] = [];
     for (const p of plays) {
-      const rows = await this.sql.query<ArmedDbRow>(
+      const rows = await this.sql.query<CandidateDbRow>(
         `update armed_candidates set status = 'disarmed'
          where play_id = $1 and status = 'armed'
            and (select count(*) from armed_candidates f where f.play_id = $1 and f.status = 'fired') >= $2
-         returning id::float8 as id, play_id, wallet, source_funder, extract(epoch from expires_at)::float8 as expires_at, status`,
+         returning id::float8 as id, play_id, wallet`,
         [p.id, p.stopAfter],
       );
       out.push(...rows.map((r) => toChange(r, 'disarmed')));
@@ -235,7 +255,7 @@ export class PgTrackerStore implements TrackerStore {
   }
 
   async armedCount(): Promise<number> {
-    return (await listArmed(this.sql)).length;
+    return (await listArmed(this.sql, 'armed')).length;
   }
 
   fundingPath(wallet: Address, depth: number): Promise<FundingHop[]> {

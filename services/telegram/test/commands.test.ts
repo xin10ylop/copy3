@@ -151,7 +151,7 @@ describe('read-only views', () => {
     expect(t).toContain('indexer 100302000');
     expect(t).toContain('kill switch: off');
     expect(t).toContain('positions: 1 live, 2 paper');
-    expect(t).toContain('PnL today: live +0.0123 ETH (+$36.90)');
+    expect(t).toContain('PnL today (UTC): live +0.0123 ETH (+$36.90)');
     expect(t).toContain('ETH/USD: $3,000');
   });
 

@@ -1,17 +1,18 @@
-/** IndexerStore on Postgres (postgres.js) via the @hood/db helpers. */
+/** IndexerStore on Postgres via the @hood/db helpers (see db.ts); reads are plain SQL. */
+import { notify } from '@hood/db';
 import {
   columnsOf,
   getSetting,
-  insertTokenTransfer,
-  insertTrade,
-  insertTransfer,
-  notify,
   setSetting,
-  upsertLaunch,
-  upsertTokenMetrics,
-  upsertWallet,
+  writeLaunch,
+  writeMetrics,
+  writeTokenTransfer,
+  writeTrade,
+  writeTransfer,
+  writeWallet,
+  type MetricsExtraColumns,
   type Sql,
-} from './stubs/db.js';
+} from './db.js';
 import { CHECKPOINT_KEY, TRANSFERS_CHANNEL, type Batch, type DirectoryEntry, type IndexerStore, type StoredCurve } from './store.js';
 import type { Address, Checkpoint, Hex, LaunchKind, LaunchRow, TokenTransferRow, TradeRow, TradeSide } from './types.js';
 
@@ -144,12 +145,12 @@ const LAUNCH_COLS = `token, curve, deployer, launcher, launch_kind, creator_fee_
   tx_hash, tx_from, start_price, start_mcap_eth, graduated`;
 
 export class PgStore implements IndexerStore {
-  private extra: { dumpWallets: boolean; operatorSellEth: boolean } | null = null;
+  private extra: MetricsExtraColumns | null = null;
 
   constructor(readonly sql: Sql) {}
 
   /** token_metrics.dump_wallets / operator_sell_eth are written only if the migration has them */
-  private async metricsExtra(): Promise<{ dumpWallets: boolean; operatorSellEth: boolean }> {
+  private async metricsExtra(): Promise<MetricsExtraColumns> {
     if (!this.extra) {
       const cols = await columnsOf(this.sql, 'token_metrics');
       this.extra = { dumpWallets: cols.has('dump_wallets'), operatorSellEth: cols.has('operator_sell_eth') };
@@ -158,18 +159,18 @@ export class PgStore implements IndexerStore {
   }
 
   async writeBatch(b: Batch): Promise<void> {
-    const extra = b.metrics.length ? await this.metricsExtra() : null;
+    const extra = b.metrics.length ? await this.metricsExtra() : { dumpWallets: false, operatorSellEth: false };
     await this.sql.begin(async (tx) => {
-      for (const l of b.launches) await upsertLaunch(tx, l);
-      for (const t of b.trades) await insertTrade(tx, t);
-      for (const t of b.tokenTransfers) await insertTokenTransfer(tx, t);
-      for (const t of b.transfers) await insertTransfer(tx, t);
-      for (const w of b.wallets) await upsertWallet(tx, w);
+      for (const l of b.launches) await writeLaunch(tx, l);
+      for (const t of b.trades) await writeTrade(tx, t);
+      for (const t of b.tokenTransfers) await writeTokenTransfer(tx, t);
+      for (const t of b.transfers) await writeTransfer(tx, t);
+      for (const w of b.wallets) await writeWallet(tx, w);
       for (const [token, ex] of b.exemptionUpdates) {
         await tx.query(`update launches set exemptions = $2::text[] where token = $1`, [token, ex]);
       }
       for (const token of b.graduated) await tx.query(`update launches set graduated = true where token = $1`, [token]);
-      for (const m of b.metrics) await upsertTokenMetrics(tx, m, extra ?? undefined);
+      for (const m of b.metrics) await writeMetrics(tx, m, extra);
       if (b.checkpoint) await setSetting(tx, CHECKPOINT_KEY, b.checkpoint);
     });
   }

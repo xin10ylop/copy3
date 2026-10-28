@@ -164,6 +164,7 @@ const METRIC_COLUMNS = new Set([
   'peak2_pct', 'peak5_pct', 'peak10_pct', 'peak30_pct', 'peak60_pct',
   'mcap2', 'mcap5', 'mcap10', 'mcap30', 'mcap60',
   'low_after_entry_pct', 'n_buys_60s', 'n_sells_60s', 'exempt_sold_within_sec',
+  'dump_wallets', 'operator_sell_eth',
 ]);
 
 /** Upsert a subset of token_metrics columns (snake_case keys). numeric columns accept bigint. */

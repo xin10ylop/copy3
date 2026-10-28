@@ -93,6 +93,8 @@ CREATE TABLE IF NOT EXISTS token_metrics (
   n_buys_60s            int NOT NULL DEFAULT 0,
   n_sells_60s           int NOT NULL DEFAULT 0,
   exempt_sold_within_sec int,
+  dump_wallets          text[] NOT NULL DEFAULT '{}',          -- recipients of exempt-wallet token transfers (operator exit)
+  operator_sell_eth     double precision NOT NULL DEFAULT 0,  -- curve sells by exempt + dump wallets, ETH
   updated_at            timestamptz NOT NULL DEFAULT now()
 );
 

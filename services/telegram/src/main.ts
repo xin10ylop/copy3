@@ -4,7 +4,7 @@
  */
 import pino from 'pino';
 import { createBot } from './bot.js';
-import { createDb, listen } from './db.js';
+import { createDb, listen } from '@hood/db';
 import { loadEnv, notifyChats } from './env.js';
 import { Links } from './format.js';
 import { startHealthServer } from './health.js';
@@ -62,7 +62,7 @@ async function main(): Promise<void> {
       reportsDir: env.REPORTS_DIR,
       maxBuyEth: env.TELEGRAM_MAX_BUY_ETH,
       maxWatchEth: env.TELEGRAM_MAX_WATCH_ETH,
-      scout: { sinceMinutes: env.SCOUT_SINCE_MINUTES, minPeak10Pct: env.SCOUT_MIN_PEAK10_PCT },
+      scout: { sinceMinutes: env.SCOUT_SINCE_MIN, minPeak10Pct: env.SCOUT_MIN_PEAK10_PCT },
     },
   });
   await bot.init();
@@ -76,7 +76,7 @@ async function main(): Promise<void> {
       chatCount: chats.length,
       registry,
       activeJobKinds: () => jobs.activeKinds(),
-      listen: async (channel, onPayload) => (await listen(sql, channel, onPayload)).unlisten,
+      listen: (channel, onPayload) => listen(sql, channel, onPayload),
       log,
     },
     {
@@ -92,7 +92,7 @@ async function main(): Promise<void> {
 
   const health = startHealthServer(env.HEALTH_PORT, {
     check: async () => {
-      const db = await sql`select 1 as ok`.then(() => true).catch(() => false);
+      const db = await sql.query('SELECT 1 AS ok').then(() => true).catch(() => false);
       const polling = bot.isRunning();
       return { ok: db && polling, detail: { db, polling, jobs: jobs.size } };
     },
@@ -107,7 +107,7 @@ async function main(): Promise<void> {
     await notifier.stop().catch(() => undefined);
     await Promise.race([jobs.idle(), new Promise((r) => setTimeout(r, 10_000))]);
     health.close();
-    await sql.end({ timeout: 5 }).catch(() => undefined);
+    await sql.end().catch(() => undefined);
     process.exit(0);
   };
   process.once('SIGINT', () => void shutdown('SIGINT'));

@@ -222,11 +222,14 @@ services:
       <<: *app-env
       SERVICE: tracker
 
+  # `serve`: scout every SCOUT_INTERVAL_MIN, /healthz on AGENT_HEALTH_PORT.
   agent:
     <<: *app
+    command: ["pnpm", "--filter", "@hood/agent", "start", "serve"]
     environment:
       <<: *app-env
       SERVICE: agent
+      AGENT_HEALTH_PORT: "8080"
     volumes:
       - ${DATA_ROOT:-/data}/reports:/reports
 

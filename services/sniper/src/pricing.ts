@@ -37,3 +37,19 @@ export function planMinOut(p: Preset, r: Reserves, quoteIn: bigint, creatorTaxBp
   }
   return { expectedOut, minTokensOut: minOutWithSlippage(expectedOut, p.slippageBps), taxBps, basis: 'slippage' };
 }
+
+/**
+ * Curve reserves right after launch, per launchConfigId (verified: config 0 starts at a 1.68 ETH
+ * virtual quote and 1e27 tokens). Lets the executor skip waiting for getReserves.
+ */
+export const DEFAULT_LAUNCH_RESERVES: Readonly<Record<string, Reserves>> = {
+  '0': { quote: 1_680_000_000_000_000_000n, token: 10n ** 27n },
+};
+
+/** Reserves after the launch tx: config start + the (exempt, untaxed) dev buy of launchAndBuy. */
+export function launchReserves(start: Reserves, devBuyQuoteIn: bigint, creatorTaxBps: number, feeBps = CURVE_FEE_BPS): Reserves {
+  if (devBuyQuoteIn <= 0n) return start;
+  const out = quoteBuy(start, devBuyQuoteIn, feeBps, creatorTaxBps, 0n);
+  const net = devBuyQuoteIn - (devBuyQuoteIn * BigInt(feeBps)) / 10_000n - (devBuyQuoteIn * BigInt(creatorTaxBps)) / 10_000n;
+  return { quote: start.quote + net, token: start.token - out };
+}

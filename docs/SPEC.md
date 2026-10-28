@@ -46,7 +46,7 @@ Tables (snake_case, timestamps `timestamptz`, addresses `text` lower-case,
 wei amounts `numeric(78,0)`, prices `double precision` in ETH units):
 
 ```
-launches(token pk, curve, deployer, launcher (tx.to), launch_kind, creator_fee_recipient, creator_tax_bps,
+launches(token pk, curve, deployer, launcher (tx.to), launch_kind ('launchToken'|'launchAndBuy'|'launchTokenFor'; a dev buy = dev_buy_quote > 0), creator_fee_recipient, creator_tax_bps,
          name, symbol, logo, pair_token, launch_config_id, graduation_threshold numeric, exemptions text[],
          dev_buy_quote numeric, block bigint, ts, tx_hash, tx_from, start_price, start_mcap_eth,
          graduated bool default false, created_at)
@@ -57,7 +57,8 @@ token_metrics(token pk, first_taxed_buyer, first_taxed_ts, first_taxed_block, fi
          tax_free_buy_count int, tax_free_quote numeric, ath_price, ath_ts, ath_mcap_eth,
          peak2_pct, peak5_pct, peak10_pct, peak30_pct, peak60_pct, mcap2, mcap5, mcap10, mcap30, mcap60,
          low_after_entry_pct (max drawdown within 60 s), n_buys_60s, n_sells_60s, exempt_sold_within_sec,
-         updated_at)
+         dump_wallets text[], operator_sell_eth double (ETH), updated_at)
+token_transfers(id bigserial pk, token, block, ts, tx_hash, log_index, from_addr, to_addr, value numeric, unique(tx_hash, log_index))
 eth_transfers(id bigserial pk, block, ts, tx_hash, trace_addr text, from_addr, to_addr, value numeric,
          kind ('tx'|'internal'|'create'), unique(tx_hash, trace_addr))
 wallets(address pk, first_seen_block, first_seen_ts, first_funder, first_funding_value numeric, first_funding_tx,

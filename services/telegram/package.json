@@ -24,9 +24,10 @@
     "@hood/tracker": "workspace:*",
     "grammy": "^1.40.0",
     "pino": "^9.14.0",
-    "postgres": "^3.4.7",
     "viem": "^2.45.0",
     "zod": "^4.1.12"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.3.14"
+  }
 }

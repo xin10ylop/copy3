@@ -116,7 +116,8 @@ export function createBot(token: string, deps: BotDeps, opts: { botInfo?: UserFr
 
   bot.command('status', async (ctx) => {
     const c = await fmtCtx();
-    const [snap, heads] = await Promise.all([store.getStatus(startOfLocalDay(c.now, config.tz)), deps.chainHeads().catch(() => ({ node: null, publicRpc: null }))]);
+    // UTC day: the same window the sniper's daily loss limit uses
+    const [snap, heads] = await Promise.all([store.getStatus(startOfLocalDay(c.now, 'UTC')), deps.chainHeads().catch(() => ({ node: null, publicRpc: null }))]);
     await reply(ctx, statusMessage(snap, heads, { ...c, ethUsd: snap.ethUsd ?? c.ethUsd }));
   });
 

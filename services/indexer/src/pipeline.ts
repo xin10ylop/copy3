@@ -361,6 +361,10 @@ export class BlockPipeline {
   /** start reserves for launches of this batch + hydrate unknown curves */
   async prepareCurves(events: readonly PonsEvent[], n: number): Promise<void> {
     for (const l of launchesInBatch(events)) {
+      if (this.book.get(l.curve)?.launch) continue;
+      // re-processing an already stored launch (backfill re-run / overlap with live data):
+      // start from the stored state so metrics keep every stored trade
+      if (this.directory.has(l.token)) await this.hydrate(l.curve, n);
       if (!this.book.get(l.curve)?.launch) await this.startReserves(l.curve, null);
     }
     for (const curve of curvesNeedingHydration(this.book, events)) await this.hydrate(curve, n);

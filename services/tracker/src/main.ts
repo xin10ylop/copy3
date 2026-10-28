@@ -1,5 +1,6 @@
 /** tracker service entry point: `pnpm --filter @hood/tracker start` */
-import { TRANSFERS_CHANNEL, createDb, errMsg, listen, startHealthServer } from '@hood/indexer';
+import { createDb, listen } from '@hood/db';
+import { TRANSFERS_CHANNEL, errMsg, startHealthServer } from '@hood/indexer';
 import pino from 'pino';
 import { parseTrackerEnv } from './env.js';
 import { PgTrackerStore } from './store.js';
