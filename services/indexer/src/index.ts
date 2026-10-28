@@ -10,7 +10,7 @@ export { chunkRanges, splitRange, chunkList, type BlockRange } from './ranges.js
 export { BlockPipeline, type PipelineConfig, type PipelineStats } from './pipeline.js';
 export { PgStore } from './pg-store.js';
 export { MemoryStore } from './memory-store.js';
-export { CHECKPOINT_KEY, TRANSFERS_CHANNEL, type IndexerStore, type Batch } from './store.js';
+export { CHECKPOINT_KEY, TRANSFERS_CHANNEL, emptyBatch, type IndexerStore, type Batch } from './store.js';
 export type {
   Address,
   Hex,

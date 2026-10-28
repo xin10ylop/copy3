@@ -103,7 +103,7 @@ describe('LaunchDetector', () => {
 
   it('ignores non-launch calls to the factory', async () => {
     const d = new LaunchDetector();
-    const t = decodedTxFromRpc({ ...launchFixture.tx, hash: `0x${'66'.repeat(32)}`, input: '0x3cf28b5a' + '0'.repeat(64) });
+    const t = decodedTxFromRpc({ ...launchFixture.tx, hash: `0x${'66'.repeat(32)}`, input: `0x3cf28b5a${'0'.repeat(64)}` });
     expect(d.isCandidate(t)).toBe(true);
     expect(await d.detect(emptyBlock(1, LAUNCH.ts, LAUNCH.ts * 1000, [t]))).toEqual([]);
     expect(launchTx().selector).toBe('0xf35abbcf');

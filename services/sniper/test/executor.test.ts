@@ -93,7 +93,7 @@ describe('LiveExecutor burst', () => {
     expect(times).toHaveLength(10);
     const r = run();
     const fillP = ex.execute({ run: r, token: LAUNCH.token, curve: LAUNCH.curve, times, gasLimit: 300_000, maxFeeGwei: 1, priorityFeeGwei: 0 });
-    await new Promise((res) => setTimeout(res, 5)); // signing
+    await expectEventually(() => r.burst.length === 10); // signing
     expect(r.burst.map((m) => m.nonce)).toEqual([42, 43, 44, 45, 46, 47, 48, 49, 50, 51]);
     expect(ex.nonces.value).toBe(52);
     expect(a.sent).toHaveLength(0);
@@ -162,6 +162,19 @@ describe('LiveExecutor burst', () => {
     sched.advance(sched.t + 100);
     expect(a.sent).toHaveLength(1);
     expect(r.burst.map((m) => m.status)).toEqual(['sent', 'skipped', 'skipped']);
+  });
+
+  it('signing cost of a 10-member burst (the remaining post-receipt latency)', async () => {
+    const { ex } = setup();
+    await ex.init();
+    const r = run();
+    await ex.sign({ run: r, token: LAUNCH.token, curve: LAUNCH.curve, times: [0], gasLimit: 300_000, maxFeeGwei: 1, priorityFeeGwei: 0 }); // warm-up
+    const t0 = performance.now();
+    const m = await ex.sign({ run: r, token: LAUNCH.token, curve: LAUNCH.curve, times: Array.from({ length: 10 }, (_, i) => i), gasLimit: 300_000, maxFeeGwei: 1, priorityFeeGwei: 0 });
+    const ms = performance.now() - t0;
+    expect(m).toHaveLength(10);
+    // eslint-disable-next-line no-console
+    console.log(`[executor] signed 10 burst txs in ${ms.toFixed(2)} ms (${(ms / 10).toFixed(2)} ms/tx)`);
   });
 
   it('NonceManager only resyncs when nothing is in flight', () => {
