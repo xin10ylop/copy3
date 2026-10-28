@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.log
+.env
+.env.*
+!.env.example
+reports/
+data/
+coverage/
+.DS_Store
+contracts/artifacts/
+contracts/cache/

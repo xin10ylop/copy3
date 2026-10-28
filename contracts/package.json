@@ -1,0 +1,13 @@
+{
+  "name": "@hood/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node script/compile.mjs",
+    "typecheck": "echo skip",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
