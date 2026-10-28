@@ -55,7 +55,9 @@ export type Trailing = z.infer<typeof TrailingSchema>;
 export const PresetSchema = z.object({
   buyEth: z.number().positive().default(0.07),
   /** max snipe tax tolerated ("tax protection"), bps. 1000 = 10 %. */
-  maxTaxBps: z.number().int().min(0).default(1000),
+  // ≥ 9900 would disable the gate (launch-second tax is 9900); anything above ~700 is pointless
+  // because the schedule only takes 9900 / 618 / 19 / 0. PonsSniper also refuses ≥ 9900.
+  maxTaxBps: z.number().int().min(0).max(5000).default(1000),
   /** slippage tolerance in bps; default 3000 plus impact-aware minOut (SPEC). */
   slippageBps: z.number().int().min(0).default(3000),
   burst: BurstSchema.default({ startMs: -120, spacingMs: 15, count: 10 }),

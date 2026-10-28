@@ -1,6 +1,15 @@
 /**
  * Risk gate (ARCHITECTURE §6). All checks are memory-only except `reserveCheck`, which uses the
  * single getReserves eth_call made right after the launch receipt.
+ *
+ * Accounting (reviewer H1/H2/H3):
+ *  - `reserve()` takes a concurrency slot at decision time — nothing else; a spoofed or failed
+ *    launch must not burn `stopAfter` or `firstBuyOnly` for the real one.
+ *  - `confirm()` runs once the receipt proved the launch (TokenLaunched from the factory with the
+ *    same deployer): counts the play, marks the deployer + token.
+ *  - `release()` frees the slot of a run that ended without a position; a confirmed run that never
+ *    filled is un-counted again so the next launch of that deployer can still be played.
+ *  - positions (incl. ones rebuilt at startup) hold their slot until closed.
  */
 import { mcapFromReserves, type Preset, type Reserves } from '@hood/core';
 import { formatEther } from 'viem';
@@ -18,8 +27,15 @@ export interface RiskVerdict {
   reasons: string[];
 }
 
-const truthy = (v: unknown): boolean =>
-  v === true || v === 'true' || v === 1 || (typeof v === 'object' && v !== null && ((v as { enabled?: unknown }).enabled === true || (v as { on?: unknown }).on === true));
+/** Same value shapes the telegram bot writes/reads (services/telegram parseKillState). */
+export function killSwitchOn(v: unknown): boolean {
+  if (v === true || v === 'on' || v === 'true' || v === 1) return true;
+  if (v && typeof v === 'object') {
+    const o = v as Record<string, unknown>;
+    return o.on === true || o.enabled === true || o.killed === true;
+  }
+  return false;
+}
 
 const utcDay = (ms: number): number => Math.floor(ms / 86_400_000);
 
@@ -33,6 +49,8 @@ export class Risk {
   private readonly playDeployers = new Set<string>();
   /** latest L2 gas price (wei), refreshed off the hot path */
   gasPriceWei: bigint | null = null;
+  /** PonsSniper ETH balance (live), refreshed off the hot path; null = unknown */
+  contractBalanceWei: bigint | null = null;
 
   constructor(private readonly opts: RiskOptions) {}
 
@@ -40,16 +58,15 @@ export class Risk {
     this.settings = s;
   }
 
-  seed(stats: { countsByPlay: Record<number, number>; openCount: number; realizedPnlSince: number; tokens: string[]; playDeployers: { playId: number; deployer: string }[] }): void {
+  seed(stats: { countsByPlay: Record<number, number>; realizedPnlSince: number; tokens: string[]; playDeployers: { playId: number; deployer: string }[] }): void {
     for (const [k, v] of Object.entries(stats.countsByPlay)) this.countsByPlay.set(Number(k), v);
-    this.openCount = stats.openCount;
     this.realizedTodayEth = stats.realizedPnlSince;
     for (const t of stats.tokens) this.tokens.add(t.toLowerCase());
     for (const pd of stats.playDeployers) this.playDeployers.add(`${pd.playId}:${pd.deployer.toLowerCase()}`);
   }
 
   get killSwitch(): boolean {
-    return truthy(this.settings.kill_switch);
+    return killSwitchOn(this.settings.kill_switch);
   }
 
   get dailyLossLimitEth(): number {
@@ -71,6 +88,10 @@ export class Risk {
     return this.realizedTodayEth;
   }
 
+  playCount(playId: number): number {
+    return this.countsByPlay.get(playId) ?? 0;
+  }
+
   private rollDay(now = Date.now()): void {
     const d = utcDay(now);
     if (d !== this.day) {
@@ -79,14 +100,20 @@ export class Risk {
     }
   }
 
-  /** Memory-only checks on the decide path. */
-  preCheck(d: Decision, l: DetectedLaunch, now = Date.now()): RiskVerdict {
+  /** Global stops that must hold at decide time AND right before the first send. */
+  sendCheck(now = Date.now()): RiskVerdict {
     this.rollDay(now);
     const reasons: string[] = [];
-    const p = d.preset;
-    const playId = d.play.id ?? -1;
     if (this.killSwitch) reasons.push('kill switch on');
     if (this.realizedTodayEth <= -this.dailyLossLimitEth) reasons.push(`daily loss ${this.realizedTodayEth.toFixed(4)} ETH ≥ limit ${this.dailyLossLimitEth}`);
+    return { ok: reasons.length === 0, reasons };
+  }
+
+  /** Memory-only checks on the decide path. */
+  preCheck(d: Decision, l: DetectedLaunch, now = Date.now()): RiskVerdict {
+    const reasons = [...this.sendCheck(now).reasons];
+    const p = d.preset;
+    const playId = d.play.id ?? -1;
     if (this.openCount >= this.maxConcurrent) reasons.push(`max concurrent ${this.maxConcurrent} reached`);
     const n = this.countsByPlay.get(playId) ?? 0;
     if (this.opts.mode === 'live' && n >= p.stopAfter) reasons.push(`stopAfter ${p.stopAfter} reached (${n})`);
@@ -96,6 +123,8 @@ export class Risk {
     if (this.gasPriceWei !== null && Number(this.gasPriceWei) / 1e9 > this.opts.maxGasPriceGwei)
       reasons.push(`gas price ${Number(this.gasPriceWei) / 1e9} gwei > cap ${this.opts.maxGasPriceGwei}`);
     if (p.buyEth <= 0) reasons.push('buyEth must be > 0');
+    if (this.opts.mode === 'live' && this.contractBalanceWei !== null && this.contractBalanceWei < BigInt(Math.round(p.buyEth * 1e18)))
+      reasons.push(`contract balance ${formatEther(this.contractBalanceWei)} ETH < buy ${p.buyEth}`);
     return { ok: reasons.length === 0, reasons };
   }
 
@@ -120,21 +149,30 @@ export class Risk {
     return Math.min(p.maxFeeGwei, this.opts.maxGasPriceGwei);
   }
 
-  onSnipeStarted(playId: number, token: string | undefined, deployer: string): void {
+  /** Concurrency slot for a decided run (no other bookkeeping yet). */
+  reserve(): void {
     this.openCount++;
+  }
+
+  /** The receipt proved the launch: count it for stopAfter / firstBuyOnly / token cap. */
+  confirm(playId: number, token: string, deployer: string): void {
     this.countsByPlay.set(playId, (this.countsByPlay.get(playId) ?? 0) + 1);
-    if (token) this.tokens.add(token.toLowerCase());
+    this.tokens.add(token.toLowerCase());
     this.playDeployers.add(`${playId}:${deployer.toLowerCase()}`);
   }
 
-  onTokenKnown(token: string): void {
-    this.tokens.add(token.toLowerCase());
+  /** A run ended without a position: free its slot; un-count a confirmed run that never filled. */
+  release(playId: number, confirmed: { deployer: string } | null): void {
+    this.openCount = Math.max(0, this.openCount - 1);
+    if (confirmed) {
+      this.countsByPlay.set(playId, Math.max(0, (this.countsByPlay.get(playId) ?? 1) - 1));
+      this.playDeployers.delete(`${playId}:${confirmed.deployer.toLowerCase()}`);
+    }
   }
 
-  /** Snipe ended without a position (failed/aborted): frees the slot and the stopAfter count. */
-  onSnipeEnded(playId: number, counted: boolean): void {
-    this.openCount = Math.max(0, this.openCount - 1);
-    if (!counted) this.countsByPlay.set(playId, Math.max(0, (this.countsByPlay.get(playId) ?? 1) - 1));
+  /** A position rebuilt at startup holds a slot. */
+  adoptPosition(): void {
+    this.openCount++;
   }
 
   onPositionClosed(pnlEth: number): void {

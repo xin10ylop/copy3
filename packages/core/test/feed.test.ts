@@ -180,6 +180,32 @@ describe('decodeFeedFrame on captured Robinhood Chain frames', () => {
     expect(feedDecodeCounters.parseErrors).toBe(1);
   });
 
+  it('M2: malformed frames/messages never throw and are counted', () => {
+    resetFeedDecodeCounters();
+    const ok = JSON.stringify(frames[0]!.frame);
+    const bad = [
+      '{"messages":[null]}',
+      '{"messages":"x"}',
+      '{"messages":[{"sequenceNumber":"5"}]}',
+      '{"messages":[{"sequenceNumber":-1,"message":{"message":{"header":{"kind":3,"timestamp":1},"l2Msg":"AA=="}}}]}',
+      '{"messages":[{"sequenceNumber":5,"message":{"message":{"header":{"kind":3,"timestamp":1},"l2Msg":12345}}}]}',
+      '{"messages":[{"sequenceNumber":5,"message":{"message":{"header":null,"l2Msg":"AA=="}}}]}',
+      '{"messages":[{"sequenceNumber":5,"message":null}]}',
+      '{"messages":[{"sequenceNumber":5,"message":{"message":{"header":{"kind":3,"timestamp":"x"},"l2Msg":"AA=="}}}]}',
+      'null',
+      '[]',
+    ];
+    for (const f of bad) expect(() => decodeFeedFrame(f, 0)).not.toThrow();
+    expect(decodeFeedFrame('{"messages":[{"sequenceNumber":5,"message":{"message":{"header":{"kind":3,"timestamp":1},"l2Msg":12345}}}]}', 0)).toEqual([
+      expect.objectContaining({ block: 5, timestamp: 1, txs: [] }),
+    ]);
+    expect(feedDecodeCounters.malformed).toBeGreaterThanOrEqual(7);
+    // a good message next to a bad one still decodes
+    const mixed = JSON.parse(ok) as { messages: unknown[] };
+    mixed.messages.unshift(null);
+    expect(decodeFeedFrame(JSON.stringify(mixed), 0)).toHaveLength(1);
+  });
+
   it('builds DecodedTx from RPC data with a known sender', async () => {
     const fx = JSON.parse(
       readFileSync(fileURLToPath(new URL('./fixtures/launch-tx.json', import.meta.url)), 'utf8'),

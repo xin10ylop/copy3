@@ -22,7 +22,7 @@ import {
   updateSnipe,
   type Sql,
 } from '@hood/db';
-import type { ChangeChannel, EventRecord, FeedBlockRow, SnipeRecord, SnipeStats, SniperStore } from './store.js';
+import type { ActiveSnipe, ChangeChannel, EventRecord, FeedBlockRow, SnipeRecord, SnipeStats, SniperStore } from './store.js';
 
 const json = (v: unknown): unknown =>
   JSON.parse(JSON.stringify(v ?? null, (_k, x: unknown) => (typeof x === 'bigint' ? x.toString() : x)));
@@ -72,22 +72,22 @@ export class PgStore implements SniperStore {
     return Object.fromEntries(rows.map((r) => [r.key, r.value]));
   }
 
-  async loadSnipeStats(since: Date): Promise<SnipeStats> {
+  async loadSnipeStats(since: Date, mode: 'live' | 'paper'): Promise<SnipeStats> {
     const counts = await this.sql.query<{ play_id: number; n: string }>(
       `SELECT play_id, count(*)::text AS n FROM snipes
-       WHERE mode = 'live' AND status IN ('pending','open','closed') AND play_id IS NOT NULL GROUP BY play_id`,
+       WHERE mode = $1 AND status IN ('pending','open','closed') AND play_id IS NOT NULL GROUP BY play_id`,
+      [mode],
     );
-    const open = await this.sql.query<{ n: string }>(`SELECT count(*)::text AS n FROM snipes WHERE status IN ('pending','open')`);
-    const pnl = await this.sql.query<{ s: number | null }>(
-      `SELECT sum(realized_pnl_eth) AS s FROM snipes WHERE mode = 'live' AND closed_at >= $1`,
-      [since],
-    );
+    const open = await this.sql.query<{ n: string }>(`SELECT count(*)::text AS n FROM snipes WHERE mode = $1 AND status IN ('pending','open')`, [mode]);
+    const pnl = await this.sql.query<{ s: number | null }>(`SELECT sum(realized_pnl_eth) AS s FROM snipes WHERE mode = $1 AND closed_at >= $2`, [mode, since]);
     const toks = await this.sql.query<{ token: string }>(
-      `SELECT DISTINCT token FROM snipes WHERE status IN ('pending','open','closed') AND token <> ''`,
+      `SELECT DISTINCT token FROM snipes WHERE mode = $1 AND status IN ('pending','open','closed') AND token <> ''`,
+      [mode],
     );
     const pd = await this.sql.query<{ play_id: number; deployer: string | null }>(
       `SELECT DISTINCT play_id, decision->'launch'->'event'->>'deployer' AS deployer FROM snipes
-       WHERE status <> 'aborted' AND play_id IS NOT NULL`,
+       WHERE mode = $1 AND status IN ('pending','open','closed') AND play_id IS NOT NULL`,
+      [mode],
     );
     return {
       countsByPlay: Object.fromEntries(counts.map((c) => [c.play_id, Number(c.n)])),
@@ -96,6 +96,39 @@ export class PgStore implements SniperStore {
       tokens: toks.map((t) => t.token),
       playDeployers: pd.filter((r) => r.deployer).map((r) => ({ playId: r.play_id, deployer: r.deployer! })),
     };
+  }
+
+  async loadActiveSnipes(mode: 'live' | 'paper'): Promise<ActiveSnipe[]> {
+    const rows = await this.sql.query<{
+      id: string;
+      play_id: number | null;
+      token: string;
+      curve: string;
+      mode: 'live' | 'paper';
+      status: 'pending' | 'open';
+      decided_at: Date;
+      decision: unknown;
+      quote_in: string | null;
+      tokens_out: string | null;
+      entry_price: number | null;
+      buy_block: string | number | null;
+      sells: unknown;
+    }>(`SELECT * FROM snipes WHERE mode = $1 AND status IN ('pending','open') ORDER BY id`, [mode]);
+    return rows.map((r) => ({
+      id: Number(r.id),
+      playId: r.play_id ?? 0,
+      token: r.token,
+      curve: r.curve,
+      mode: r.mode,
+      status: r.status,
+      decidedAt: new Date(r.decided_at),
+      decision: r.decision,
+      quoteIn: r.quote_in === null ? null : BigInt(r.quote_in),
+      tokensOut: r.tokens_out === null ? null : BigInt(r.tokens_out),
+      entryPrice: r.entry_price,
+      buyBlock: r.buy_block === null ? null : Number(r.buy_block),
+      sells: r.sells,
+    }));
   }
 
   async onChange(cb: (channel: ChangeChannel, payload: string) => void): Promise<() => Promise<void>> {

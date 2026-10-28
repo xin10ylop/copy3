@@ -69,6 +69,8 @@ export interface FeedDecodeCounters {
   /** L1 header kinds other than 3 (deposits, retryables, batch-posting reports…). */
   nonL2Headers: number;
   parseErrors: number;
+  /** messages with an invalid shape (null, bad sequence number, missing timestamp, non-string l2Msg) */
+  malformed: number;
   lastError?: string;
 }
 
@@ -79,6 +81,7 @@ export const feedDecodeCounters: FeedDecodeCounters = {
   skippedKinds: {},
   nonL2Headers: 0,
   parseErrors: 0,
+  malformed: 0,
 };
 
 export function resetFeedDecodeCounters(): void {
@@ -88,6 +91,7 @@ export function resetFeedDecodeCounters(): void {
   feedDecodeCounters.skippedKinds = {};
   feedDecodeCounters.nonL2Headers = 0;
   feedDecodeCounters.parseErrors = 0;
+  feedDecodeCounters.malformed = 0;
   delete feedDecodeCounters.lastError;
 }
 
@@ -432,53 +436,87 @@ export function decodeL2Message(msg: Uint8Array, out: DecodedTx[], depth = 0): v
   bump(kind);
 }
 
-interface RawFeedMessage {
-  sequenceNumber: number;
-  message?: {
-    message?: {
-      header?: { kind?: number; timestamp?: number };
-      l2Msg?: string;
-    };
-  };
-  blockHash?: string | null;
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/** Sequence number of a feed message, or undefined when the message is malformed. */
+function seqOf(m: unknown): number | undefined {
+  if (!isObj(m)) return undefined;
+  const n = m.sequenceNumber;
+  return typeof n === 'number' && Number.isSafeInteger(n) && n >= 0 ? n : undefined;
+}
+
+/** Lowest/highest valid sequence number in a frame without decoding txs (dedupe, jump checks). */
+export function peekFrameRange(frame: unknown): { min: number; max: number } | undefined {
+  const msgs = isObj(frame) ? frame.messages : undefined;
+  if (!Array.isArray(msgs)) return undefined;
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  for (const m of msgs) {
+    const n = seqOf(m);
+    if (n === undefined) continue;
+    if (n < min) min = n;
+    if (n > max) max = n;
+  }
+  return Number.isFinite(min) ? { min, max } : undefined;
 }
 
 /** Cheap peek at the highest sequence number in a frame without decoding txs (for dedupe). */
 export function peekFrameSequence(frame: unknown): number | undefined {
-  const msgs = (frame as { messages?: RawFeedMessage[] } | null)?.messages;
-  if (!Array.isArray(msgs) || msgs.length === 0) return undefined;
-  return msgs[msgs.length - 1]!.sequenceNumber;
+  return peekFrameRange(frame)?.max;
 }
 
-/** Decode an already JSON-parsed frame. `minBlockExclusive` skips blocks ≤ it (dedupe). */
+/**
+ * Decode an already JSON-parsed frame. `minBlockExclusive` skips blocks ≤ it (dedupe).
+ * Never throws: malformed messages (null, wrong types, missing timestamp, non-string l2Msg)
+ * are skipped and counted in `feedDecodeCounters.malformed`.
+ */
 export function decodeParsedFrame(
   frame: unknown,
   receivedAt: number,
   minBlockExclusive = -1,
 ): FeedBlock[] {
   feedDecodeCounters.frames++;
-  const msgs = (frame as { messages?: RawFeedMessage[] } | null)?.messages;
+  const msgs = isObj(frame) ? frame.messages : undefined;
   if (!Array.isArray(msgs)) return []; // e.g. confirmedSequenceNumberMessage
   const blocks: FeedBlock[] = [];
   for (const m of msgs) {
-    const seq = Number(m.sequenceNumber);
-    if (!Number.isFinite(seq) || seq <= minBlockExclusive) continue;
-    const inner = m.message?.message;
-    const header = inner?.header;
-    const headerKind = header?.kind ?? -1;
+    const seq = seqOf(m);
+    if (seq === undefined) {
+      feedDecodeCounters.malformed++;
+      continue;
+    }
+    if (seq <= minBlockExclusive) continue;
+    const outer = (m as Record<string, unknown>).message;
+    const inner = isObj(outer) && isObj(outer.message) ? outer.message : undefined;
+    const header = inner && isObj(inner.header) ? inner.header : undefined;
+    const ts = header?.timestamp;
+    if (typeof ts !== 'number' || !Number.isSafeInteger(ts) || ts <= 0) {
+      feedDecodeCounters.malformed++;
+      continue;
+    }
+    const headerKind = typeof header?.kind === 'number' ? header.kind : -1;
     const txs: DecodedTx[] = [];
-    if (headerKind === L1_MESSAGE_TYPE_L2_MESSAGE && inner?.l2Msg) {
-      decodeL2Message(Buffer.from(inner.l2Msg, 'base64'), txs);
+    const l2Msg = inner?.l2Msg;
+    if (headerKind === L1_MESSAGE_TYPE_L2_MESSAGE && typeof l2Msg === 'string') {
+      try {
+        decodeL2Message(Buffer.from(l2Msg, 'base64'), txs);
+      } catch (e) {
+        feedDecodeCounters.parseErrors++;
+        feedDecodeCounters.lastError = (e as Error).message.split('\n')[0];
+      }
+    } else if (headerKind === L1_MESSAGE_TYPE_L2_MESSAGE) {
+      feedDecodeCounters.malformed++;
     } else {
       feedDecodeCounters.nonL2Headers++;
     }
     feedDecodeCounters.blocks++;
+    const bh = (m as Record<string, unknown>).blockHash;
     blocks.push({
       block: seq,
-      timestamp: Number(header?.timestamp ?? 0),
+      timestamp: ts,
       txs,
       receivedAt,
-      blockHash: (m.blockHash ?? undefined) as Hex | undefined,
+      blockHash: typeof bh === 'string' && /^0x[0-9a-fA-F]{64}$/.test(bh) ? (bh.toLowerCase() as Hex) : undefined,
       headerKind,
     });
   }

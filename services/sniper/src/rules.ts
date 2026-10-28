@@ -5,6 +5,9 @@
  *
  * Trigger semantics (SPEC §4):
  *   identity matchers: armedWallet, deployerIn, teamWalletsAny, nameRegex, symbolRegex
+ *   In LIVE mode at least one matched identity matcher must be non-spoofable (armedWallet or
+ *   deployerIn: both are bound to the tx signer / TokenLaunched.deployer). name, symbol and
+ *   team wallets are chosen by whoever launches, so on their own they only arm paper runs.
  *   filters (always AND): launchKind, minDevBuyEth, maxDevBuyEth, native-ETH pair token
  *   `require` lists matchers that must ALL match; of the remaining configured matchers at
  *   least one must match (OR). A trigger with no identity matcher never matches (safety: it
@@ -39,8 +42,12 @@ export interface MatchExplanation {
   reasons: string[];
 }
 
+const ANCHORS: readonly TriggerField[] = ['armedWallet', 'deployerIn'];
+
 export class Rules {
   private compiled: CompiledPlay[] = [];
+  constructor(private readonly opts: { mode?: 'live' | 'paper' } = {}) {}
+
   /** playId → wallet → candidate */
   private armed = new Map<number, Map<string, ArmedCandidate>>();
   readonly stats = { evaluations: 0, matches: 0 };
@@ -110,6 +117,12 @@ export class Rules {
     }
     if (out.length) this.stats.matches++;
     return out;
+  }
+
+  /** Re-evaluate one play (after the launch was verified against its receipt). */
+  evaluatePlay(playId: number, ev: LaunchEvent, nowMs: number = Date.now()): { matched: boolean; reasons: string[] } {
+    const c = this.compiled.find((x) => (x.play.id ?? -1) === playId);
+    return c ? this.match(c, ev, nowMs) : { matched: false, reasons: ['play no longer enabled'] };
   }
 
   /** Per-play explanation (matched or not) for logs / the telegram bot. */
@@ -191,6 +204,9 @@ export class Rules {
     const optional = c.configured.filter((f) => !required.has(f));
     const optionalHits = optional.filter((f) => res.get(f));
     if (optional.length > 0 && optionalHits.length === 0) return no(`none of ${optional.join('|')} matched`);
+    if ((this.opts.mode ?? 'live') === 'live' && !ANCHORS.some((a) => res.get(a))) {
+      return no('live play needs a non-spoofable match (armedWallet or deployerIn); name/symbol/team wallets alone only arm paper runs');
+    }
     const reasons = [...res.values()].filter((x): x is string => !!x);
     if (devBuy > 0n) reasons.push(`dev buy ${formatEther(devBuy)} ETH`);
     return { matched: true, reasons };

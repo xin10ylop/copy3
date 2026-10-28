@@ -99,3 +99,69 @@ describe('FeedClient', () => {
     expect(n).toBeGreaterThanOrEqual(3);
   });
 });
+
+describe('FeedClient robustness', () => {
+  it('M2: handleFrame never throws, even without an error listener', () => {
+    const c = new FeedClient({ urls: ['ws://unused'], stats: new FeedStats() });
+    for (const f of ['{"messages":[null]}', '{"messages":[{"sequenceNumber":5,"message":{"message":{"header":{"kind":3,"timestamp":1},"l2Msg":12345}}}]}', 'not json', '{"messages":7}']) {
+      expect(() => c.handleFrame(f, 0)).not.toThrow();
+    }
+    // a throwing block listener does not break delivery of later blocks
+    const c2 = new FeedClient({ urls: ['ws://unused'], stats: new FeedStats() });
+    const seen: number[] = [];
+    c2.on('block', (b) => {
+      seen.push(b.block);
+      throw new Error('listener bug');
+    });
+    expect(() => c2.handleFrame(lines[0]!, 1)).not.toThrow();
+    expect(() => c2.handleFrame(lines[1]!, 2)).not.toThrow();
+    expect(seen).toEqual([100307474, 100307475]);
+  });
+
+  it('L3: a bogus huge sequenceNumber is dropped; real frames keep flowing', () => {
+    const stats = new FeedStats();
+    const c = new FeedClient({ urls: ['ws://unused'], stats });
+    const got: number[] = [];
+    c.on('block', (b) => got.push(b.block));
+    c.handleFrame(lines[0]!, 1);
+    const bogus = JSON.parse(lines[1]!) as { messages: { sequenceNumber: number }[] };
+    bogus.messages[0]!.sequenceNumber = 9_999_999_999;
+    expect(c.handleFrame(JSON.stringify(bogus), 2)).toEqual([]);
+    for (const l of lines.slice(1, 6)) c.handleFrame(l, 3);
+    expect(got).toEqual([100307474, 100307475, 100307476, 100307477, 100307478, 100307479]);
+    expect(stats.snapshot().bogus).toBe(1);
+    expect(c.head).toBe(100307479);
+  });
+
+  it('L3: a head that is genuinely wrong recovers after consistent frames (reset), duplicates are not liveness', async () => {
+    const stats = new FeedStats();
+    const c = new FeedClient({ urls: ['ws://unused'], stats, resetAfter: 3 });
+    const resets: { from: number; to: number }[] = [];
+    c.on('reset', (r) => resets.push(r));
+    // poisoned head (e.g. first frame after connect was bogus)
+    const bogus = JSON.parse(lines[0]!) as { messages: { sequenceNumber: number }[] };
+    bogus.messages[0]!.sequenceNumber = 9_999_999_999;
+    c.handleFrame(JSON.stringify(bogus), 0);
+    const got: number[] = [];
+    c.on('block', (b) => got.push(b.block));
+    for (const l of lines.slice(1, 6)) c.handleFrame(l, 1);
+    expect(resets).toEqual([{ from: 9_999_999_999, to: 100307477 }]);
+    expect(got).toEqual([100307477, 100307478, 100307479]);
+
+    // liveness: a server that only repeats old frames is stale and gets dropped
+    const { wss, url } = await server();
+    let conns = 0;
+    wss.on('connection', (ws) => {
+      conns++;
+      ws.send(lines[0]!);
+      const t = setInterval(() => ws.readyState === ws.OPEN && ws.send(lines[0]!), 10); // duplicates forever
+      ws.on('close', () => clearInterval(t));
+    });
+    const c3 = new FeedClient({ urls: [url], staleMs: 80, reconnectDelayMs: 5 });
+    clients.push(c3);
+    c3.on('error', () => undefined);
+    c3.start();
+    await until(() => conns >= 2, 3000);
+    expect(c3.stats.snapshot().duplicates).toBeGreaterThan(3);
+  });
+});

@@ -1,6 +1,6 @@
 /** Tiny in-process chain on @ethereumjs/vm (Cancun) for contract tests. */
 import { createBlock } from '@ethereumjs/block';
-import { Common, Hardfork, Mainnet } from '@ethereumjs/common';
+import { Common, Hardfork, Mainnet, createCustomCommon } from '@ethereumjs/common';
 import { createFeeMarket1559Tx } from '@ethereumjs/tx';
 import { Address, bytesToHex, createAccount, createAddressFromPrivateKey, hexToBytes } from '@ethereumjs/util';
 import { createVM, runTx, type VM } from '@ethereumjs/vm';
@@ -28,12 +28,25 @@ export class Chain {
   private constructor(
     readonly vm: VM,
     readonly common: Common,
+    readonly chainId: bigint,
   ) {}
 
-  static async create(): Promise<Chain> {
-    const common = new Common({ chain: Mainnet, hardfork: Hardfork.Cancun });
+  /** Cancun chain; `chainId` 4663 makes PonsSniper read deadlines from ArbSys (0x64). */
+  static async create(opts: { chainId?: number } = {}): Promise<Chain> {
+    const common = opts.chainId
+      ? createCustomCommon({ chainId: opts.chainId }, Mainnet, { hardfork: Hardfork.Cancun })
+      : new Common({ chain: Mainnet, hardfork: Hardfork.Cancun });
     const vm = await createVM({ common });
-    return new Chain(vm, common);
+    return new Chain(vm, common, BigInt(opts.chainId ?? 1));
+  }
+
+  /** Install runtime code (and optionally storage slot 0) at an address, e.g. a precompile mock. */
+  async putCode(address: Hex, runtime: Hex, slot0?: bigint): Promise<void> {
+    const a = new Address(hexToBytes(address));
+    await this.vm.stateManager.putCode(a, hexToBytes(runtime));
+    if (slot0 !== undefined) {
+      await this.vm.stateManager.putStorage(a, new Uint8Array(32), hexToBytes(`0x${slot0.toString(16).padStart(64, '0')}`));
+    }
   }
 
   signer(seed: number): Signer {
@@ -68,7 +81,7 @@ export class Chain {
         ...(tx.to ? { to: tx.to } : {}),
         value: tx.value ?? 0n,
         data: tx.data ?? '0x',
-        chainId: 1n,
+        chainId: this.chainId,
       },
       { common: this.common },
     ).sign(from.pk);

@@ -23,7 +23,10 @@ interface IArbSys {
 ///         tokens stay here, pre-approved to the curve, so `exit` is a single call.
 /// @dev    Buys are paid from this contract's ETH balance (fund it via `receive`); burst txs
 ///         should carry `msg.value = 0` so that every member stays executable and the
-///         executor's nonces are always consumed.
+///         executor's nonces are always consumed. Sale proceeds stay in the contract (they
+///         fund the next snipe); the owner sweeps profits with `sweepEth`.
+///         Operator keys are hot: they can only buy real Pons curves (verified against the
+///         immutable factory), at most `maxQuoteIn` per token, once per token.
 contract PonsSniper {
     // ---------------------------------------------------------------- errors / events
     error NotOwner();
@@ -34,29 +37,46 @@ contract PonsSniper {
     error NothingToSell();
     error TransferFailed();
     error ZeroAddress();
+    error MaxTaxTooHigh();
+    error QuoteTooLarge(uint256 quoteIn, uint256 maxQuoteIn);
+    error UnknownCurve();
+    error NotPendingOwner();
 
     event Sniped(address indexed token, address indexed curve, uint256 quoteIn, uint256 tokensOut, uint256 taxBps);
     event Exited(address indexed token, address indexed curve, uint256 tokensIn, uint256 quoteOut);
     event OperatorSet(address indexed operator, bool enabled);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
+    event MaxQuoteInSet(uint256 maxQuoteIn);
 
     // ---------------------------------------------------------------- curve call encoding
     /// @dev buy(uint256 quoteIn, uint256 minTokensOut, address recipient)   — RESEARCH §3, §7.1
     bytes4 internal constant CURVE_BUY = 0x59a87bc1;
     /// @dev sell(uint256 tokensIn, uint256 minQuoteOut, address recipient)  — RESEARCH §3, §7.1
     bytes4 internal constant CURVE_SELL = 0xd04c6983;
+    /// @dev factory getLaunchedToken(address) → LaunchInfo{token, curve, deployer, …} (15 static words)
+    bytes4 internal constant FACTORY_GET_LAUNCHED = 0x3cf28b5a;
+    /// @dev the snipe tax is 9900 in the launch second; a cap at/above it disables the gate
+    uint256 internal constant TAX_CAP_LIMIT = 9900;
 
     // ---------------------------------------------------------------- storage
-    address public owner;
+    address public owner; // packed with maxQuoteIn (one slot)
+    uint96 public maxQuoteIn;
+    address public pendingOwner;
     mapping(address => bool) public operators;
     mapping(address => bool) public bought;
     /// @dev true on Arbitrum Nitro chains: deadlines are L2 block numbers from ArbSys.
     bool public immutable arbBlockNumbers;
+    /// @dev PonsV2LaunchFactory: the only source of truth for token → curve.
+    address public immutable factory;
 
-    constructor(address owner_, address operator_) {
-        if (owner_ == address(0)) revert ZeroAddress();
+    constructor(address owner_, address operator_, address factory_, uint96 maxQuoteIn_) {
+        if (owner_ == address(0) || factory_ == address(0)) revert ZeroAddress();
         owner = owner_;
+        factory = factory_;
+        maxQuoteIn = maxQuoteIn_;
         emit OwnershipTransferred(address(0), owner_);
+        emit MaxQuoteInSet(maxQuoteIn_);
         if (operator_ != address(0)) {
             operators[operator_] = true;
             emit OperatorSet(operator_, true);
@@ -80,7 +100,8 @@ contract PonsSniper {
 
     // ---------------------------------------------------------------- hot path
     /// @notice Buy `token` on `curve` once, only if the snipe tax for this contract is ≤ maxTaxBps.
-    /// @dev Check order keeps revert paths cheap: deadline, auth, bought, tax, then buy.
+    /// @dev Check order keeps revert paths cheap: deadline, tax cap, auth, bought, tax; the buy
+    ///      path then checks maxQuoteIn and that `curve` is the factory's curve for `token`.
     function snipe(
         address curve,
         address token,
@@ -90,11 +111,14 @@ contract PonsSniper {
         uint64 deadlineBlock
     ) external payable {
         if (_blockNumber() > deadlineBlock) revert Expired();
+        if (maxTaxBps >= TAX_CAP_LIMIT) revert MaxTaxTooHigh();
         // operators first: the burst key is an operator, so the common case costs one SLOAD
         if (!operators[msg.sender] && msg.sender != owner) revert NotOperator();
         if (bought[token]) revert AlreadyBought();
         uint256 tax = IPonsCurve(curve).currentSnipeTaxBps(address(this));
         if (tax > maxTaxBps) revert TaxTooHigh(tax);
+        if (quoteIn > maxQuoteIn) revert QuoteTooLarge(quoteIn, maxQuoteIn);
+        _checkCurve(token, curve);
         bought[token] = true;
         uint256 before = IERC20Min(token).balanceOf(address(this));
         _curveBuy(curve, quoteIn, minTokensOut);
@@ -103,13 +127,12 @@ contract PonsSniper {
         emit Sniped(token, curve, quoteIn, tokensOut, tax);
     }
 
-    /// @notice Sell `tokensIn` (0 = everything held) and forward the ETH proceeds to the owner.
+    /// @notice Sell `tokensIn` (> 0) of `token` on its factory curve; proceeds stay in the contract.
     function exit(address curve, address token, uint256 tokensIn, uint256 minQuoteOut)
         external
         onlyOperator
         returns (uint256 quoteOut)
     {
-        if (tokensIn == 0) tokensIn = IERC20Min(token).balanceOf(address(this));
         quoteOut = _exit(curve, token, tokensIn, minQuoteOut);
     }
 
@@ -124,10 +147,23 @@ contract PonsSniper {
         emit OperatorSet(operator, enabled);
     }
 
+    function setMaxQuoteIn(uint96 v) external onlyOwner {
+        maxQuoteIn = v;
+        emit MaxQuoteInSet(v);
+    }
+
+    /// @notice Two-step ownership: the new owner must `acceptOwnership`.
     function transferOwnership(address newOwner) external onlyOwner {
         if (newOwner == address(0)) revert ZeroAddress();
-        emit OwnershipTransferred(owner, newOwner);
-        owner = newOwner;
+        pendingOwner = newOwner;
+        emit OwnershipTransferStarted(owner, newOwner);
+    }
+
+    function acceptOwnership() external {
+        if (msg.sender != pendingOwner) revert NotPendingOwner();
+        emit OwnershipTransferred(owner, msg.sender);
+        owner = msg.sender;
+        pendingOwner = address(0);
     }
 
     /// @notice Send `amount` wei (0 = all) to `to`.
@@ -171,12 +207,20 @@ contract PonsSniper {
         returns (uint256 quoteOut)
     {
         if (tokensIn == 0) revert NothingToSell();
+        _checkCurve(token, curve);
         uint256 before = address(this).balance;
         _curveSell(curve, tokensIn, minQuoteOut);
         quoteOut = address(this).balance - before;
-        (bool ok,) = owner.call{value: quoteOut}("");
-        if (!ok) revert TransferFailed();
         emit Exited(token, curve, tokensIn, quoteOut);
+    }
+
+    /// @dev `curve` must be the factory's curve for `token` (a hot operator key cannot point the
+    ///      contract's ETH at an arbitrary address).
+    function _checkCurve(address token, address curve) internal view {
+        (bool ok, bytes memory ret) = factory.staticcall(abi.encodeWithSelector(FACTORY_GET_LAUNCHED, token));
+        if (!ok || ret.length < 64) revert UnknownCurve();
+        (address t, address c) = abi.decode(ret, (address, address));
+        if (t != token || c != curve || c == address(0)) revert UnknownCurve();
     }
 
     function _approveMax(address token, address spender) internal {

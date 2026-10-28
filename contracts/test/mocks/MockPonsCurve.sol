@@ -131,3 +131,48 @@ contract MockPonsCurve {
 
     receive() external payable {}
 }
+
+/// @notice Factory stand-in: getLaunchedToken(token) → LaunchInfo{token, curve, …} (15 static words).
+contract MockPonsFactory {
+    struct LaunchInfo {
+        address token;
+        address curve;
+        address deployer;
+        address creatorFeeRecipient;
+        uint256 launchConfigId;
+        uint256 graduationThreshold;
+        uint256 creatorTaxBps;
+        uint256 f7;
+        uint256 f8;
+        uint256 f9;
+        uint256 f10;
+        uint256 f11;
+        uint256 f12;
+        uint256 f13;
+        bool f14;
+    }
+
+    mapping(address => address) public curveOf;
+
+    function register(address token, address curve) external {
+        curveOf[token] = curve;
+    }
+
+    function getLaunchedToken(address token) external view returns (LaunchInfo memory info) {
+        address c = curveOf[token];
+        if (c != address(0)) {
+            info.token = token;
+            info.curve = c;
+            info.graduationThreshold = 4.2 ether;
+        }
+    }
+}
+
+/// @notice ArbSys stand-in placed at 0x64 in tests (L2 block number from storage slot 0).
+contract MockArbSys {
+    uint256 public n;
+
+    function arbBlockNumber() external view returns (uint256) {
+        return n;
+    }
+}

@@ -3,11 +3,13 @@
  * the launch receipt; everything else is off the decide path. `ViemChain` is the real
  * implementation (own node http + ws); tests use fakes.
  */
+import { sniperAbi } from '@hood/contracts';
 import {
   MULTICALL3,
   PONS_V2,
   curveAbi,
   factoryAbi,
+  parseTokenLaunchedLog,
   tokenAbi,
   type RawLog,
   type Reserves,
@@ -32,8 +34,22 @@ export interface ReceiptLite {
   logs: RawLog[];
 }
 
+/** What the PonsSniper contract holds for a token (chain truth for reconciliation). */
+export interface SniperHolding {
+  bought: boolean;
+  balance: bigint;
+}
+
 export interface ChainClient {
   getReserves(curve: Address, blockNumber?: number): Promise<Reserves>;
+  getBlockNumber(): Promise<number>;
+  /** sniper.bought(token) + token.balanceOf(sniper) */
+  readSniper(sniper: Address, token: Address): Promise<SniperHolding>;
+  /** curve.graduated() — sells on the curve revert once true */
+  curveGraduated(curve: Address): Promise<boolean>;
+  estimateGas(tx: { from: Address; to: Address; data: Hex; value?: bigint }): Promise<bigint>;
+  /** most recent TokenLaunched {token, curve} within `lookbackBlocks` (startup checks) */
+  recentLaunch(lookbackBlocks: number): Promise<{ token: Address; curve: Address } | null>;
   getTransactionCount(address: Address, tag: 'latest' | 'pending'): Promise<number>;
   getReceipt(hash: Hex): Promise<ReceiptLite | null>;
   getGasPrice(): Promise<bigint>;
@@ -77,6 +93,40 @@ export class ViemChain implements ChainClient {
 
   getTransactionCount(address: Address, tag: 'latest' | 'pending'): Promise<number> {
     return this.http.getTransactionCount({ address, blockTag: tag });
+  }
+
+  async getBlockNumber(): Promise<number> {
+    return Number(await this.http.getBlockNumber({ cacheTime: 0 }));
+  }
+
+  async readSniper(sniper: Address, token: Address): Promise<SniperHolding> {
+    const [bought, balance] = await Promise.all([
+      this.http.readContract({ address: sniper, abi: sniperAbi, functionName: 'bought', args: [token] }),
+      this.http.readContract({ address: token, abi: tokenAbi, functionName: 'balanceOf', args: [sniper] }),
+    ]);
+    return { bought, balance };
+  }
+
+  curveGraduated(curve: Address): Promise<boolean> {
+    return this.http.readContract({ address: curve, abi: curveAbi, functionName: 'graduated' });
+  }
+
+  estimateGas(tx: { from: Address; to: Address; data: Hex; value?: bigint }): Promise<bigint> {
+    return this.http.estimateGas({ account: tx.from, to: tx.to, data: tx.data, value: tx.value ?? 0n });
+  }
+
+  async recentLaunch(lookbackBlocks: number): Promise<{ token: Address; curve: Address } | null> {
+    const head = await this.http.getBlockNumber();
+    const logs = await this.http.getLogs({
+      address: PONS_V2.factory as Address,
+      event: getAbiItem({ abi: factoryAbi, name: 'TokenLaunched' }),
+      fromBlock: head - BigInt(lookbackBlocks),
+      toBlock: head,
+    });
+    const last = logs.at(-1);
+    if (!last) return null;
+    const p = parseTokenLaunchedLog(toRaw(last as Log));
+    return { token: p.token as Address, curve: p.curve as Address };
   }
 
   async getReceipt(hash: Hex): Promise<ReceiptLite | null> {

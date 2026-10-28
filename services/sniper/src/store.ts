@@ -28,6 +28,23 @@ export interface SnipeRecord {
   notes?: string | null;
 }
 
+/** A pending/open snipe row to reconcile at startup. */
+export interface ActiveSnipe {
+  id: number;
+  playId: number;
+  token: string;
+  curve: string;
+  mode: 'live' | 'paper';
+  status: 'pending' | 'open';
+  decidedAt: Date;
+  decision: unknown;
+  quoteIn: bigint | null;
+  tokensOut: bigint | null;
+  entryPrice: number | null;
+  buyBlock: number | null;
+  sells: unknown;
+}
+
 export interface SnipeStats {
   countsByPlay: Record<number, number>;
   openCount: number;
@@ -54,7 +71,9 @@ export interface SniperStore {
   loadPlays(): Promise<Play[]>;
   loadArmed(): Promise<ArmedCandidate[]>;
   loadSettings(): Promise<Record<string, unknown>>;
-  loadSnipeStats(since: Date): Promise<SnipeStats>;
+  /** risk aggregates for ONE mode (paper runs never affect live limits and vice versa) */
+  loadSnipeStats(since: Date, mode: 'live' | 'paper'): Promise<SnipeStats>;
+  loadActiveSnipes(mode: 'live' | 'paper'): Promise<ActiveSnipe[]>;
   onChange(cb: (channel: ChangeChannel, payload: string) => void): Promise<() => Promise<void>>;
   insertSnipe(s: SnipeRecord): Promise<number>;
   updateSnipe(id: number, patch: Partial<SnipeRecord>): Promise<void>;
@@ -92,20 +111,42 @@ export class MemoryStore implements SniperStore {
   async loadSettings(): Promise<Record<string, unknown>> {
     return { ...this.settings };
   }
-  async loadSnipeStats(since: Date): Promise<SnipeStats> {
-    const all = [...this.snipes.values()];
-    const live = all.filter((s) => s.mode === 'live');
+  async loadSnipeStats(since: Date, mode: 'live' | 'paper'): Promise<SnipeStats> {
+    const all = [...this.snipes.values()].filter((s) => s.mode === mode);
     const countsByPlay: Record<number, number> = {};
-    for (const s of live) if (s.status !== 'aborted' && s.status !== 'failed') countsByPlay[s.playId] = (countsByPlay[s.playId] ?? 0) + 1;
+    for (const s of all) if (s.status === 'pending' || s.status === 'open' || s.status === 'closed') countsByPlay[s.playId] = (countsByPlay[s.playId] ?? 0) + 1;
+    const deployers = new Map<string, { playId: number; deployer: string }>();
+    for (const s of all) {
+      if (s.status === 'aborted' || s.status === 'failed') continue;
+      const d = (s.decision as { launch?: { event?: { deployer?: string } } } | null)?.launch?.event?.deployer;
+      if (d) deployers.set(`${s.playId}:${d}`, { playId: s.playId, deployer: d });
+    }
     return {
       countsByPlay,
       openCount: all.filter((s) => s.status === 'open' || s.status === 'pending').length,
-      realizedPnlSince: live
-        .filter((s) => s.closedAt && s.closedAt >= since)
-        .reduce((a, s) => a + (s.realizedPnlEth ?? 0), 0),
-      tokens: all.filter((s) => s.status !== 'aborted').map((s) => s.token),
-      playDeployers: [],
+      realizedPnlSince: all.filter((s) => s.closedAt && s.closedAt >= since).reduce((a, s) => a + (s.realizedPnlEth ?? 0), 0),
+      tokens: all.filter((s) => s.status !== 'aborted' && s.status !== 'failed' && s.token).map((s) => s.token),
+      playDeployers: [...deployers.values()],
     };
+  }
+  async loadActiveSnipes(mode: 'live' | 'paper'): Promise<ActiveSnipe[]> {
+    return [...this.snipes.entries()]
+      .filter(([, s]) => s.mode === mode && (s.status === 'pending' || s.status === 'open'))
+      .map(([id, s]) => ({
+        id,
+        playId: s.playId,
+        token: s.token,
+        curve: s.curve,
+        mode: s.mode,
+        status: s.status as 'pending' | 'open',
+        decidedAt: s.decidedAt,
+        decision: s.decision,
+        quoteIn: s.quoteIn ?? null,
+        tokensOut: s.tokensOut ?? null,
+        entryPrice: s.entryPrice ?? null,
+        buyBlock: s.buyBlock ?? null,
+        sells: s.sells,
+      }));
   }
   async onChange(cb: (channel: ChangeChannel, payload: string) => void): Promise<() => Promise<void>> {
     this.listeners.push(cb);

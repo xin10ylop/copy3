@@ -1,9 +1,12 @@
 /**
  * LaunchDetector: feed block → Pons V2 launches (before execution results are known).
  *
- * Hot path: a synchronous prefilter on `tx.to ∈ {factory, launchAndBuyRouter}` or
- * `selector ∈ launch selectors` (no allocation for the ~99.9 % of txs that are not launches),
- * then ABI-decode + lazy sender recovery for the few candidates.
+ * Hot path: a synchronous prefilter on `tx.to ∈ {factory, launchAndBuyRouter, configured
+ * launchers}` AND `selector ∈ launch selectors` (no allocation for the ~99.9 % of txs that are
+ * not launches), then ABI-decode + lazy sender recovery for the few candidates. A launch-shaped
+ * calldata sent anywhere else is ignored: anyone can put `launchTokenFor(…, deployer = <a wallet
+ * we follow>)` into a tx to their own contract (reviewer PoC5). Even a launch tx to the factory is
+ * only a hint until its receipt shows a TokenLaunched from the factory with the same deployer.
  *
  * Token/curve addresses: the TokenLaunched log (node ws) or the launch receipt resolves them
  * (`resolve()`), ~100-200 ms after the launch block. Optional nonce-based CREATE prediction
@@ -30,6 +33,8 @@ export interface LaunchDetectorOptions {
   router?: Address;
   launchDeployer?: Address;
   prediction?: 'none' | 'nonce';
+  /** extra contracts allowed to launch (whitelisted launchers); default none */
+  launchers?: readonly string[];
   /** skip (but still account for) launches whose block arrived later than this (replays) */
   maxLaunchAgeMs?: number;
 }
@@ -38,6 +43,8 @@ export interface ResolvedAddresses {
   token: Address;
   curve: Address;
   source: 'nonce' | 'log' | 'receipt' | 'fallback';
+  /** TokenLaunched.deployer (must equal the launch event's deployer) */
+  deployer?: Address;
 }
 
 const LAUNCH_SELECTORS = new Set<string>([
@@ -56,6 +63,7 @@ export class LaunchDetector {
   readonly factory: Address;
   readonly router: Address;
   readonly launchDeployer: Address;
+  private readonly launchers: Set<string>;
   private prediction: 'none' | 'nonce';
   private readonly maxLaunchAgeMs: number;
   private deployerNonce: bigint | null = null;
@@ -65,12 +73,13 @@ export class LaunchDetector {
   private readonly waiters = new Map<string, Waiter[]>();
   /** addresses that arrived before the feed tx was processed */
   private readonly early = new Map<string, ResolvedAddresses>();
-  readonly stats = { candidates: 0, launches: 0, stale: 0, parseErrors: 0, predictedOk: 0, predictedBad: 0 };
+  readonly stats = { candidates: 0, launches: 0, stale: 0, parseErrors: 0, predictedOk: 0, predictedBad: 0, deployerMismatch: 0 };
 
   constructor(opts: LaunchDetectorOptions = {}) {
     this.factory = (opts.factory ?? PONS_V2.factory).toLowerCase() as Address;
     this.router = (opts.router ?? PONS_V2.launchAndBuyRouter).toLowerCase() as Address;
     this.launchDeployer = (opts.launchDeployer ?? PONS_V2.launchDeployer).toLowerCase() as Address;
+    this.launchers = new Set([this.factory, this.router, ...(opts.launchers ?? []).map((a) => a.toLowerCase())]);
     this.prediction = opts.prediction ?? 'none';
     this.maxLaunchAgeMs = opts.maxLaunchAgeMs ?? 2500;
   }
@@ -88,13 +97,13 @@ export class LaunchDetector {
     return this.deployerNonce;
   }
 
-  /** Synchronous prefilter (no allocation for non-launch txs). */
+  /** Synchronous prefilter: launch selector sent to the factory/router/whitelisted launcher. */
   isCandidate(tx: DecodedTx): boolean {
-    return (
-      tx.to === this.factory ||
-      tx.to === this.router ||
-      (tx.selector !== null && LAUNCH_SELECTORS.has(tx.selector))
-    );
+    return tx.to !== null && tx.selector !== null && this.launchers.has(tx.to) && LAUNCH_SELECTORS.has(tx.selector);
+  }
+
+  isLauncher(to: string | null | undefined): boolean {
+    return !!to && this.launchers.has(to.toLowerCase());
   }
 
   /** Decode every launch in a feed block. Senders are recovered only for launch txs. */
@@ -134,7 +143,8 @@ export class LaunchDetector {
       const early = this.early.get(tx.hash);
       if (early) {
         this.early.delete(tx.hash);
-        this.apply(launch, early);
+        if (!early.deployer || early.deployer.toLowerCase() === launch.event.deployer.toLowerCase()) this.apply(launch, early);
+        else this.stats.deployerMismatch++;
       }
       this.stats.launches++;
       if (stale) {
@@ -162,6 +172,11 @@ export class LaunchDetector {
   resolve(txHash: Hex, addrs: ResolvedAddresses): DetectedLaunch | undefined {
     const key = txHash.toLowerCase();
     const l = this.launches.get(key);
+    if (l && addrs.deployer && addrs.deployer.toLowerCase() !== l.event.deployer.toLowerCase()) {
+      // a TokenLaunched for a different deployer in this tx: never let it stand in for ours
+      this.stats.deployerMismatch++;
+      return undefined;
+    }
     if (this.prediction === 'nonce' && addrs.source !== 'nonce') this.reconcileNonce(l, addrs);
     if (!l) {
       this.early.set(key, addrs);

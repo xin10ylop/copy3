@@ -7,7 +7,7 @@
 import { EventEmitter } from 'node:events';
 import WebSocket from 'ws';
 import { nowMs } from '../clock.js';
-import { decodeParsedFrame, peekFrameSequence, type FeedBlock } from './decode.js';
+import { decodeParsedFrame, peekFrameRange, type FeedBlock } from './decode.js';
 import { FeedStats, feedStats as defaultFeedStats } from './stats.js';
 
 /** Minimal websocket surface the client needs (lets tests inject fakes). */
@@ -35,6 +35,13 @@ export interface FeedClientOptions {
   pingIntervalMs?: number;
   /** Ask the server to replay from the next expected block after a reconnect. Default true. */
   requestReplay?: boolean;
+  /**
+   * A frame whose sequence numbers are more than this many blocks away from the head (ahead or
+   * behind) is suspicious and dropped, unless `resetAfter` consecutive, mutually consistent
+   * suspicious frames confirm a genuine reset. Default 50 000 (~1.4 h of blocks).
+   */
+  maxJump?: number;
+  resetAfter?: number;
   now?: () => number;
   stats?: FeedStats;
   createSocket?: (url: string, headers: Record<string, string>) => FeedSocket;
@@ -51,6 +58,7 @@ export interface FeedClientEvents {
   connected: [string];
   disconnected: [{ url: string; reason: string }];
   error: [Error];
+  reset: [{ from: number; to: number }];
 }
 
 export class FeedClient extends EventEmitter<FeedClientEvents> {
@@ -65,6 +73,7 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
   private lastFrameAt = 0;
   private connectedAt = 0;
   private lastBlock = -1;
+  private suspect: { max: number; count: number } | null = null;
   private watchdog: NodeJS.Timeout | null = null;
   private pinger: NodeJS.Timeout | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
@@ -80,6 +89,8 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
       primaryRetryMs: options.primaryRetryMs ?? 30_000,
       pingIntervalMs: options.pingIntervalMs ?? 10_000,
       requestReplay: options.requestReplay ?? true,
+      maxJump: options.maxJump ?? 50_000,
+      resetAfter: options.resetAfter ?? 3,
     };
     this.now = options.now ?? nowMs;
     this.stats = options.stats ?? defaultFeedStats;
@@ -88,6 +99,11 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
       ((url, headers) =>
         // the Robinhood feed rejects clients that do not offer permessage-deflate (HTTP 400 "Compression is required")
         new WebSocket(url, { perMessageDeflate: true, headers, handshakeTimeout: 5000 }) as FeedSocket);
+  }
+
+  /** `error` without a listener would throw (EventEmitter semantics); never let it. */
+  private reportError(e: Error): void {
+    if (this.listenerCount('error') > 0) this.emit('error', e);
   }
 
   /** Highest block delivered so far (-1 before the first). */
@@ -118,18 +134,45 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
     s?.terminate();
   }
 
-  /** Feed a raw text frame (used by the socket handler, replays and tests). */
+  /**
+   * Feed a raw text frame (used by the socket handler, replays and tests). Never throws.
+   * Returns the new in-order blocks it delivered (only those count as feed liveness).
+   */
   handleFrame(text: string, receivedAt: number): FeedBlock[] {
+    try {
+      return this.handleFrameUnsafe(text, receivedAt);
+    } catch (e) {
+      this.reportError(new Error(`feed: frame handling failed: ${(e as Error).message}`));
+      return [];
+    }
+  }
+
+  private handleFrameUnsafe(text: string, receivedAt: number): FeedBlock[] {
     let frame: unknown;
     try {
       frame = JSON.parse(text);
     } catch (e) {
-      this.emit('error', new Error(`feed: bad JSON frame: ${(e as Error).message}`));
+      this.reportError(new Error(`feed: bad JSON frame: ${(e as Error).message}`));
       return [];
     }
-    const top = peekFrameSequence(frame);
-    if (top === undefined) return [];
-    if (top <= this.lastBlock) {
+    const range = peekFrameRange(frame);
+    if (range === undefined) return [];
+    let reset = false;
+    const { maxJump, resetAfter } = this.opts;
+    if (this.lastBlock >= 0 && (range.min > this.lastBlock + maxJump || range.max < this.lastBlock - maxJump)) {
+      // far from our head: a bogus frame, or a genuine reset (chain restart / our head is wrong)
+      const consistent = this.suspect !== null && range.min > this.suspect.max && range.min - this.suspect.max <= maxJump;
+      this.suspect = { max: range.max, count: consistent ? this.suspect!.count + 1 : 1 };
+      this.stats.bogus++;
+      if (this.suspect.count < resetAfter) return [];
+      this.reportError(new Error(`feed: sequence reset ${this.lastBlock} → ${range.min} confirmed by ${resetAfter} frames`));
+      this.emit('reset', { from: this.lastBlock, to: range.min });
+      this.stats.resets++;
+      this.lastBlock = range.min - 1;
+      reset = true;
+    }
+    this.suspect = null;
+    if (range.max <= this.lastBlock) {
       this.stats.duplicates++;
       return [];
     }
@@ -137,14 +180,21 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
     const blocks = decodeParsedFrame(frame, receivedAt, this.lastBlock);
     const decodeMs = this.now() - t0;
     for (const b of blocks) {
-      if (this.lastBlock >= 0 && b.block > this.lastBlock + 1) {
+      if (b.block <= this.lastBlock) continue; // out-of-order inside a frame
+      if (!reset && this.lastBlock >= 0 && b.block > this.lastBlock + 1) {
         const gap = { from: this.lastBlock + 1, to: b.block - 1 };
         this.stats.recordGap(gap.from, gap.to);
         this.emit('gap', gap);
       }
+      reset = false;
       this.lastBlock = b.block;
+      this.lastFrameAt = receivedAt; // liveness only advances on new in-order blocks
       this.stats.recordBlock(b, decodeMs / blocks.length);
-      this.emit('block', b);
+      try {
+        this.emit('block', b);
+      } catch (e) {
+        this.reportError(new Error(`feed: block listener threw: ${(e as Error).message}`));
+      }
     }
     return blocks;
   }
@@ -184,13 +234,15 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
     });
     sock.on('message', (data, isBinary) => {
       const receivedAt = this.now();
-      if (this.socket !== sock) return;
-      this.lastFrameAt = receivedAt;
-      if (isBinary) return;
-      this.handleFrame(typeof data === 'string' ? data : data.toString(), receivedAt);
+      if (this.socket !== sock || isBinary) return;
+      try {
+        this.handleFrame(typeof data === 'string' ? data : data.toString(), receivedAt);
+      } catch {
+        /* handleFrame never throws; belt and braces inside the ws handler */
+      }
     });
     sock.on('error', (err) => {
-      if (this.socket === sock) this.emit('error', err);
+      if (this.socket === sock) this.reportError(err);
     });
     sock.on('close', (code, reason) => {
       if (this.socket !== sock) return;
@@ -226,7 +278,7 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
     if (!s) return;
     const now = this.now();
     if (now - this.lastFrameAt > this.opts.staleMs) {
-      this.emit('error', new Error(`feed stale for ${Math.round(now - this.lastFrameAt)} ms`));
+      this.reportError(new Error(`feed stale for ${Math.round(now - this.lastFrameAt)} ms`));
       this.socket = null;
       s.terminate();
       this.onDown(this.opts.urls[this.urlIndex]!, 'stale');

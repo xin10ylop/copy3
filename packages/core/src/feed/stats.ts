@@ -12,6 +12,9 @@ export interface FeedStatsSnapshot {
   gaps: number;
   gapBlocks: number;
   duplicates: number;
+  /** frames dropped because their sequence numbers were implausibly far from the head */
+  bogus: number;
+  resets: number;
   reconnects: number;
   failovers: number;
   currentUrl: string | null;
@@ -25,6 +28,8 @@ export class FeedStats {
   gaps = 0;
   gapBlocks = 0;
   duplicates = 0;
+  bogus = 0;
+  resets = 0;
   reconnects = 0;
   failovers = 0;
   currentUrl: string | null = null;
@@ -90,6 +95,8 @@ export class FeedStats {
       gaps: this.gaps,
       gapBlocks: this.gapBlocks,
       duplicates: this.duplicates,
+      bogus: this.bogus,
+      resets: this.resets,
       reconnects: this.reconnects,
       failovers: this.failovers,
       currentUrl: this.currentUrl,
