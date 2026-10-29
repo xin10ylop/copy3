@@ -119,6 +119,12 @@ export class PaperBankroll {
     const b = this.startWei + this.realizedWei - this.committedWei;
     return b > 0n ? b : 0n;
   }
+
+  /** Free + committed: the whole paper bankroll, the base for the daily-loss percentage. */
+  totalWei(): bigint {
+    const b = this.startWei + this.realizedWei;
+    return b > 0n ? b : 0n;
+  }
 }
 
 function toWei(x: number): bigint {

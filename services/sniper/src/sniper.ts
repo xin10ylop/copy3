@@ -266,9 +266,25 @@ export class Sniper {
     return this.paperBank ? this.paperBank.balanceWei() : (this.o.backend.bankrollWei?.() ?? null);
   }
 
+  /**
+   * The daily-loss percentage base is the WHOLE bankroll: free balance + the cost of the open
+   * positions. `bankrollWei()` is the free balance (paper: start + realised − committed; live:
+   * the contract's ETH, which drops while positions are open), so the first sample of the day
+   * taken with three positions open gave a base of 0.024 ETH on a 0.127 ETH bankroll (Ohio,
+   * 29 Oct 2026) — a 0.0036 ETH limit that a normal losing streak trips.
+   */
   private feedBankroll(): void {
+    this.risk.setBankroll(this.totalBankrollEth());
+  }
+
+  /** Free bankroll + cost basis of the open positions (ETH); null when the free figure is unknown. */
+  totalBankrollEth(): number | null {
+    if (this.paperBank) return Number(this.paperBank.totalWei()) / 1e18;
     const b = this.bankrollWei();
-    this.risk.setBankroll(b === null ? null : Number(b) / 1e18);
+    if (b === null) return null;
+    let open = 0n;
+    for (const p of this.positions.open) open += p.costBasis;
+    return Number(b + open) / 1e18;
   }
 
   /** Creator tax for a curve we have seen launch (paper fills/exits). */

@@ -281,3 +281,13 @@ Tests (`services/indexer/test/log-follower.test.ts`):
 - a checkpoint 7,401 blocks behind: 4 consecutive ranges ≤ 2,000 blocks, each block exactly once.
 - `eth_getLogs` short of the subscription → range retried; a `removed` log → rollback from
   `block - REORG_DEPTH` and identical rows after re-indexing.
+
+### R-1 — daily-loss base sampled the free balance (fixed)
+
+`Risk.setBankroll` takes the first bankroll figure of the UTC day as the base for
+`DAILY_LOSS_LIMIT_PCT`. The sniper fed it the FREE balance (paper: start + realised − committed;
+live: the contract's ETH, which drops while positions are open). Ohio, 29 Oct 2026: sampled with
+three positions open → base 0.024 ETH on a 0.127 ETH bankroll → limit 0.0036 ETH, which a normal
+losing streak trips. Now `Sniper.totalBankrollEth()` = free + cost basis of the open positions
+(paper: `PaperBankroll.totalWei()`). Tests: `sizing.test.ts` "totalWei", `paper-e2e.test.ts`
+(base stays 0.1 with 0.07 open).

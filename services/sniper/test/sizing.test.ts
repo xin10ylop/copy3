@@ -42,6 +42,18 @@ describe('sizeBuy (Preset.sizing)', () => {
 });
 
 describe('PaperBankroll (paper compounding)', () => {
+  it('totalWei is free + committed: the daily-loss base does not shrink while positions are open', () => {
+    const b = new PaperBankroll(eth('0.1'));
+    b.commit('a', eth('0.025'));
+    b.commit('b', eth('0.025'));
+    b.commit('c', eth('0.025'));
+    expect(b.balanceWei()).toBe(eth('0.025'));
+    expect(b.totalWei()).toBe(eth('0.1'));
+    b.close('a', 0.01);
+    expect(b.totalWei()).toBe(eth('0.11'));
+    expect(b.balanceWei()).toBe(eth('0.06'));
+  });
+
   it('commits on decide, releases on no-fill, books PnL on close', () => {
     const b = new PaperBankroll(eth('0.1'));
     b.commit('a', eth('0.01'));

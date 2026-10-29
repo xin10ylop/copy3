@@ -122,6 +122,9 @@ describe('paper mode end-to-end (AMLIL timeline on the SHIBA launch fixture)', (
     const want = quoteBuy(afterTeam(), parseEther('0.07'), CURVE_FEE_BPS, 0, snipeTaxWeiFor(parseEther('0.07'), 618));
     expect(run.fill).toMatchObject({ block: LAUNCH.block + 8, ts: T + 1, taxBps: 618, tokensOut: want, taxPaid: 4_326_000_000_000_000n });
     expect(h.chain.calls).toContain(`getReserves:${LAUNCH.curve}:${LAUNCH.block + 7}`);
+    // the daily-loss base is the whole bankroll (free + the open position's 0.07), not the free balance
+    expect(h.sniper.bankrollWei()).toBe(parseEther('0.03'));
+    expect(h.sniper.totalBankrollEth()).toBeCloseTo(0.1, 12);
     const pos = h.sniper.positions.get(run.key)!;
     expect(pos).toBeDefined();
 
