@@ -418,6 +418,12 @@ export class Sniper {
       // burst of settings writes causes one reload (R4-5 generations keep the newest load).
       const key = tryParse<{ key?: string }>(payload)?.key ?? '';
       if (/checkpoint|^indexer:|^sweep:/.test(key)) return;
+      if (key === 'kill_switch' || key === '' || key === 'daily_loss' || key === 'auto_approve') {
+        // safety keys and unknown payloads reload at once; never debounce the kill switch
+        await this.loadConfig('settings', 'notify');
+        this.o.logger.info({ channel, key, plays: this.rules.playCount, armed: this.rules.armedCount }, 'config refreshed');
+        return;
+      }
       if (this.settingsReloadTimer) return;
       this.settingsReloadTimer = setTimeout(() => {
         this.settingsReloadTimer = null;
