@@ -29,8 +29,14 @@ export type Channel = (typeof CHANNELS)[keyof typeof CHANNELS];
 export function createDb(url: string, opts: { max?: number } = {}): Sql {
   const client = postgres(url, {
     max: opts.max ?? 10,
-    // keep bigints/numerics as strings (lossless for wei); we convert at the edges
-    types: {},
+    // keep bigints/numerics as strings (lossless for wei); we convert at the edges.
+    // json/jsonb: every helper passes pre-serialised JSON text for `$n::jsonb` parameters;
+    // postgres.js would JSON.stringify that string again (double encoding, stored as a JSON
+    // string). Strings are therefore passed through untouched; objects are serialised once.
+    types: {
+      json: { to: 114, from: [114], serialize: (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v)), parse: (v: string) => JSON.parse(v) },
+      jsonb: { to: 3802, from: [3802], serialize: (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v)), parse: (v: string) => JSON.parse(v) },
+    },
   }) as unknown as PostgresClient;
   return fromPostgres(client);
 }
