@@ -151,3 +151,74 @@ Preset: no fixed TP, trailing 50/20, SL 40 %, timeout 60 s, dump exit. "Race win
 Per-trade win rate is 52 % (≥ 0.1 signal) / 38 % (any team buy); the median trade
 is a small loss and the day is carried by the runners. Scale linearly with size up to
 the ~0.3 ETH impact ceiling.
+
+---
+
+# Backtest #3 – thirty days (2026-09-28 → 2026-10-28), full data via Alchemy
+
+Data: 82,192 launches (60,484 ETH-paired) over 30.0 days, 2.0M curve events, 943k
+block timestamps (94 % of the needed set; the rest errored on the RPC and those
+launches are skipped), ERC-20 transfers for all 29k tokens with team exemptions
+(2,062 observed dumps). Replay sanity: tokensOut error 0.0 on every day, snipe-tax
+ratio at +1 s exactly 0.0618 every day (the Pons parameters did not change during
+the month). Raw results: `docs/backtest-month-results.txt`; per-launch rows:
+`docs/backtest-month-per-launch.csv.gz`. Scripts: `scripts/backtest/`.
+
+## Market shape
+
+Launch volume fell from ~5,100/day (end of September) to ~1,000/day (last week).
+Mean number of taxed buyers in the +1 s second dropped from 1.3 to 0.4-0.8 mid-month
+and rose back to 1.4-1.6 in the last week (more bots). Team-buy launches: ~290/day
+early, ~170/day now.
+
+## Month totals at 0.07 ETH, best preset (no TP, trail 50/20, SL 40, t/o 60, dump exit)
+
+| Segment | n | first in block | last in block | mean/trade (first) | negative days (first) |
+|---|---|---|---|---|---|
+| all launches | 60,484 | −120.6 ETH | −272.7 | −0.0020 | 9 / 31 |
+| any team buy | 9,022 | **+22.3 ETH** | −19.1 | +0.0025 | 10 / 31 |
+| team buy ≥ 0.1 ETH | 4,989 | **+14.8 ETH** | −16.7 | +0.0030 | 7 / 31 |
+| team buy ≥ 0.2 ETH | 3,882 | +11.4 ETH | −15.4 | +0.0029 | 8 / 31 |
+| dev bought, no team | 37,744 | −82.3 | −177.2 | −0.0022 | – |
+| nobody bought | 13,718 | −60.5 | −76.4 | −0.0044 | – |
+
+Threshold: 0.05-0.15 ETH minimum team buy gives the same +0.003/trade; ≥ 0.5 ETH
+collapses to +0.0006. Dev-buy size alone never reaches positive expectancy.
+
+## Weekly walk-forward (fit on all previous weeks, test the next week)
+
+Team ≥ 0.1: +0.0003, +0.0028, +0.0072, +0.0085, +0.0054 ETH/trade in the five test
+weeks — positive every week, and the fitted preset was identical every week (no TP,
+trailing 50/20, SL 40, timeout 60, dump exit). The video preset was negative in two
+of five weeks for the broad team segment.
+
+## Daily distribution (bootstrap over the month, 0.07 ETH)
+
+| Signal | race win | P(losing day) | median day | p10 / p90 |
+|---|---|---|---|---|
+| team ≥ 0.1 (~161/day) | 100 % | 12 % | +0.44 ETH | −0.04 / +1.01 |
+| | 75 % | 31 % | +0.19 | −0.28 / +0.74 |
+| | 50 % | 58 % | −0.07 | −0.48 / +0.46 |
+| any team (~291/day) | 100 % | 9 % | +0.67 | +0.04 / +1.48 |
+| | 50 % | 49 % | +0.01 | −0.55 / +0.69 |
+
+The three-day numbers were an unusually good stretch; over the month the per-trade
+edge is about +4 % of size and it needs a high race win rate to stay positive.
+
+## Operators
+
+39,670 clusters, one factory with 5,123 launches (+14.3 ETH over the month at
+0.07, 31 % win) and one toxic team-buy operator with 639 launches, 0 % win,
+−4.2 ETH — which is why the nightly blacklist exists. Operator selection
+walk-forward (≥ 5 prior launches, positive, ≥ 40 % win), trading their next week's
+launches: +0.0033, −0.0014, +0.0098, +0.0015, +0.0115 ETH/trade; last week +1.66 ETH
+on 144 trades. Operator selection carries a higher per-trade edge than the generic
+fingerprint and is the layer the scout automates.
+
+## What changes in the defaults
+
+* Keep `team-buy-0.1` as the always-on play; the ≥ 0.05 variant adds trades at the
+  same edge and can be enabled after the paper week.
+* Operator blacklisting is not optional: one operator alone would have cost 4.2 ETH.
+* Expectation to plan with: at 0.07 ETH, +0.3 to +0.5 ETH on a typical day *if* we
+  win most races, with one losing day in roughly eight; scale by size.
