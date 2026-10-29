@@ -5,19 +5,17 @@
  * in-memory book de-duplicates trades/transfers already in the DB.
  *
  * ETH transfers / wallets are NOT in logs; use `--mode blocks` (full block scan,
- * needs an own node) for those.
+ * needs an own node) for those. The per-range work lives in log-range.ts and is shared
+ * with the live indexer's INDEXER_MODE=logs (log-follower.ts).
  */
 import type { ChainReader } from './chain.js';
-import { hexToNum } from './hex.js';
 import { errMsg, type Log } from './log.js';
-import { INDEXED_TOPICS, PONS_TOPICS, decodePonsLogs, ponsLogAllowed } from './pons.js';
-import { launchesInBatch, metricsFor, processEvents, type TxInfo } from './process.js';
+import { processLogRange } from './log-range.js';
 import type { BlockPipeline } from './pipeline.js';
-import { chunkList, chunkRanges, splitRange, type BlockRange } from './ranges.js';
-import { RpcError } from './rpc.js';
+import { chunkRanges, type BlockRange } from './ranges.js';
 import type { IndexerStore } from './store.js';
-import { extractTokenTransfers } from './token-transfers.js';
-import type { Address, Hex, RpcLog } from './types.js';
+
+export { getLogsSplitting } from './log-range.js';
 
 export interface BackfillOptions {
   from: number;
@@ -39,25 +37,6 @@ export interface BackfillStats {
   tokenTransfers: number;
   blocksFetched: number;
   skippedUnknownCurve: number;
-}
-
-/** eth_getLogs that halves the range when the node says it is too big. */
-export async function getLogsSplitting(
-  chain: Pick<ChainReader, 'getLogs'>,
-  range: BlockRange,
-  filter: { address?: Address[]; topics: (Hex | Hex[] | null)[] },
-  log?: Log,
-): Promise<RpcLog[]> {
-  try {
-    return await chain.getLogs({ fromBlock: range.from, toBlock: range.to, ...filter });
-  } catch (err) {
-    const halves = splitRange(range);
-    if (!(err instanceof RpcError) || err.code === null || !halves) throw err;
-    log?.debug({ range, err: errMsg(err) }, 'getLogs rejected; splitting range');
-    const a = await getLogsSplitting(chain, halves[0], filter, log);
-    const b = await getLogsSplitting(chain, halves[1], filter, log);
-    return [...a, ...b];
-  }
 }
 
 export class LogBackfill {
@@ -102,84 +81,17 @@ export class LogBackfill {
   }
 
   async processRange(r: BlockRange): Promise<void> {
-    const ponsLogs = (await getLogsSplitting(this.chain, r, { topics: [INDEXED_TOPICS] }, this.log)).filter(ponsLogAllowed);
-    const events = decodePonsLogs(ponsLogs);
-    this.stats.logs += ponsLogs.length;
-
-    // full blocks for every block with Pons events: timestamps, tx.from, launch calldata
-    const tsByBlock = new Map<number, number>();
-    const txs = new Map<Hex, TxInfo>();
-    const blocks = [...new Set(ponsLogs.map((l) => hexToNum(l.blockNumber)))].sort((a, b) => a - b);
-    for (const b of blocks) {
-      const blk = await this.chain.getBlock(b, true);
-      this.stats.blocksFetched++;
-      if (!blk) continue;
-      tsByBlock.set(b, hexToNum(blk.timestamp));
-      for (const tx of blk.transactions) {
-        txs.set(tx.hash, {
-          from: tx.from.toLowerCase() as Address,
-          to: tx.to ? (tx.to.toLowerCase() as Address) : null,
-          input: tx.input,
-        });
-      }
-    }
-
-    // ERC-20 Transfer logs of recently launched tokens (+ the ones launched in this chunk)
-    let transferLogs: RpcLog[] = [];
-    const chunkLaunchTokens = launchesInBatch(events).map((l) => l.token);
-    if (this.o.tokenTransfers) {
-      const first = await this.chain.getBlock(r.from, false);
-      const startTs = first ? hexToNum(first.timestamp) : 0;
-      const tokens = [...new Set([...this.pipeline.tokensLaunchedSince(startTs - this.o.tokenWindowSec), ...chunkLaunchTokens])];
-      for (const batch of chunkList(tokens, this.o.addressBatch)) {
-        transferLogs.push(...(await getLogsSplitting(this.chain, r, { address: batch, topics: [PONS_TOPICS.Erc20Transfer] }, this.log)));
-      }
-      for (const b of new Set(transferLogs.map((l) => hexToNum(l.blockNumber)))) {
-        if (tsByBlock.has(b)) continue;
-        const hdr = await this.chain.getBlock(b, false);
-        this.stats.blocksFetched++;
-        if (hdr) tsByBlock.set(b, hexToNum(hdr.timestamp));
-      }
-    } else {
-      transferLogs = [];
-    }
-
-    await this.pipeline.prepareCurves(events, r.from);
-    const launchSet = new Set(chunkLaunchTokens);
-    const tokenTransfers = extractTokenTransfers(
-      transferLogs,
-      (t) => this.pipeline.isKnownToken(t) || launchSet.has(t),
-      (b) => tsByBlock.get(b),
-    );
-    const lastTs = Math.max(0, ...tsByBlock.values());
-    await this.pipeline.hydrateTokens(
-      tokenTransfers.map((t) => t.token),
-      r.from,
-      this.o.tokenWindowSec,
-      lastTs,
-    );
-
-    const res = processEvents(this.pipeline.book, events, tokenTransfers, {
-      tsOf: (b) => tsByBlock.get(b),
-      txOf: (h) => txs.get(h),
-      startReserves: (c) => this.pipeline.startReservesOf(c),
+    const res = await processLogRange({ chain: this.chain, store: this.store, pipeline: this.pipeline, log: this.log }, r, {
+      tokenTransfers: this.o.tokenTransfers,
+      tokenWindowSec: this.o.tokenWindowSec,
+      addressBatch: this.o.addressBatch,
     });
-    const metrics = metricsFor(this.pipeline.book, res.touched);
-    await this.store.writeBatch({
-      launches: res.launches,
-      trades: res.trades,
-      tokenTransfers: res.tokenTransfers,
-      transfers: [],
-      wallets: [],
-      metrics,
-      exemptionUpdates: res.exemptionUpdates,
-      graduated: res.graduated,
-    });
-    this.pipeline.recordLaunches(res.launches);
-    this.stats.launches += res.launches.length;
-    this.stats.trades += res.trades.length;
-    this.stats.tokenTransfers += res.tokenTransfers.length;
-    this.stats.skippedUnknownCurve += res.skipped.unknownCurve;
+    this.stats.logs += res.logs;
+    this.stats.blocksFetched += res.blocksFetched;
+    this.stats.launches += res.launches;
+    this.stats.trades += res.trades;
+    this.stats.tokenTransfers += res.tokenTransfers;
+    this.stats.skippedUnknownCurve += res.skippedUnknownCurve;
   }
 }
 

@@ -140,9 +140,14 @@ services:
           memory: 512m
 
   # -------------------------------------------------------------------------------------------
-  # Live indexer: newHeads + Pons logs over Alchemy WS (set INDEXER_NODE_WS= empty to poll
-  # eth_blockNumber once a second instead, which is far cheaper in compute units), blocks + receipts
-  # + callTracer traces over Alchemy HTTP. Starts at the head on first run (START_BLOCK).
+  # Live indexer. INDEXER_MODE=logs (default here): one eth_getLogs range about once a second
+  # + one block per block with Pons events -> launches, curve trades, token transfers, metrics,
+  # ~2-3 calls/s instead of ~20/s. It does NOT index ETH transfers / wallets / traces, so the
+  # tracker arms nothing and the agent sees no new funding trails; INDEXER_MODE=blocks (every
+  # block + receipts + callTracer traces, ~1.7M+ calls/day) restores them. Head: newHeads + Pons
+  # logs over Alchemy WS (INDEXER_WS_NEW_HEADS=0 keeps only the logs subscription and polls the
+  # head once a second, far cheaper in compute units; INDEXER_NODE_WS= empty drops WS entirely).
+  # Starts at the head on first run (START_BLOCK). /healthz shows per-method RPC counts.
   indexer:
     <<: *app
     environment:
@@ -150,6 +155,11 @@ services:
       DATABASE_URL: *db-url
       NODE_HTTP: *alchemy-http
       NODE_WS: ${INDEXER_NODE_WS-wss://${ALCHEMY_HOST:-robinhood-mainnet.g.alchemy.com}/v2/${ALCHEMY_KEY:?set ALCHEMY_KEY in .env.ohio}}
+      INDEXER_MODE: ${INDEXER_MODE:-logs}
+      WS_NEW_HEADS: ${INDEXER_WS_NEW_HEADS:-0}
+      LOGS_INTERVAL_MS: ${INDEXER_LOGS_INTERVAL_MS:-}
+      LOGS_TOKEN_WINDOW_HOURS: ${INDEXER_LOGS_TOKEN_WINDOW_HOURS:-}
+      # blocks mode only (ignored in logs mode)
       TRACE_INTERNAL: ${INDEXER_TRACE_INTERNAL:-1}
       START_BLOCK: ${START_BLOCK:-}
       CONFIRMATIONS: ${CONFIRMATIONS:-0}

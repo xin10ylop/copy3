@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { HttpRpc, RpcError, Spacer, backoffMs } from '../src/rpc.js';
+import { HttpRpc, RpcError, Spacer, backoffMs, diffCounts } from '../src/rpc.js';
 
 function fakeFetch(responses: Array<{ status: number; body?: unknown } | Error>) {
   const calls: unknown[] = [];
@@ -46,6 +46,20 @@ describe('HttpRpc', () => {
     const rpc = new HttpRpc('http://x', { fetchImpl: impl, sleep });
     await expect(rpc.request('eth_getLogs', [])).rejects.toBeInstanceOf(RpcError);
     expect(calls).toHaveLength(1);
+  });
+
+  it('counts every request sent per method (retries included) for /healthz and the per-minute summary', async () => {
+    const ok = (result: unknown) => ({ status: 200, body: { jsonrpc: '2.0', id: 1, result } });
+    const { impl } = fakeFetch([{ status: 429 }, ok('0x1'), ok([]), ok([])]);
+    const rpc = new HttpRpc('http://x', { fetchImpl: impl, sleep });
+    const before = rpc.counter.snapshot();
+    await rpc.request('eth_blockNumber', []);
+    await rpc.request('eth_getLogs', []);
+    await rpc.request('eth_getLogs', []);
+    expect(rpc.counter.snapshot()).toEqual({ eth_blockNumber: 2, eth_getLogs: 2 });
+    expect(rpc.counter.total()).toBe(4);
+    expect(diffCounts(before, rpc.counter.snapshot())).toEqual({ eth_blockNumber: 2, eth_getLogs: 2 });
+    expect(diffCounts({ eth_getLogs: 2 }, rpc.counter.snapshot())).toEqual({ eth_blockNumber: 2 });
   });
 
   it('gives up after maxRetries', async () => {

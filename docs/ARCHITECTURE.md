@@ -88,6 +88,7 @@ has three jobs: **discover** plays, **arm** them, **execute** them.
 packages/core      addresses, ABIs, feed decoder, curve math, play/preset types, clock model (pure, unit-tested)
 packages/db        Postgres schema + migrations + typed query helpers (postgres.js); PGlite for tests
 services/indexer   node WS → launches, curve trades, ETH transfers (plain + traced internal), wallets, per-token metrics/peaks
+                   (INDEXER_MODE=logs: eth_getLogs ranges ~1/s, no ETH transfers/wallets; see services/indexer/README.md)
 services/tracker   funding-trail watcher: funder rules → armed candidates (+ "fresh" checks), expiry, notifications
 services/sniper    HOT PATH: feed decoder + rules engine + executor (burst) + position manager (TP/trailing/SL/timeout) + nonce/key mgmt
 services/agent     Opus 5.5 play finder + scout + backtester: tools over DB/RPC, writes reports + CSV, proposes plays

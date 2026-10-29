@@ -12,6 +12,9 @@
  *   6. wallets: first funding of new addresses (+ nonce at n-1, is_contract)
  *   7. token_metrics for touched tokens (computeTokenMetrics)
  *   8. one DB transaction incl. the checkpoint, then NOTIFY transfers_block
+ *
+ * This is INDEXER_MODE=blocks. INDEXER_MODE=logs runs LogFollower (log-follower.ts)
+ * instead, which reuses this class's book/directory/hydration through processLogRange.
  */
 import { CurveBook, newCurveState } from './book.js';
 import type { ChainReader } from './chain.js';
@@ -422,7 +425,8 @@ export class BlockPipeline {
     );
   }
 
-  private async prepareStale(n: number): Promise<Address[]> {
+  /** curves of tokens whose rows a rollback deleted: hydrated again so their metrics get recomputed */
+  async prepareStale(n: number): Promise<Address[]> {
     const curves: Address[] = [];
     for (const t of this.staleTokens) {
       const d = this.directory.get(t);
@@ -433,7 +437,13 @@ export class BlockPipeline {
     return curves;
   }
 
-  private async rollback(from: number, at: number): Promise<void> {
+  /** forget the stale set once the recomputed metrics are written */
+  clearStale(): void {
+    this.staleTokens.clear();
+  }
+
+  /** delete everything at block >= `from` (DB + in-memory state); `at` is only logged */
+  async rollback(from: number, at: number): Promise<void> {
     this.stats.reorgs++;
     this.log.warn({ at, rollbackFrom: from }, 'reorg detected: rolling back');
     const stale = await this.store.rollbackFrom(from);

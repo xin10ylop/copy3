@@ -120,8 +120,17 @@ unexplained aborts, and a fresh feed the whole time.
 ## Alchemy cost
 
 Alchemy bills **compute units**: $0.52 per 1M CU on Pay-As-You-Go, 10,000 CU/s of throughput
-included. Robinhood Chain makes about 10 blocks/s, or ~864k blocks/day. The live indexer reads
-every block.
+included. Robinhood Chain makes about 10 blocks/s, or ~864k blocks/day.
+
+**The live indexer defaults to `INDEXER_MODE=logs` here.** It reads one `eth_getLogs` range about
+once a second (+ one `eth_getLogs` per 100 tokens launched in the last 6 h for their ERC-20
+Transfers) and one block per block that has Pons events, i.e. about 2-3 calls/s instead of ~20/s.
+The `eth_getBlockByNumber` + `eth_getBlockReceipts` and `debug_traceTransaction` rows below then
+drop out, and `newHeads` becomes the largest item: set `INDEXER_WS_NEW_HEADS=0` (keeps the logs
+subscription, polls the head 1/s) to remove it too. The price: no ETH transfers, wallets or
+traces, so the tracker arms nothing and the agent sees no new funding trails. `/healthz` → `rpc`
+and the indexer's per-minute `rpc calls in the last minute` log line show the real per-method
+counts. The table below is `INDEXER_MODE=blocks`, which reads every block:
 
 | Item | CU | Per day |
 |---|---|---|

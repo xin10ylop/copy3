@@ -11,6 +11,8 @@ export interface HeadEvent {
   number: number;
   hash: Hex;
   parentHash: Hex;
+  /** unix seconds (absent if the node omits it) */
+  timestamp?: number;
 }
 
 export interface WsSubscriberOptions {
@@ -18,6 +20,8 @@ export interface WsSubscriberOptions {
   /** topic0 OR-set for the logs subscription */
   topics: Hex[];
   onHead: (h: HeadEvent) => void;
+  /** subscribe to newHeads (default true). INDEXER_MODE=logs may run on the logs subscription alone. */
+  heads?: boolean;
   onLog?: (log: RpcLog) => void;
   onStatus?: (status: 'open' | 'closed', detail?: string) => void;
   reconnectMinMs?: number;
@@ -80,7 +84,7 @@ export class WsSubscriber {
       this.attempts = 0;
       this.lastMessageAt = Date.now();
       this.o.onStatus?.('open');
-      this.send(1, ['newHeads'], 'newHeads');
+      if (this.o.heads !== false) this.send(1, ['newHeads'], 'newHeads');
       if (this.o.onLog) this.send(2, ['logs', { topics: [this.o.topics] }], 'logs');
     });
     ws.addEventListener('message', (ev: MessageEvent) => {
@@ -118,8 +122,13 @@ export class WsSubscriber {
     if (msg.method !== 'eth_subscription' || !msg.params) return;
     const kind = this.subs.get(msg.params.subscription);
     if (kind === 'newHeads') {
-      const h = msg.params.result as { number: Hex; hash: Hex; parentHash: Hex };
-      this.o.onHead({ number: hexToNum(h.number), hash: h.hash, parentHash: h.parentHash });
+      const h = msg.params.result as { number: Hex; hash: Hex; parentHash: Hex; timestamp?: Hex };
+      this.o.onHead({
+        number: hexToNum(h.number),
+        hash: h.hash,
+        parentHash: h.parentHash,
+        ...(h.timestamp ? { timestamp: hexToNum(h.timestamp) } : {}),
+      });
     } else if (kind === 'logs') {
       this.o.onLog?.(msg.params.result as RpcLog);
     }

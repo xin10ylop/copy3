@@ -8,6 +8,8 @@ export { extractTokenTransfers } from './token-transfers.js';
 export { decodePonsLogs, INDEXED_TOPICS } from './pons.js';
 export { chunkRanges, splitRange, chunkList, type BlockRange } from './ranges.js';
 export { BlockPipeline, type PipelineConfig, type PipelineStats } from './pipeline.js';
+export { LogFollower, type LogFollowerConfig, type LogFollowerStats } from './log-follower.js';
+export { processLogRange, getLogsSplitting, type LogRangeOptions, type LogRangeResult } from './log-range.js';
 export { PgStore } from './pg-store.js';
 export { MemoryStore } from './memory-store.js';
 export { CHECKPOINT_KEY, TRANSFERS_CHANNEL, emptyBatch, type IndexerStore, type Batch } from './store.js';

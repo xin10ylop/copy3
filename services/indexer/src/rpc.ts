@@ -71,7 +71,37 @@ function isRetryableRpcError(code: number | null, message: string): boolean {
 
 let nextId = 1;
 
+/** Per-method request counters (every HTTP request sent, retries included = what the provider bills). */
+export class RpcCounter {
+  private readonly counts = new Map<string, number>();
+
+  add(method: string): void {
+    this.counts.set(method, (this.counts.get(method) ?? 0) + 1);
+  }
+
+  snapshot(): Record<string, number> {
+    return Object.fromEntries([...this.counts].sort(([a], [b]) => a.localeCompare(b)));
+  }
+
+  total(): number {
+    let n = 0;
+    for (const v of this.counts.values()) n += v;
+    return n;
+  }
+}
+
+/** counts in `cur` minus `prev` (per method, zero deltas dropped) */
+export function diffCounts(prev: Record<string, number>, cur: Record<string, number>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(cur)) {
+    const d = v - (prev[k] ?? 0);
+    if (d > 0) out[k] = d;
+  }
+  return out;
+}
+
 export class HttpRpc implements Rpc {
+  readonly counter = new RpcCounter();
   private readonly spacer: Spacer;
   private readonly o: Required<Omit<HttpRpcOptions, 'onRetry'>> & Pick<HttpRpcOptions, 'onRetry'>;
 
@@ -96,6 +126,7 @@ export class HttpRpc implements Rpc {
   async request<T>(method: string, params: readonly unknown[]): Promise<T> {
     for (let attempt = 0; ; attempt++) {
       await this.spacer.wait();
+      this.counter.add(method);
       let reason: string;
       try {
         const res = await this.o.fetchImpl(this.url, {

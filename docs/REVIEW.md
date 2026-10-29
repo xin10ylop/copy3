@@ -261,3 +261,23 @@ recipient", `launcher.test.ts` "the observed 0x6319… pattern".
 28 stale timeouts in 6 h, each a 30 s detour onto `delayed-feed…` (every launch in those windows
 lost). A stale primary now reconnects to the primary; the secondary is used after two
 consecutive stale timeouts or a socket error/close. Tests: `feed-client.test.ts` "stale primary".
+
+## Alchemy budget (Ohio paper box)
+
+The live indexer read every block: `eth_getBlockByNumber(full)` + `eth_getBlockReceipts` per block
+(+ `debug_traceTransaction` per value tx to a contract with `TRACE_INTERNAL=1`, + `getCode` /
+nonce per new wallet, + an `eth_blockNumber` poll per second). At ~10 blocks/s that is ~21 calls/s,
+**~1.8M calls/day** before traces, most of the Alchemy bill.
+
+| # | Sev | Finding | Fix | Status |
+|---|---|---|---|---|
+| A-1 | Med | Alchemy budget: live indexer reads every block (~21 calls/s, ~1.8M/day + traces) | `INDEXER_MODE=logs` (default in `infra/ohio`, code default `blocks`): `LogFollower` indexes `[checkpoint+1, head - CONFIRMATIONS]` about once a second through `processLogRange`, the path `backfill --mode logs` now shares: 1 Pons `eth_getLogs` + ⌈tokens launched in the last 6 h / 100⌉ Transfer `eth_getLogs` per range + 1 `eth_getBlockByNumber` per block with Pons events (+1 head poll/s without `newHeads`). ≈ 2-3 calls/s (~170-260k/day) + one call per block with Pons events, i.e. roughly 5-10× fewer calls depending on how many blocks carry Pons events; no receipts, no traces. Checkpoint in the same transaction; ranges ≤ 2,000 blocks when catching up; getLogs cross-checked against the WS logs subscription; a `removed` log rolls back through the existing rollback path. `/healthz` gains `mode`, `logs` and `rpc` (per-method counts) and a per-minute `rpc calls in the last minute` log line. **Trade-off**: no `eth_transfers`, `wallets` or traces in logs mode, so the tracker arms no candidates (`armedWallet` plays idle; it does not crash), the agent sees no new funding trails, and Transfer logs are kept only for tokens younger than `LOGS_TOKEN_WINDOW_HOURS`. Launches, trades, token transfers, metrics, the sniper and telegram are unaffected. `INDEXER_MODE=blocks` restores the funding graph from the checkpoint on. Next lever: `INDEXER_WS_NEW_HEADS=0` drops the `newHeads` stream (~22-26M CU/day, now the largest item) for a 1/s head poll | fixed |
+
+Tests (`services/indexer/test/log-follower.test.ts`):
+- 401 blocks with 2 launches, 10 trades and 4 token transfers, head +10 blocks per poll: launches,
+  trades, token transfers and metrics are identical to the block pipeline's. Checkpoint = head,
+  lag 0. Calls: 41 ranges, 82 `eth_getLogs`, 6 full blocks, 2 headers, 0 receipts, 0 traces
+  (+46 head polls without WS). Block mode on the same blocks: 401 blocks + 401 receipts.
+- a checkpoint 7,401 blocks behind: 4 consecutive ranges ≤ 2,000 blocks, each block exactly once.
+- `eth_getLogs` short of the subscription → range retried; a `removed` log → rollback from
+  `block - REORG_DEPTH` and identical rows after re-indexing.

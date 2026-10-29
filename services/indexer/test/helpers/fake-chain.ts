@@ -14,6 +14,16 @@ export class FakeChain implements ChainReader {
   readonly reservesAt = new Map<string, Reserves>();
   readonly curveInfos = new Map<string, { token: Address; launchedAt: number }>();
   readonly calls: string[] = [];
+  /** per-method call counts (what an RPC provider would bill) */
+  readonly counts = new Map<string, number>();
+
+  count(method: string): number {
+    return this.counts.get(method) ?? 0;
+  }
+
+  private hit(method: string): void {
+    this.counts.set(method, this.count(method) + 1);
+  }
 
   addBlock(block: RpcBlock, receipts: RpcReceipt[]): void {
     const n = hexToNum(block.number);
@@ -23,6 +33,7 @@ export class FakeChain implements ChainReader {
   }
 
   async blockNumber(): Promise<number> {
+    this.hit('blockNumber');
     return this.head;
   }
 
@@ -30,16 +41,22 @@ export class FakeChain implements ChainReader {
   getBlock(n: BlockTag, full: false): Promise<RpcBlock<Hex> | null>;
   async getBlock(n: BlockTag, full: boolean): Promise<RpcBlock | RpcBlock<Hex> | null> {
     this.calls.push(`getBlock:${n}`);
+    this.hit(full ? 'getBlockFull' : 'getBlockHeader');
     const b = this.blocks.get(n === 'latest' ? this.head : n);
     if (!b) return null;
     return full ? b : { ...b, transactions: b.transactions.map((t) => t.hash) };
   }
 
   async getBlockReceipts(block: RpcBlock): Promise<RpcReceipt[]> {
+    this.hit('getBlockReceipts');
     return this.receipts.get(hexToNum(block.number)) ?? [];
   }
 
+  readonly logRanges: Array<{ from: number; to: number; address: boolean }> = [];
+
   async getLogs(f: LogFilter): Promise<RpcLog[]> {
+    this.hit('getLogs');
+    this.logRanges.push({ from: f.fromBlock, to: f.toBlock, address: f.address !== undefined });
     const out: RpcLog[] = [];
     const addrs = f.address ? new Set((Array.isArray(f.address) ? f.address : [f.address]).map((a) => a.toLowerCase())) : null;
     const t0 = f.topics?.[0];
@@ -59,29 +76,35 @@ export class FakeChain implements ChainReader {
   }
 
   async getCode(a: Address): Promise<Hex> {
+    this.hit('getCode');
     return this.code.get(a.toLowerCase()) ?? '0x';
   }
 
   async getTransactionCount(a: Address, block: BlockTag): Promise<number> {
     this.calls.push(`nonce:${a}:${block}`);
+    this.hit('getTransactionCount');
     return this.nonces.get(a.toLowerCase()) ?? 0;
   }
 
   async traceTransaction(hash: Hex): Promise<CallFrame> {
+    this.hit('traceTransaction');
     const t = this.traces.get(hash);
     if (!t) throw new Error(`no trace for ${hash}`);
     return t;
   }
 
   async curveStartReserves(curve: Address): Promise<Reserves | null> {
+    this.hit('curveStartReserves');
     return this.startReserves.get(curve) ?? null;
   }
 
   async curveReserves(curve: Address, block: BlockTag): Promise<Reserves | null> {
+    this.hit('curveReserves');
     return this.reservesAt.get(`${curve}:${block}`) ?? null;
   }
 
   async curveInfo(curve: Address): Promise<{ token: Address; launchedAt: number } | null> {
+    this.hit('curveInfo');
     return this.curveInfos.get(curve) ?? null;
   }
 }
