@@ -296,6 +296,26 @@ describe('launch-second fingerprint: ledger → rules → burst at T+1', () => {
     expect(row.notes).toMatch(/launch-second fingerprint not confirmed: launchSecond: team buy 0 ETH < min 0\.1 \(confirmed\)/);
   });
 
+  it('R4-8: a reverting fake team-buy hint no longer uses up the launch — a real confirmed team buy later in the second still fires', async () => {
+    const h = harness();
+    await h.sniper.start();
+    h.warm();
+    const fake = curveBuyTx(0.19); // feed-visible, reverts on chain (gas only)
+    h.chain.receipts.set(fake.hash, buyReceipt(fake, h.blockAt(3), 'reverted'));
+    h.launchSecond(new Map([[3, [fake]]]), 0, 4);
+    await waitFor(() => h.sniper.counters.launch_second_unconfirmed === 1);
+    expect(h.scripted!.orders).toHaveLength(0);
+    expect(h.sniper.ledger(LAUNCH.txHash)!.decided).toBe(false); // re-opened after the refutation
+    const real = curveBuyTx(0.15);
+    h.chain.receipts.set(real.hash, buyReceipt(real, h.blockAt(5)));
+    h.launchSecond(new Map([[5, [real]]]), 5, 6);
+    await waitFor(() => h.scripted!.orders.length === 1);
+    const run = h.scripted!.orders[0]!.run;
+    expect(run.decision.reasons.join()).toMatch(/team 0\.15 ETH/);
+    expect(run.notes.join()).toMatch(/launch-second confirmed/);
+    h.scripted!.resolveFill!(null);
+  });
+
   it('blacklist: deployerNotIn keeps a blacklisted operator out even with a team buy', async () => {
     const h = harness({ plays: [{ ...TEAM_BUY_PLAY, trigger: { launchSecond: { minTeamBuyEth: 0.1 }, deployerNotIn: [LAUNCH.deployer] } }] });
     await h.sniper.start();

@@ -45,4 +45,11 @@ describe('migrations', () => {
     );
     expect(idx.some((i) => i.indexname === 'curve_trades_token_ts_idx')).toBe(true);
   });
+
+  it('R4-8: 0002 adds the feed_blocks(ts) index the sniper retention delete uses', async () => {
+    const done = await db.sql.query<{ name: string }>('SELECT name FROM schema_migrations');
+    expect(done.some((r) => r.name === '0002_feed_blocks_ts_idx.sql')).toBe(true);
+    const idx = await db.sql.query<{ indexname: string; indexdef: string }>(`SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'feed_blocks'`);
+    expect(idx.find((i) => i.indexname === 'feed_blocks_ts_idx')?.indexdef).toMatch(/\(ts\)/);
+  });
 });

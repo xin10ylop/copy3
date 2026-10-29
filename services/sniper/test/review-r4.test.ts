@@ -135,7 +135,7 @@ describe('R4-1: the orphan sweep never re-books a closed trade and ignores dust'
     expect(await h.sniper.sweeping).toBe(0);
     expect(h.sniper.positions.open).toHaveLength(0);
     expect(h.sniper.risk.open).toBe(0);
-    expect(h.sniper.risk.realizedToday).toBe(0);
+    expect(h.sniper.risk.realizedToday).toBeCloseTo(0.02, 12); // the original trade, booked once (the PoC showed −0.05)
     expect(store.snipes.size).toBe(1);
     expect(backend.exits).toHaveLength(0);
     const ev = store.events.find((e) => e.type === 'orphan_dust_ignored')!;
