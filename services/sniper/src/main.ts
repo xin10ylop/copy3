@@ -40,7 +40,8 @@ async function main(): Promise<void> {
   installCrashGuards(logger, (kind, err) => sniper?.alert('process_error', { kind, err: err instanceof Error ? err.message : String(err) }, 'error'));
 
   const store: SniperStore = cfg.DATABASE_URL ? PgStore.fromUrl(cfg.DATABASE_URL) : new MemoryStore({ plays: loadPlaysFile(cfg.PLAYS_FILE) });
-  const chain = new ViemChain({ httpUrl: cfg.NODE_HTTP || cfg.PUBLIC_RPC, ...(cfg.NODE_WS ? { wsUrl: cfg.NODE_WS } : {}) });
+  // receipts are raced against the sequencer's own RPC: a launcher-contract launch is built from its receipt
+  const chain = new ViemChain({ httpUrl: cfg.NODE_HTTP || cfg.PUBLIC_RPC, ...(cfg.NODE_WS ? { wsUrl: cfg.NODE_WS } : {}), receiptUrls: [cfg.PUBLIC_RPC] });
   const clock = new SequencerClock({ windowMs: cfg.CLOCK_WINDOW_MS });
   const scheduler = new PreciseScheduler(cfg.SPIN_MS);
   const senders = cfg.SEND_ENDPOINTS.map((u) => new JsonRpcHttp(u));

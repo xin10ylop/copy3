@@ -614,3 +614,37 @@ describe('N16: the TokenLaunched ws log confirms a launch as soon as it arrives'
     expect(curveAbi.length).toBeGreaterThan(0);
   });
 });
+
+describe('receipt race (launcher-contract launches are built from the receipt)', () => {
+  const receipt = { transactionHash: `0x${'77'.repeat(32)}`, status: '0x1', blockNumber: '0x5f5e100', gasUsed: '0x5208', logs: [], transactionIndex: '0x2', blockHash: `0x${'ab'.repeat(32)}`, cumulativeGasUsed: '0x5208', effectiveGasPrice: '0x1', from: `0x${'11'.repeat(20)}`, to: `0x${'22'.repeat(20)}`, contractAddress: null, logsBloom: `0x${'00'.repeat(256)}`, type: '0x2' };
+  const endpoint = (name: string, answer: () => Promise<unknown>, calls: string[]) =>
+    custom({
+      async request({ method }: { method: string }) {
+        calls.push(`${name}:${method}`);
+        if (method === 'eth_getTransactionReceipt') return answer();
+        if (method === 'eth_chainId') return '0x1237';
+        throw new Error(`unexpected ${method}`);
+      },
+    });
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  it('the first endpoint to hold the receipt wins (the sequencer RPC beats a lagging node)', async () => {
+    const calls: string[] = [];
+    const slowNode = endpoint('node', () => sleep(150).then(() => null), calls); // Alchemy: not found yet
+    const sequencer = endpoint('seq', () => sleep(5).then(() => receipt), calls);
+    const vc = new ViemChain({ httpUrl: 'http://unused', transport: slowNode, receiptTransports: [sequencer] });
+    const t0 = Date.now();
+    const r = await vc.getReceipt(receipt.transactionHash as Hex);
+    expect(r?.blockNumber).toBe(100_000_000);
+    expect(r?.transactionIndex).toBe(2);
+    expect(Date.now() - t0).toBeLessThan(120);
+    expect(calls).toEqual(expect.arrayContaining(['node:eth_getTransactionReceipt', 'seq:eth_getTransactionReceipt']));
+  });
+
+  it('not found everywhere → null; an endpoint error does not hide the other endpoint’s receipt', async () => {
+    const vc = new ViemChain({ httpUrl: 'http://unused', transport: endpoint('node', async () => null, []), receiptTransports: [endpoint('seq', async () => null, [])] });
+    expect(await vc.getReceipt(receipt.transactionHash as Hex)).toBeNull();
+    const vc2 = new ViemChain({ httpUrl: 'http://unused', transport: endpoint('node', () => Promise.reject(new Error('429')), []), receiptTransports: [endpoint('seq', async () => receipt, [])] });
+    expect((await vc2.getReceipt(receipt.transactionHash as Hex))?.blockNumber).toBe(100_000_000);
+  });
+});

@@ -999,7 +999,12 @@ export class Sniper {
     const decisions = this.rules.evaluate(l.event, Date.now(), ledger?.stats());
     if (decisions.length === 0) {
       this.lastDecideUs = (performance.now() - t0) * 1000;
-      this.o.logger.debug({ tx: l.txHash, name: l.event.name, deployer: l.event.deployer, ledger: ledger !== undefined }, 'launch: no play');
+      const st = ledger?.stats();
+      // a launcher-contract launch, or any launch with real team money, is rare enough to explain at info
+      if (l.origin === 'log' || (st && st.seen.teamBuyEth >= 0.05)) {
+        const why = this.rules.explain(l.event, Date.now(), st).map((x) => `${x.playId}: ${x.reasons.join('; ')}`);
+        this.o.logger.info({ tx: l.txHash, origin: l.origin, ageMs: this.o.scheduler.now() - l.ts * 1000, seen: st?.seen, why }, 'launch: no play');
+      } else this.o.logger.debug({ tx: l.txHash, name: l.event.name, deployer: l.event.deployer, ledger: ledger !== undefined }, 'launch: no play');
       return null;
     }
     if (ledger) ledger.decided = true;

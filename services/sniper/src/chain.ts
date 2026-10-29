@@ -210,10 +210,23 @@ export class ViemChain implements ChainClient {
   /** R4-7: the eth_getLogs chunk size this endpoint accepts (learnt from range errors) */
   readonly logChunk = { chunk: LOG_CHUNK_BLOCKS };
 
-  /** `transport` replaces the http transport (tests). */
-  constructor(opts: { httpUrl: string; wsUrl?: string; transport?: Transport }) {
+  /**
+   * Receipt endpoints raced by `getReceipt` (first to return the receipt wins). A launcher-contract
+   * launch is built from its RECEIPT; Alchemy served it ~1.2 s after the launch block on the Ohio
+   * box (29 Oct 2026: a 0.427 ETH team launch was recognised after the +1 s boundary and never
+   * sniped), the sequencer's own RPC serves it within ~100 ms. The http client is always included.
+   */
+  private readonly receiptClients: PublicClient[];
+
+  /** `transport` replaces the http transport (tests); `receiptTransports` / `receiptUrls` add receipt endpoints. */
+  constructor(opts: { httpUrl: string; wsUrl?: string; transport?: Transport; receiptUrls?: string[]; receiptTransports?: Transport[] }) {
     this.http = createPublicClient({ transport: opts.transport ?? http(opts.httpUrl, { batch: false, retryCount: 1, timeout: 5000 }) });
     this.ws = opts.wsUrl ? createPublicClient({ transport: webSocket(opts.wsUrl, { keepAlive: true, reconnect: true }) }) : null;
+    const extra = [
+      ...(opts.receiptTransports ?? []).map((t) => createPublicClient({ transport: t })),
+      ...(opts.receiptUrls ?? []).filter((u) => u && u !== opts.httpUrl).map((u) => createPublicClient({ transport: http(u, { batch: false, retryCount: 0, timeout: 3000 }) })),
+    ];
+    this.receiptClients = [this.http, ...extra];
   }
 
   async getReserves(curve: Address, blockNumber?: number): Promise<Reserves> {
@@ -341,9 +354,10 @@ export class ViemChain implements ChainClient {
     };
   }
 
+  /** Races every receipt endpoint; the first receipt wins, "not found" everywhere = null, errors everywhere = throws the first. */
   async getReceipt(hash: Hex): Promise<ReceiptLite | null> {
-    try {
-      const r = await this.http.getTransactionReceipt({ hash });
+    const one = async (c: PublicClient): Promise<ReceiptLite> => {
+      const r = await c.getTransactionReceipt({ hash });
       return {
         transactionHash: r.transactionHash,
         status: r.status,
@@ -352,9 +366,21 @@ export class ViemChain implements ChainClient {
         logs: live(r.logs).map((l) => toRaw(l as Log)),
         transactionIndex: Number(r.transactionIndex),
       };
+    };
+    if (this.receiptClients.length === 1) {
+      try {
+        return await one(this.http);
+      } catch (e) {
+        if ((e as { name?: string }).name === 'TransactionReceiptNotFoundError') return null;
+        throw e;
+      }
+    }
+    try {
+      return await Promise.any(this.receiptClients.map((c) => one(c)));
     } catch (e) {
-      if ((e as { name?: string }).name === 'TransactionReceiptNotFoundError') return null;
-      throw e;
+      const errors = (e as AggregateError).errors ?? [e];
+      if (errors.some((x) => (x as { name?: string }).name === 'TransactionReceiptNotFoundError')) return null;
+      throw errors[0];
     }
   }
 
