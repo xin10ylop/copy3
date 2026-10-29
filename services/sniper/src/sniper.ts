@@ -789,10 +789,16 @@ export class Sniper {
     }
     const exempt = new Set<string>();
     let devBuy = 0n;
+    let devBuyRecipient: string | undefined;
     for (const x of r.logs) {
       if (x.address.toLowerCase() !== curve) continue;
       if (x.topics[0] === TOPICS.SnipeTaxExempted) exempt.add(`0x${(x.topics[1] ?? '').slice(26)}`.toLowerCase());
-      if (x.topics[0] === TOPICS.CurveBuy) devBuy += BigInt(`0x${x.data.slice(2, 66) || '0'}`); // the launch tx's own buy = the dev buy
+      if (x.topics[0] === TOPICS.CurveBuy) {
+        // the launch tx's own buy; the ledger classifies it by recipient (deployer → dev, other
+        // exempt wallet → team: the 0x6319… launcher pattern), see LaunchSecondLedger.kindOf
+        devBuy += BigInt(`0x${x.data.slice(2, 66) || '0'}`);
+        devBuyRecipient = `0x${(x.topics[2] ?? '').slice(26)}`.toLowerCase();
+      }
     }
     const meta = call ? null : await this.o.chain.tokenMeta?.(token, curve).catch(() => null);
     exempt.add(tl.deployer.toLowerCase());
@@ -806,6 +812,7 @@ export class Sniper {
       creatorFeeRecipient: (call?.creatorFeeRecipient ?? ZERO) as Address,
       creatorTaxBps: call?.creatorTaxBps ?? meta?.creatorTaxBps ?? 0,
       devBuyQuoteIn: devBuy,
+      ...(devBuyRecipient && devBuyRecipient !== tl.deployer.toLowerCase() ? { devBuyRecipient: devBuyRecipient as Address } : {}),
       pairToken: tl.pairToken as Address,
       launchConfigId: tl.launchConfigId,
       token,

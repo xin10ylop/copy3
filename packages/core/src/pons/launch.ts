@@ -211,6 +211,7 @@ export function launchEventFromCall(
     creatorFeeRecipient: call.creatorFeeRecipient,
     creatorTaxBps: call.creatorTaxBps,
     devBuyQuoteIn: call.devBuyQuoteIn,
+    ...(call.recipient && call.devBuyQuoteIn > 0n ? { devBuyRecipient: call.recipient } : {}),
     pairToken: call.pairToken,
     launchConfigId: call.launchConfigId,
     ...(tx.block !== undefined ? { block: tx.block } : {}),

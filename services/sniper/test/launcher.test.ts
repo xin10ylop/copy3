@@ -6,7 +6,7 @@
  * deployer, token and curve; the launch then goes through the same ledger → rules → receipt →
  * burst path as a feed launch.
  */
-import { SequencerClock, curveAbi, decodedTxFromRpc, type DecodedTx, type FeedBlock, type RawLog, type Reserves } from '@hood/core';
+import { SequencerClock, TOPICS, curveAbi, decodedTxFromRpc, type DecodedTx, type FeedBlock, type RawLog, type Reserves } from '@hood/core';
 import { encodeFunctionData, parseEther, type Address, type Hex } from 'viem';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ReceiptLite } from '../src/chain.js';
@@ -160,6 +160,31 @@ describe('log-originated launches (third-party launcher contracts)', () => {
     await h.sniper.recorder.idle();
     const rec = [...h.store.snipes.values()][0]!.decision as { launch: { origin: string; launcher: string } };
     expect(rec.launch).toMatchObject({ origin: 'log', launcher: LAUNCHER_6319 });
+    h.backend.resolveFill!(null);
+  });
+
+  it("the observed 0x6319… pattern: the launch tx's own CurveBuy to the exempted sender (≠ TokenLaunched.deployer) is the team buy — no later buy needed", async () => {
+    // 29 Oct 2026, Ohio box: 23 of 290 launches in one night had team ≥ 0.1 ETH this way (e.g.
+    // tx 0x77b4b169…: deployer 0x1aa78481…, sender 0x8e89f8ec… exempted + buys 0.804 ETH in the
+    // launch tx); the sniper matched one, because the launch tx's buy was counted as the dev buy.
+    const SENDER = '0x8e89f8ec000000000000000000000000008e89f8' as Address;
+    const h = harness();
+    const base = launcherReceipt();
+    const exemptLog: RawLog = { ...(base.logs.find((l) => l.topics[0] === TOPICS.SnipeTaxExempted) as RawLog), topics: [TOPICS.SnipeTaxExempted, `0x${SENDER.slice(2).padStart(64, '0')}` as Hex], transactionHash: LTX };
+    const bundledBuy = curveTradeLog({ curve: LAUNCH.curve, side: 'buy', trader: LAUNCHER_6319, recipient: SENDER, quote: parseEther('0.804'), tokens: 10n ** 26n, fee: 0n, tax: 0n, block: LAUNCH.block, txHash: LTX, logIndex: 40 });
+    h.chain.receipts.set(LTX, { ...base, logs: [...base.logs, exemptLog, bundledBuy] });
+    await h.sniper.start();
+    h.warm();
+    h.second(new Map([[2, [launcherTx(LAUNCHER_6319, `0xf955751f${'00'.repeat(96)}` as Hex)]]]), 0, 4); // no other buy in the second
+    await waitFor(() => h.backend.orders.length === 1);
+    const run = h.backend.orders[0]!.run;
+    expect(run.launch.origin).toBe('log');
+    expect(run.launch.event.deployer).toBe(LAUNCH.deployer);
+    expect(run.launch.event.devBuyRecipient).toBe(SENDER);
+    expect(run.launch.event.exemptions).toEqual(expect.arrayContaining([SENDER]));
+    expect(run.decision.reasons.join()).toMatch(/launchSecond: team 0\.804 ETH by 1 wallet\(s\), dev 0 ETH/);
+    expect(run.confirmed).toBe(true);
+    expect(h.sniper.ledger(LTX)!.stats().confirmed).toEqual({ teamBuyEth: 0.804, teamBuyers: 1, devBuyEth: 0 });
     h.backend.resolveFill!(null);
   });
 

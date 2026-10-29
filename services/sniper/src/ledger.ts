@@ -118,8 +118,10 @@ export class LaunchSecondLedger {
     this.exempt = this.exemptSet(launch.event.exemptions);
     const dev = launch.event.devBuyQuoteIn ?? 0n;
     if (dev > 0n) {
-      // launchAndBuy: the dev buy is in the launch tx; confirmed by the launch receipt's CurveBuy
-      this.hints.set(this.launchTx, { txHash: this.launchTx, recipient: this.deployer, quoteIn: dev, block: launch.block, logIndex: -1, source: 'calldata', status: 'seen' });
+      // launchAndBuy / launcher bundle: the launch tx's own buy; confirmed (and re-attributed by
+      // recipient) by the launch receipt's CurveBuy
+      const recipient = (launch.event.devBuyRecipient ?? this.deployer).toLowerCase();
+      this.hints.set(this.launchTx, { txHash: this.launchTx, recipient, quoteIn: dev, block: launch.block, logIndex: -1, source: 'calldata', status: 'seen' });
     }
   }
 
@@ -338,9 +340,16 @@ export class LaunchSecondLedger {
     return at !== undefined && (b.block < at.block || (b.block === at.block && b.logIndex < at.logIndex));
   }
 
+  /**
+   * By recipient, the backtest's definition (scripts/backtest/bt_month.py): to the deployer → dev;
+   * to another exempt wallet → team; taxed → other. The launch tx's own buy is NOT dev by
+   * construction: launcher contracts (0x6319…) launch for a fresh deployer wallet while the tx
+   * sender (exempted in the same tx) buys 0.2–0.8 ETH — that is the team buy the
+   * `team-buy-0.1` play is for (23 of 290 launches in one night, all missed before this).
+   */
   private kindOf(b: LedgerBuy): 'dev' | 'team' | 'other' {
     if (this.paidSnipeTax(b)) return 'other';
-    if (b.txHash === this.launchTx || b.recipient === this.deployer) return 'dev';
+    if (b.recipient === this.deployer) return 'dev';
     return this.exempt.has(b.recipient) ? 'team' : 'other';
   }
 

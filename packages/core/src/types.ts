@@ -259,8 +259,15 @@ export const LaunchEventSchema = z.object({
   exemptions: z.array(AddressSchema).default([]),
   creatorFeeRecipient: AddressSchema,
   creatorTaxBps: z.number().int().min(0),
-  /** dev-buy quote-in for launchAndBuy (wei); 0 otherwise. */
+  /** quote-in of the launch tx's own buy (launchAndBuy, or a launcher contract's bundled buy) in wei; 0 otherwise. */
   devBuyQuoteIn: z.bigint().nonnegative().default(0n),
+  /**
+   * recipient of that buy when it is not the deployer (launchAndBuy `recipient`, or the receipt's
+   * CurveBuy). Launcher contracts (0x6319…) launch for a fresh deployer wallet while the tx
+   * sender, exempted in the same tx, buys 0.2–0.8 ETH: that is a TEAM buy (the backtest's
+   * definition: exempt recipient ≠ deployer), not a dev buy.
+   */
+  devBuyRecipient: AddressSchema.optional(),
   pairToken: AddressSchema,
   launchConfigId: z.bigint().nonnegative().default(0n),
   block: z.number().int().optional(),

@@ -458,8 +458,32 @@ describe('LaunchSecondLedger (unit)', () => {
     lg.setAddresses(LAUNCH.token, LAUNCH.curve);
     const devLog = curveTradeLog({ curve: LAUNCH.curve, side: 'buy', trader: '0xe33e9e479df8802cb0866d5d05258bec4cf62948', recipient: FRESH, quote: parseEther('0.3'), tokens: 10n ** 26n, fee: 0n, tax: 0n, block: LAUNCH.block, txHash: LAUNCH.txHash, logIndex: 9 });
     lg.applyReceipt({ transactionHash: LAUNCH.txHash, status: 'success', blockNumber: LAUNCH.block, gasUsed: 1n, logs: [devLog] });
-    // a buy inside the launch tx is the dev buy whoever the recipient is
-    expect(lg.stats().confirmed).toEqual({ teamBuyEth: 0, teamBuyers: 0, devBuyEth: 0.3 });
+    // the receipt re-attributes the launch tx's buy by recipient: FRESH is neither the deployer
+    // nor exempt → neither dev nor team (the backtest's definition)
+    expect(lg.stats().confirmed).toEqual({ teamBuyEth: 0, teamBuyers: 0, devBuyEth: 0 });
+  });
+
+  it("the launch tx's own buy is classified by recipient: deployer → dev, another exempt wallet → TEAM (the 0x6319… launcher pattern)", () => {
+    const launchBuy = (recipient: Address) =>
+      curveTradeLog({ curve: LAUNCH.curve, side: 'buy', trader: '0x6319141dcc29e7dceaab6c4563cca1fb58e8cce2', recipient, quote: parseEther('0.5'), tokens: 10n ** 26n, fee: 0n, tax: 0n, block: LAUNCH.block, txHash: LAUNCH.txHash, logIndex: 9 });
+    // launcher bundle: the factory names a fresh deployer, the exempted tx sender buys 0.5 ETH in the launch tx
+    const team = new LaunchSecondLedger({ ...detected({ devBuyQuoteIn: parseEther('0.5') }), event: { ...detected().event, devBuyQuoteIn: parseEther('0.5'), devBuyRecipient: TEAM } });
+    expect(team.stats().seen).toEqual({ teamBuyEth: 0.5, teamBuyers: 1, devBuyEth: 0 }); // the hint already carries the recipient
+    team.setAddresses(LAUNCH.token, LAUNCH.curve);
+    team.applyReceipt({ transactionHash: LAUNCH.txHash, status: 'success', blockNumber: LAUNCH.block, gasUsed: 1n, logs: [launchBuy(TEAM)] });
+    expect(team.stats().confirmed).toEqual({ teamBuyEth: 0.5, teamBuyers: 1, devBuyEth: 0 });
+    expect(team.stats().seen).toEqual({ teamBuyEth: 0.5, teamBuyers: 1, devBuyEth: 0 });
+    // plain launchAndBuy: recipient = deployer → dev, as before
+    const dev = new LaunchSecondLedger(detected({ devBuyQuoteIn: parseEther('0.5') }));
+    dev.setAddresses(LAUNCH.token, LAUNCH.curve);
+    dev.applyReceipt({ transactionHash: LAUNCH.txHash, status: 'success', blockNumber: LAUNCH.block, gasUsed: 1n, logs: [launchBuy(LAUNCH.deployer)] });
+    expect(dev.stats().confirmed).toEqual({ teamBuyEth: 0, teamBuyers: 0, devBuyEth: 0.5 });
+    // a calldata hint naming the deployer is corrected by the receipt (the log is the truth)
+    const corrected = new LaunchSecondLedger(detected({ devBuyQuoteIn: parseEther('0.5') }));
+    expect(corrected.stats().seen.devBuyEth).toBeCloseTo(0.5, 12);
+    corrected.setAddresses(LAUNCH.token, LAUNCH.curve);
+    corrected.applyReceipt({ transactionHash: LAUNCH.txHash, status: 'success', blockNumber: LAUNCH.block, gasUsed: 1n, logs: [launchBuy(TEAM)] });
+    expect(corrected.stats().seen).toEqual({ teamBuyEth: 0.5, teamBuyers: 1, devBuyEth: 0 });
   });
 
   it('reservesAfter applies the confirmed launch-second buys (team untaxed) to the post-launch reserves', () => {

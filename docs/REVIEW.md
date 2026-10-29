@@ -214,7 +214,7 @@ deployer". It now has a second, equally strong source: the factory's own `TokenL
 - **Builder.** `Sniper.launchFromLog` polls the tx's receipt and requires exactly one factory
   `TokenLaunched`.
   - Deployer, token, curve, pair and config come from that log. Exemptions are the curve's
-    `SnipeTaxExempted` logs, and the dev buy is the launch tx's own `CurveBuy`s.
+    `SnipeTaxExempted` logs, and the launch tx's own `CurveBuy` is classified by recipient (deployer → dev, another exempt wallet → team: the 0x6319… launcher pattern, see P-2).
   - Name, symbol and creator tax come from known-selector calldata, else from
     `ChainClient.tokenMeta` (token `name()` / `symbol()`, curve `creatorTaxBps()`).
   - A launch older than `MAX_LAUNCH_AGE_MS` is skipped (`log_launches_stale`).
@@ -243,3 +243,21 @@ The existing H1 tests are unchanged and still pass.
 per tx cannot attribute the buys. The launch kind of an unknown-selector launch is recorded as
 `launchTokenFor`.
 
+
+### P-2 — the launch tx's own buy was always the dev buy (fixed)
+
+Ohio paper night, 29 Oct 2026: the indexer counted 23 of 290 launches with team ≥ 0.1 ETH in the
+launch second; the sniper matched 1. Trace: launcher contracts (0x6319…) launch for a fresh
+deployer wallet while the tx sender, exempted in the same tx, buys 0.2–0.8 ETH *inside the launch
+tx*. `LaunchSecondLedger.kindOf` returned `dev` for any buy in the launch tx, so `team-buy-0.1`
+saw team 0 ETH. The backtest (bt_month.py) counts an exempt recipient ≠ deployer as team, launch
+tx included — that is where its +14.8 ETH/month came from. Fix: classify by recipient only;
+`LaunchEvent.devBuyRecipient` carries the launchAndBuy `recipient` / the receipt's CurveBuy
+recipient so the pre-receipt hint is right too. Tests: `launch-second.test.ts` "classified by
+recipient", `launcher.test.ts` "the observed 0x6319… pattern".
+
+### F-1 — a stale primary feed went straight to the delayed feed (fixed)
+
+28 stale timeouts in 6 h, each a 30 s detour onto `delayed-feed…` (every launch in those windows
+lost). A stale primary now reconnects to the primary; the secondary is used after two
+consecutive stale timeouts or a socket error/close. Tests: `feed-client.test.ts` "stale primary".

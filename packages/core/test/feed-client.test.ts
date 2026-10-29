@@ -100,6 +100,53 @@ describe('FeedClient', () => {
   });
 });
 
+describe('FeedClient stale primary', () => {
+  it('a stale primary is retried on the primary first; the DELAYED secondary only after two consecutive stale timeouts', async () => {
+    const primary = await server();
+    const secondary = await server();
+    const conns: string[] = [];
+    let p = 0;
+    primary.wss.on('connection', (ws) => {
+      conns.push('p');
+      if (++p === 1) ws.send(lines[0]!); // one block on the first connection, then silence forever
+    });
+    secondary.wss.on('connection', (ws) => {
+      conns.push('s');
+      ws.send(lines[1]!);
+    });
+    const stats = new FeedStats();
+    const c = new FeedClient({ urls: [primary.url, secondary.url], staleMs: 60, reconnectDelayMs: 5, stats });
+    clients.push(c);
+    c.on('error', () => undefined);
+    c.start();
+    await until(() => conns.length >= 3);
+    // stale #1 → the primary again (no detour onto the delayed feed); stale #2 in a row → secondary
+    expect(conns.slice(0, 3)).toEqual(['p', 'p', 's']);
+    expect(stats.snapshot().failovers).toBe(1);
+    expect(stats.snapshot().reconnects).toBe(2);
+  });
+
+  it('a primary that keeps delivering after each stale reconnect never fails over', async () => {
+    const primary = await server();
+    const secondary = await server();
+    let n = 0;
+    const conns: string[] = [];
+    primary.wss.on('connection', (ws) => {
+      conns.push('p');
+      ws.send(lines[n++]!); // a NEW block per connection: the stale streak resets every time
+    });
+    secondary.wss.on('connection', () => conns.push('s'));
+    const c = new FeedClient({ urls: [primary.url, secondary.url], staleMs: 60, reconnectDelayMs: 5 });
+    clients.push(c);
+    const got: number[] = [];
+    c.on('block', (b) => got.push(b.block));
+    c.on('error', () => undefined);
+    c.start();
+    await until(() => got.length >= 4);
+    expect(conns).not.toContain('s');
+  });
+});
+
 describe('FeedClient robustness', () => {
   it('M2: handleFrame never throws, even without an error listener', () => {
     const c = new FeedClient({ urls: ['ws://unused'], stats: new FeedStats() });

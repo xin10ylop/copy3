@@ -299,7 +299,7 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
     });
   }
 
-  private onDown(url: string, reason: string): void {
+  private onDown(url: string, reason: string, rotate = true): void {
     this.socket = null;
     this.stats.currentUrl = null;
     if (this.pinger) clearInterval(this.pinger);
@@ -308,7 +308,7 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
     if (!this.running) return;
     this.failures++;
     this.stats.reconnects++;
-    if (this.opts.urls.length > 1) {
+    if (rotate && this.opts.urls.length > 1) {
       this.urlIndex = (this.urlIndex + 1) % this.opts.urls.length;
       this.stats.failovers++;
     }
@@ -332,7 +332,11 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
       s.terminate();
       // the replay request from our head did not bring a block either: stop trusting the head
       if (++this.staleStreak >= 2) this.headSuspect = true;
-      this.onDown(this.opts.urls[this.urlIndex]!, 'stale');
+      // A single stale timeout on the primary (a quiet sequencer second, a dropped frame) is
+      // retried on the primary itself: the secondary is the DELAYED feed, and a 30 s detour
+      // there loses every race in it (28 detours in 6 h on the Ohio box). Rotate only when
+      // the primary stays stale twice in a row; socket errors / closes still rotate at once.
+      this.onDown(this.opts.urls[this.urlIndex]!, 'stale', this.urlIndex !== 0 || this.staleStreak >= 2);
       return;
     }
     if (this.urlIndex !== 0 && this.connectedAt > 0 && now - this.connectedAt > this.opts.primaryRetryMs) {
