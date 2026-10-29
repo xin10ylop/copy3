@@ -19,6 +19,12 @@ export interface DetectedLaunch {
   curve?: Address;
   addressSource?: 'nonce' | 'log' | 'receipt' | 'fallback';
   source: 'feed' | 'log';
+  /**
+   * How the launch EVENT was built: `feed` = decoded from calldata sent straight to the factory /
+   * router; `log` = from the factory's own TokenLaunched log + the receipt (deployer, token, curve
+   * authoritative) — launches through third-party launcher contracts. Persisted in the decision.
+   */
+  origin?: 'feed' | 'log';
 }
 
 /** Output of the rules engine. */

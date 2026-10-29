@@ -8,6 +8,13 @@
  * we follow>)` into a tx to their own contract (reviewer PoC5). Even a launch tx to the factory is
  * only a hint until its receipt shows a TokenLaunched from the factory with the same deployer.
  *
+ * Third-party launcher contracts (~50 % of real launches; LAUNCHERS, default 0x6319…cce2 and
+ * 0x9dcc…3961) are NOT decoded from calldata: their deployer would be calldata an arbitrary
+ * contract chose (and differs from the factory's anyway, N14). The sniper builds those launches
+ * from the factory's own TokenLaunched log in the receipt / node ws (`origin: 'log'`), which is
+ * authoritative for deployer, token and curve — that is what H1 requires, so `deployerIn` /
+ * `armedWallet` plays may match them too.
+ *
  * Token/curve addresses: the TokenLaunched log (node ws) or the launch receipt resolves them
  * (`resolve()`), ~100-200 ms after the launch block. Optional nonce-based CREATE prediction
  * (`prediction: 'nonce'`, seeded from eth_getTransactionCount at startup, +2 per observed
@@ -111,6 +118,26 @@ export class LaunchDetector {
 
   isLauncher(to: string | null | undefined): boolean {
     return !!to && this.launchers.has(to.toLowerCase());
+  }
+
+  /** The factory or the launch router: one launch per call, calldata deployer = factory deployer. */
+  isDirect(to: string | null | undefined): boolean {
+    const t = to?.toLowerCase();
+    return t === this.factory || t === this.router;
+  }
+
+  /**
+   * A configured third-party launcher contract (LAUNCHERS). Its calldata (often an unknown
+   * selector) is never trusted for the deployer: such launches are built from the factory's
+   * TokenLaunched log in the receipt (`origin: 'log'`).
+   */
+  isThirdPartyLauncher(to: string | null | undefined): boolean {
+    return this.isLauncher(to) && !this.isDirect(to);
+  }
+
+  /** MAX_LAUNCH_AGE_MS: launches whose block is older than this when seen are skipped. */
+  get maxLaunchAge(): number {
+    return this.maxLaunchAgeMs;
   }
 
   /** Decode every launch in a feed block. Senders are recovered only for launch txs. */

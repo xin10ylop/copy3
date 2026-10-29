@@ -190,3 +190,56 @@ Sniper: `services/sniper/test/review-r4.test.ts` unless noted.
 - **Orphan accounting.** An adopted orphan reports its proceeds as PnL on its row (cost basis 0). The original spend of a row written off at runtime is therefore not in any row's PnL. The alert names the token and the previous row.
 - **Exit-key backlog.** A pending receipt-less exit holds its key's nonce. With one exit key, later exits queue behind it until it is final (`settle` keeps re-sending it). `EXIT_KEYS ≥ 2` avoids this.
 
+## Production finding (live paper box): launches through third-party launcher contracts
+
+About 50 % of real Pons launches go through launcher contracts. On the live paper box, 3 h, 52
+launches: `0x6319…cce2` (16, unknown selector `0xf955751f`), `0x9dcc…3961` (8, launchAndBuy-shaped),
+plus one-offs. H1's calldata filter (tx.to ∈ {factory, router, LAUNCHERS} + a launch selector) never
+saw them, so the generic launch-second play missed half the market.
+
+**H1 note.** H1's guarantee is "nothing is signed for a launch the factory did not emit for that
+deployer". It now has a second, equally strong source: the factory's own `TokenLaunched` log.
+- The original concern was **calldata-derived** deployers from arbitrary contracts. A factory log is
+  not that, and the receipt is still verified before signing.
+- `deployerIn` / `armedWallet` plays may therefore match log-originated launches.
+- Calldata sent to a launcher contract is never decoded for the deployer.
+- A `TokenLaunched`-shaped log from any other emitter is ignored.
+
+| # | Sev | Finding | Fix | Status |
+|---|---|---|---|---|
+| P-1 | Med | Launches through third-party launcher contracts invisible to the sniper (H1 calldata filter) | log-originated launches built from the factory `TokenLaunched` log + receipt (`origin: 'log'`, `launcher`); ledger, rules, receipt confirmation and the T+1 burst unchanged; default `LAUNCHERS` = the two observed contracts (early path from the feed, any selector); `origin` / `launcher` persisted in the decision | fixed |
+
+**Fix notes.** The changes are in `sniper.ts`, `detector.ts`, `chain.ts`, `config.ts` and
+`recorder.ts`:
+- **Builder.** `Sniper.launchFromLog` polls the tx's receipt and requires exactly one factory
+  `TokenLaunched`.
+  - Deployer, token, curve, pair and config come from that log. Exemptions are the curve's
+    `SnipeTaxExempted` logs, and the dev buy is the launch tx's own `CurveBuy`s.
+  - Name, symbol and creator tax come from known-selector calldata, else from
+    `ChainClient.tokenMeta` (token `name()` / `symbol()`, curve `creatorTaxBps()`).
+  - A launch older than `MAX_LAUNCH_AGE_MS` is skipped (`log_launches_stale`).
+- **Triggers.**
+  - `onFeedBlock` starts the builder for every tx to a `LAUNCHERS` contract (any selector).
+  - `onTokenLaunchedLog` (factory emitter only) starts it for a tx the feed did not classify: at
+    once when the feed already showed the block, else after `fallbackDelayMs`. The old `fallbackLaunch`
+    now delegates here, so it no longer requires a whitelisted `to`.
+- **handleLaunch.** It opens a ledger for log-originated launches. Feed-decoded launches through a
+  third-party launcher are left to the log path.
+- **Defaults.** `config.DEFAULT_LAUNCHERS` holds the two observed launchers; the `LAUNCHERS` env value
+  extends it.
+- **Persistence.** `snipes.decision.launch` gains `origin` and `launcher`.
+
+Regression tests, all in `services/sniper/test/launcher.test.ts`:
+- `a launcher-contract tx (to = 0x6319…, unknown selector) → launch from the factory log, ledger started, team buy confirmed → burst planned at T+1`
+- `a launcher the config does not list is caught from the node ws TokenLaunched log (emitter = the factory)`
+- `a TokenLaunched-shaped log whose emitter is not the factory is ignored (ws and receipt)`
+- `a launcher launch for a deployerIn play matches via the log deployer — never via calldata naming another deployer`
+- `a log-originated launch older than MAX_LAUNCH_AGE_MS is skipped like a stale feed launch`
+- `config: the observed launchers are a documented default; LAUNCHERS extends it`
+
+The existing H1 tests are unchanged and still pass.
+
+**Open.** A batch launcher tx (several `TokenLaunched` in one receipt) is skipped, because one ledger
+per tx cannot attribute the buys. The launch kind of an unknown-selector launch is recorded as
+`launchTokenFor`.
+

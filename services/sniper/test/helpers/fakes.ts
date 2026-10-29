@@ -77,6 +77,12 @@ export class FakeChain implements ChainClient {
   async recentLaunches(_lookback: number, limit: number): Promise<RecentLaunch[]> {
     return this.recents.slice(0, limit);
   }
+  /** token → name/symbol/creatorTaxBps (log-originated launches) */
+  meta = new Map<string, { name: string; symbol: string; creatorTaxBps: number }>();
+  async tokenMeta(token: Address): Promise<{ name: string; symbol: string; creatorTaxBps: number }> {
+    this.calls.push(`tokenMeta:${token}`);
+    return this.meta.get(token.toLowerCase()) ?? { name: '', symbol: '', creatorTaxBps: 0 };
+  }
   /** PonsSniper Sniped events (startup orphan sweep) */
   sniped: SnipedLog[] = [];
   snipedRanges: [number, number][] = [];

@@ -168,6 +168,8 @@ export interface ChainClient {
   balancesOf(token: Address, holders: Address[]): Promise<bigint[]>;
   getTransaction(hash: Hex): Promise<RpcTxLike | null>;
   getBlockTimestamp(blockNumber: number): Promise<number>;
+  /** name() / symbol() of the token and creatorTaxBps() of its curve (log-originated launches with unknown calldata). Optional. */
+  tokenMeta?(token: Address, curve: Address): Promise<{ name: string; symbol: string; creatorTaxBps: number }>;
   /** TokenLaunched logs from the factory (ws). Optional: without ws we poll receipts. */
   watchLaunches?(cb: (log: RawLog) => void): () => void;
   /** CurveBuy/CurveSell/CurveCompleted/SnipeTaxExempted on `curve` and Transfer on `token` (ws). */
@@ -227,6 +229,15 @@ export class ViemChain implements ChainClient {
       this.http.readContract({ address: token, abi: tokenAbi, functionName: 'balanceOf', args: [sniper], blockNumber }),
     ]);
     return { bought, balance, block: Number(blockNumber), blockTs: Number(blk.timestamp) };
+  }
+
+  async tokenMeta(token: Address, curve: Address): Promise<{ name: string; symbol: string; creatorTaxBps: number }> {
+    const [name, symbol, tax] = await Promise.all([
+      this.http.readContract({ address: token, abi: tokenAbi, functionName: 'name' }).catch(() => ''),
+      this.http.readContract({ address: token, abi: tokenAbi, functionName: 'symbol' }).catch(() => ''),
+      this.http.readContract({ address: curve, abi: curveAbi, functionName: 'creatorTaxBps' }).catch(() => 0n),
+    ]);
+    return { name: String(name), symbol: String(symbol), creatorTaxBps: Number(tax) };
   }
 
   curveGraduated(curve: Address): Promise<boolean> {

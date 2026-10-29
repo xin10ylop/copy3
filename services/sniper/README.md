@@ -100,9 +100,9 @@ in whole seconds. That is 99 % in the launch second `T`, 6.18 % at `T+1`, 0.19 %
 
    Net effect: exactly one buy, in the earliest `T+1` block any member reaches. Reverted members cost
    dust (≈ 0.0000008 ETH each at 0.02 gwei).
-4. **Launch confirmation (spoof protection, reviewer H1).** A feed tx is only a launch candidate if
-   it is sent **to** the factory, the launch router or a contract listed in `LAUNCHERS`, with a
-   launch selector. Launch-shaped calldata sent anywhere else is ignored: anyone can put
+4. **Launch confirmation (spoof protection, reviewer H1).** A feed tx is only a calldata launch
+   candidate if it is sent **to** the factory or the launch router, with a launch selector
+   (`origin: 'feed'`). Launch-shaped calldata sent anywhere else is ignored: anyone can put
    `launchTokenFor(…, deployer = <a wallet we follow>)` into a tx to their own contract. Even a
    candidate is only a hint: nothing is signed until its **receipt** shows a successful tx with
    exactly one `TokenLaunched` from the factory whose `deployer` equals the deployer the rules
@@ -120,12 +120,10 @@ in whole seconds. That is 99 % in the launch second `T`, 6.18 % at `T+1`, 0.19 %
    accepted as confirmation — that call launches exactly one token and its calldata team set is
    what the factory exempts. The receipt is then still verified in the background: a contradiction
    aborts the run (an in-flight fill exits at once) and raises `launch_receipt_mismatch`; the
-   receipt's `SnipeTaxExempted` set replaces the calldata set. Launches through a `LAUNCHERS`
-   contract (could batch) and ambiguous logs wait for the receipt. Verified live (N14,
-   `test/launch-and-buy.test.ts`, fixture `packages/core/test/fixtures/launch-and-buy-tx.json`): a
-   launchAndBuy sent to the router has `TokenLaunched.deployer == tx.from`. Third-party launcher
-   contracts also call the router (seen: `0x6319…cce2`, with a per-launch deployer); they are not
-   candidates unless listed in `LAUNCHERS`. Everything else is prepared from the feed tx:
+   receipt's `SnipeTaxExempted` set replaces the calldata set. Ambiguous logs wait for the receipt.
+   Verified live (N14, `test/launch-and-buy.test.ts`, fixture
+   `packages/core/test/fixtures/launch-and-buy-tx.json`): a launchAndBuy sent to the router has
+   `TokenLaunched.deployer == tx.from`. Everything else is prepared from the feed tx:
    decision, risk, quote, gas and warm connections. `ADDRESS_PREDICTION=nonce` keeps the original
    CREATE-nonce predictor (it self-disables after two mismatches); it never replaces the receipt.
 
@@ -176,10 +174,35 @@ in whole seconds. That is 99 % in the launch second `T`, 6.18 % at `T+1`, 0.19 %
    updates the run's row (N7). A run holds a `MAX_CONCURRENT` slot only from the moment its launch
    is confirmed (N10: reverted spoofs to the real factory cannot fill the slots).
 
-Fallback: if a `TokenLaunched` log arrives whose tx the feed never showed, it waits 150 ms, then
-rebuilds the launch from the node (only if that tx was sent to a launcher) and runs the same logic,
-receipt confirmation included. Every fire-and-forget promise on these paths is caught; a 429 from
-the node there is logged, never fatal (reviewer M2).
+**Log-originated launches (third-party launcher contracts).** On the live paper box about half of
+the real launches went through launcher contracts: `0x6319…cce2` (16 of 52 in 3 h, unknown selector
+`0xf955751f`) and `0x9dcc…3961` (8, launchAndBuy-shaped), plus one-offs. The calldata path never
+saw them. They are built from the **factory's own `TokenLaunched` log** (`origin: 'log'`,
+`launcher = tx.to`):
+- **Triggers.** Two paths lead here:
+  - A feed tx to a `LAUNCHERS` contract, whatever its selector. This is the early path: the receipt
+    is polled from the feed block on. `LAUNCHERS` defaults to the two contracts above, and the env
+    adds more.
+  - A node ws `TokenLaunched` log from the factory for a tx the feed did not classify. It is handled
+    at once when the feed already showed that block, else after a 150 ms grace period, which also
+    covers a factory/router launch the feed missed.
+- **Receipt.** It must hold exactly one factory `TokenLaunched`. A log from any other emitter is
+  ignored, and so is a batch.
+- **Fields.** Deployer, token, curve, pair and config come from that log. Calldata an arbitrary
+  contract chose is never trusted for the deployer; for a calldata launch through a launcher it
+  differs anyway (N14). Exemptions are the curve's `SnipeTaxExempted` logs and the dev buy is the
+  launch tx's own `CurveBuy`. Name, symbol and creator tax come from the calldata when the selector
+  is a known launch selector, else from `token.name()`/`symbol()` and `curve.creatorTaxBps()`.
+- **Matching.** Because the deployer is the factory's truth, `deployerIn` / `armedWallet` plays match
+  these launches too (H1's concern was calldata-derived deployers).
+- **Age.** A launch whose block is older than `MAX_LAUNCH_AGE_MS` when its log is handled is skipped
+  (`log_launches_stale`).
+- **Then the feed path unchanged.** A launch-second ledger (it replays the buffered feed txs of the
+  second), the rules, receipt confirmation, and the burst at T+1: the log arrives ~100–300 ms after
+  sequencing, so the boundary is still reachable.
+
+`origin` and `launcher` are stored in `snipes.decision.launch`. Every fire-and-forget promise on
+these paths is caught; a 429 from the node there is logged, never fatal (reviewer M2).
 
 ### Operator keys (multi-key setup, reviewer M1)
 
@@ -332,7 +355,8 @@ teamWalletsNotIn?: string[]  // blacklist: exemptions ∪ creatorFeeRecipient
   OR/require semantics. It can stand alone only when it demands ETH (`launchSecondIsMatcher`).
   The blacklists are AND filters for every play (the agent's nightly job maintains them on generic
   plays).
-- **Ledger.** While at least one enabled play has `launchSecond`, every feed launch gets a
+- **Ledger.** While at least one enabled play has `launchSecond`, every feed launch and every
+  log-originated launch (third-party launchers, see above) gets a
   `LaunchSecondLedger` (`src/ledger.ts`). Each feed block of second T adds hints: direct
   `curve.buy(quoteIn, minOut, recipient)` calls with `msg.value == quoteIn`, plus exempt outflows
   (`sell` / `transfer` / `transferFrom` by an exempt wallet, sender recovered off the decide path).
@@ -441,7 +465,7 @@ From the 3-day walk-forward (`docs/BACKTEST.md`, Backtest #2):
 | `EXECUTOR_PRIVATE_KEYS` | – | live only; comma list of operator keys: **first = exit key**, the rest = one burst slot each (≥ 2 keys in live mode). Fund each with gas. chmod 600 env file on the executor host |
 | `EXECUTOR_PRIVATE_KEY` | – | legacy single key (shared exit/burst sequence); live mode refuses it unless `ALLOW_SINGLE_KEY=1` (N5) |
 | `SNIPER_CONTRACT` | – | live only; deployed PonsSniper address |
-| `LAUNCHERS` | – | extra launcher contracts (Pons whitelisted launchers) accepted besides the factory and the launch router |
+| `LAUNCHERS` | `0x6319141dcc29e7dceaab6c4563cca1fb58e8cce2,0x9dcceb091218cdedbc2875514386615a8ce63961` (always included) | third-party launcher contracts: their txs start the early log path (receipt polled from the feed block); the launch is built from the factory's TokenLaunched log. The env value adds to the defaults |
 | `MAX_GAS_PRICE_GWEI` | `1` | global cap: blocks snipes when L2 gas price is above it, clamps every preset's `maxFeeGwei` and the gap fillers' fee |
 | `DAILY_LOSS_LIMIT_ETH` | – | fixed realised live loss (UTC day) that stops new snipes (checked at decide time and right before the first send); unset = `DAILY_LOSS_LIMIT_PCT` |
 | `DAILY_LOSS_LIMIT_PCT` | `15` | daily loss limit as % of the bankroll (contract ETH balance) at the start of the UTC day, when `DAILY_LOSS_LIMIT_ETH` is unset |

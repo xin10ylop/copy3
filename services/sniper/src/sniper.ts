@@ -140,6 +140,8 @@ export class Sniper {
     fills_after_abort: 0,
     closed: 0,
     fallback_launches: 0,
+    log_launches: 0,
+    log_launches_stale: 0,
     spoof_rejected: 0,
     positions_rebuilt: 0,
     alerts: 0,
@@ -182,6 +184,8 @@ export class Sniper {
   /** runs whose no-fill check is being settled (timer and reconcile tick never overlap) */
   private readonly settling = new Set<string>();
   private lastFeedPrune = 0;
+  /** tx hashes already handled by the log-originated launch path */
+  private readonly logOrigin = new Set<string>();
   /** R4-2: the last bought()/balanceOf() read per run (with the block it was pinned to) */
   private readonly lastRead = new Map<string, SniperHolding>();
   private sweepRunning: Promise<number> | null = null;
@@ -457,10 +461,13 @@ export class Sniper {
     if (this.runs.size) this.checkLaunchSecondDumps(b).catch((e: unknown) => this.error('launch-second dump check', e));
     let launchy = false;
     for (const tx of b.txs) {
-      if (this.detector.isCandidate(tx)) {
-        launchy = true;
-        break;
+      if (this.detector.isThirdPartyLauncher(tx.to)) {
+        // a configured third-party launcher (any selector — 0x6319… uses an unknown one): the early
+        // path polls its receipt; the launch is built from the factory's TokenLaunched log in it
+        this.launchFromLog(tx.hash, { tx, addressSource: 'receipt' }).catch((e: unknown) => this.error(`launcher tx ${tx.hash}`, e));
+        continue;
       }
+      if (!launchy && this.detector.isCandidate(tx)) launchy = true;
     }
     if (launchy) {
       this.detector.detect(b).then(
@@ -706,41 +713,123 @@ export class Sniper {
       this.onLedgerChanged(lg);
     }
     if (known || this.detector.get(hash)) return;
-    // the feed has not shown this launch (yet): fallback after a short grace period
-    const t = setTimeout(() => {
+    // the feed did not classify this tx as a launch (a third-party launcher contract, or the feed
+    // missed it): build it from the factory log. Right away when the feed already showed the
+    // block (it will not classify it any more), else after a short grace period.
+    const go = (): void => {
       if (this.detector.get(hash)) return;
-      this.fallbackLaunch(hash, parsed.block, parsed.token, parsed.curve).catch((e: unknown) => this.error(`fallback launch ${hash} failed`, e));
-    }, this.o.fallbackDelayMs ?? 150);
-    t.unref?.();
+      this.fallbackLaunch(hash, parsed.block, parsed.token, parsed.curve).catch((e: unknown) => this.error(`fallback launch ${hash} failed (log-originated)`, e));
+    };
+    if (parsed.block !== undefined && this.blockTs.has(parsed.block)) go();
+    else {
+      const t = setTimeout(go, this.o.fallbackDelayMs ?? 150);
+      t.unref?.();
+    }
   }
 
-  /** Feed missed a launch: rebuild it from the node (RPC is acceptable on this degraded path). */
-  async fallbackLaunch(txHash: Hex, block: number | undefined, token: Address, curve: Address): Promise<SnipeRun | null> {
-    const tx = await this.o.chain.getTransaction(txHash);
-    if (!tx) return null;
-    const dtx = decodedTxFromRpc(tx);
-    if (!this.detector.isLauncher(dtx.to)) {
-      this.counters.spoof_rejected!++;
-      return null; // H1: launch calldata sent anywhere but the factory / router / whitelisted launchers
+  /** A factory TokenLaunched log for a tx the feed did not classify: a log-originated launch. */
+  async fallbackLaunch(txHash: Hex, _block?: number, _token?: Address, _curve?: Address): Promise<SnipeRun | null> {
+    return this.launchFromLog(txHash, { addressSource: 'fallback' });
+  }
+
+  /**
+   * Log-originated launch (production: ~50 % of Pons launches go through third-party launcher
+   * contracts — 0x6319…cce2 with an unknown selector, 0x9dcc…3961 — that the calldata path never
+   * saw). Built from the tx's RECEIPT: it must hold exactly one `TokenLaunched` emitted by the
+   * factory; deployer, token, curve, pair and config come from that log — the factory's own truth,
+   * not calldata an arbitrary contract chose, so H1's guarantee holds (the original H1 concern was
+   * calldata-derived deployers). Exemptions are the curve's SnipeTaxExempted logs in the receipt,
+   * the dev buy the launch tx's own CurveBuys; name / symbol / creator tax come from the calldata
+   * when its selector is a known launch selector, else from token.name() / symbol() and
+   * curve.creatorTaxBps(). Skipped when its block is older than MAX_LAUNCH_AGE_MS. Then exactly the
+   * feed path: launch-second ledger, rules, receipt confirmation, burst at T+1.
+   */
+  async launchFromLog(txHash: Hex, o: { tx?: DecodedTx; addressSource: 'receipt' | 'fallback' }): Promise<SnipeRun | null> {
+    const key = txHash.toLowerCase();
+    if (this.logOrigin.has(key)) return null;
+    this.logOrigin.add(key);
+    if (this.logOrigin.size > 4096) this.logOrigin.delete(this.logOrigin.keys().next().value!);
+    const poll = this.o.receiptPollMs ?? 20;
+    const until = Date.now() + Math.max(500, this.detector.maxLaunchAge);
+    let r: Awaited<ReturnType<ChainClient['getReceipt']>> = null;
+    for (;;) {
+      r = await this.o.chain.getReceipt(txHash).catch(() => null);
+      if (r || Date.now() >= until || this.stopped) break;
+      await sleep(poll);
     }
-    const call = parseLaunchCall({ to: dtx.to, input: dtx.input, value: dtx.value });
-    if (!call) return null;
-    let blk = block;
-    if (blk === undefined) blk = (await this.o.chain.getReceipt(txHash))?.blockNumber;
-    if (blk === undefined) return null;
+    if (!r || r.status !== 'success') return null;
+    const feed = this.detector.get(txHash);
+    if (feed && !this.detector.isThirdPartyLauncher(feed.event.launcher)) return null; // the feed path owns it
+    const f = this.detector.factory;
+    const launched = r.logs
+      .filter((x) => x.address.toLowerCase() === f && x.topics[0] === TOPICS.TokenLaunched)
+      .flatMap((x) => {
+        try {
+          return [parseTokenLaunchedLog(x)];
+        } catch {
+          return [];
+        }
+      });
+    if (launched.length !== 1) return null; // no launch, or a batch: nothing we can attribute safely
+    const tl = launched[0]!;
+    const token = tl.token as Address;
+    const curve = tl.curve as Address;
+    const blk = r.blockNumber;
     const ts = this.blockTs.get(blk) ?? (await this.o.chain.getBlockTimestamp(blk));
-    const event = launchEventFromCall(call, { from: dtx.from ?? null, to: dtx.to, hash: txHash, block: blk, ts });
-    this.counters.fallback_launches!++;
+    if (this.o.scheduler.now() - ts * 1000 > this.detector.maxLaunchAge) {
+      this.counters.log_launches_stale!++;
+      return null; // too late for the +1 s boundary (replay / slow node), like a stale feed launch
+    }
+    const dtx = o.tx ?? (await this.o.chain.getTransaction(txHash).then((t) => (t ? decodedTxFromRpc(t) : null)).catch(() => null));
+    let call: ReturnType<typeof parseLaunchCall> | null = null;
+    try {
+      call = dtx && dtx.to ? parseLaunchCall({ to: dtx.to, input: dtx.input, value: dtx.value }) : null;
+    } catch {
+      call = null;
+    }
+    const exempt = new Set<string>();
+    let devBuy = 0n;
+    for (const x of r.logs) {
+      if (x.address.toLowerCase() !== curve) continue;
+      if (x.topics[0] === TOPICS.SnipeTaxExempted) exempt.add(`0x${(x.topics[1] ?? '').slice(26)}`.toLowerCase());
+      if (x.topics[0] === TOPICS.CurveBuy) devBuy += BigInt(`0x${x.data.slice(2, 66) || '0'}`); // the launch tx's own buy = the dev buy
+    }
+    const meta = call ? null : await this.o.chain.tokenMeta?.(token, curve).catch(() => null);
+    exempt.add(tl.deployer.toLowerCase());
+    exempt.delete(ZERO);
+    const event: LaunchEvent = {
+      deployer: tl.deployer as Address,
+      name: call?.name ?? meta?.name ?? '',
+      symbol: call?.symbol ?? meta?.symbol ?? '',
+      launchKind: call?.kind ?? 'launchTokenFor',
+      exemptions: [...exempt] as Address[],
+      creatorFeeRecipient: (call?.creatorFeeRecipient ?? ZERO) as Address,
+      creatorTaxBps: call?.creatorTaxBps ?? meta?.creatorTaxBps ?? 0,
+      devBuyQuoteIn: devBuy,
+      pairToken: tl.pairToken as Address,
+      launchConfigId: tl.launchConfigId,
+      token,
+      curve,
+      block: blk,
+      ts,
+      txHash: key as Hex,
+      ...(dtx?.from ? { txFrom: dtx.from.toLowerCase() as Address } : {}),
+      ...(dtx?.to ? { launcher: dtx.to.toLowerCase() as Address } : {}),
+    };
+    if (o.addressSource === 'fallback') this.counters.fallback_launches!++;
+    this.counters.log_launches!++;
+    this.o.logger.info({ tx: key, launcher: event.launcher, deployer: event.deployer, token, ageMs: this.o.scheduler.now() - ts * 1000 }, 'log-originated launch');
     return this.handleLaunch({
-      event: { ...event, token, curve },
+      event,
       block: blk,
       ts,
       receivedAt: this.o.scheduler.now(),
-      txHash,
+      txHash: key as Hex,
       token,
       curve,
-      addressSource: 'fallback',
+      addressSource: o.addressSource,
       source: 'log',
+      origin: 'log',
     });
   }
 
@@ -865,13 +954,18 @@ export class Sniper {
   async handleLaunch(l: DetectedLaunch): Promise<SnipeRun | null> {
     const t0 = performance.now();
     this.counters.launches_seen!++;
-    if (l.event.launcher && !this.detector.isLauncher(l.event.launcher)) {
-      this.counters.spoof_rejected!++;
-      return null; // H1 defence in depth (the detector already filters on tx.to)
+    if (l.origin !== 'log') {
+      if (l.event.launcher && !this.detector.isLauncher(l.event.launcher)) {
+        this.counters.spoof_rejected!++;
+        return null; // H1 defence in depth (the detector already filters on tx.to)
+      }
+      // a third-party launcher's calldata deployer is not the factory's (N14): the log path owns it
+      if (this.detector.isThirdPartyLauncher(l.event.launcher)) return null;
     }
-    // every feed launch gets a ledger while a launch-second play is enabled: later blocks of the
-    // launch second can still make it match (onLedgerChanged)
-    const ledger = l.source === 'feed' && this.rules.hasLaunchSecondPlays ? this.openLedger(l) : undefined;
+    // every feed launch — and every launch built from the factory's TokenLaunched log — gets a
+    // ledger while a launch-second play is enabled: later blocks of the launch second can still
+    // make it match (onLedgerChanged)
+    const ledger = (l.source === 'feed' || l.origin === 'log') && this.rules.hasLaunchSecondPlays ? this.openLedger(l) : undefined;
     const decisions = this.rules.evaluate(l.event, Date.now(), ledger?.stats());
     if (decisions.length === 0) {
       this.lastDecideUs = (performance.now() - t0) * 1000;

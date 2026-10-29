@@ -22,6 +22,14 @@ const bool = (d: boolean) =>
     .transform((s) => ['1', 'true', 'yes', 'on'].includes(s.trim().toLowerCase()));
 
 const KEY_RE = /^0x[0-9a-fA-F]{64}$/;
+
+/**
+ * Third-party launcher contracts seen launching real Pons tokens (live paper box, 3 h, 52 launches):
+ * 0x6319…cce2 (16, unknown selector 0xf955751f) and 0x9dcc…3961 (8, launchAndBuy-shaped). Their txs
+ * start the early log path (receipt polled from the feed block on); the launch itself is always
+ * built from the factory's TokenLaunched log. LAUNCHERS (env) adds to this list.
+ */
+export const DEFAULT_LAUNCHERS: readonly string[] = ['0x6319141dcc29e7dceaab6c4563cca1fb58e8cce2', '0x9dcceb091218cdedbc2875514386615a8ce63961'];
 const ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
 
 export const ConfigSchema = z
@@ -44,7 +52,7 @@ export const ConfigSchema = z
     EXECUTOR_PRIVATE_KEY: z.string().default(''),
     SNIPER_CONTRACT: z.string().default(''),
     /** extra launcher contracts (Pons whitelisted launchers) besides the factory and the launch router (H1) */
-    LAUNCHERS: csv,
+    LAUNCHERS: csv.transform((l) => [...new Set([...DEFAULT_LAUNCHERS, ...l.map((a) => a.toLowerCase())])]),
     MAX_GAS_PRICE_GWEI: num(1),
     /** fixed daily loss limit (realised live PnL, UTC day); unset = DAILY_LOSS_LIMIT_PCT of the day's starting bankroll */
     DAILY_LOSS_LIMIT_ETH: optNum,
