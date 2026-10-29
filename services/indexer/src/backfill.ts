@@ -39,7 +39,7 @@ async function main(): Promise<void> {
   const to = args.to === 'latest' ? head : args.to;
   const from =
     args.from ?? (await chain.blockAtOrAfter(Math.floor(Date.now() / 1000 - (args.sinceDays ?? 1) * 86_400), 0, to));
-  log.info({ from, to, mode: args.mode, chunk: args.chunk, rpc: nodeHttp }, 'backfill start');
+  log.info({ from, to, mode: args.mode, chunk: args.chunk, rpc: nodeHttp.replace(/\/v2\/[^/?#]+/, '/v2/***') }, 'backfill start');
 
   const pipeline = new BlockPipeline(chain, store, log, {
     traceInternal: process.env.TRACE_INTERNAL === '1',

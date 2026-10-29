@@ -124,6 +124,10 @@ while deciding.
   config sync and to record results, and sends txs to `rpc.mainnet` directly (3 ms)
   plus our own node (fallback). If the user insists on Cherry-only, run it on the
   Chicago box and accept ~24 ms (~¼ block) of disadvantage; the burst still works.
+* **Path A, paper only** (before Chicago exists): one us-east-2 VM runs Postgres, indexer, tracker,
+  agent and a paper sniper in `infra/ohio/compose.yml`, with Alchemy as `NODE_HTTP`/`NODE_WS`
+  (it serves `debug_traceTransaction` and `newHeads` on Robinhood Chain) and the public feed for
+  detection. Live later: the sniper moves to the host (`install-executor.sh`), the rest may stay.
 * **L1 endpoints** for the nitro node: a paid Ethereum mainnet RPC + beacon (e.g.
   QuickNode/Alchemy/dRPC) – running our own L1 is out of scope.
 * Secrets: executor key in an env file with 0600 perms on the executor only; the

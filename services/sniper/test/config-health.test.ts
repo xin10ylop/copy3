@@ -1,6 +1,6 @@
 import { SequencerClock, FeedStats } from '@hood/core';
 import { describe, expect, it } from 'vitest';
-import { loadConfig, redactedConfig } from '../src/config.js';
+import { loadConfig, redactedConfig, redactUrl } from '../src/config.js';
 import { healthy, prometheus, type HealthState } from '../src/health.js';
 
 describe('config', () => {
@@ -25,6 +25,21 @@ describe('config', () => {
     expect(c.MAX_GAS_PRICE_GWEI).toBe(0.5);
     expect(c.SEND_ENDPOINTS).toHaveLength(2);
     expect(JSON.stringify(redactedConfig(c))).not.toContain('1111111111');
+  });
+
+  it('redacts API keys embedded in endpoint URLs (Alchemy /v2/<key>)', () => {
+    const key = 'AbCdEf0123456789xyzKEY';
+    const c = loadConfig({
+      NODE_HTTP: `https://robinhood-mainnet.g.alchemy.com/v2/${key}`,
+      NODE_WS: `wss://robinhood-mainnet.g.alchemy.com/v2/${key}`,
+      SEND_ENDPOINTS: `https://rpc.mainnet.chain.robinhood.com,https://robinhood-mainnet.g.alchemy.com/v2/${key}`,
+    });
+    const r = redactedConfig(c);
+    expect(JSON.stringify(r)).not.toContain(key);
+    expect(r.NODE_HTTP).toBe('https://robinhood-mainnet.g.alchemy.com/v2/***');
+    expect(r.SEND_ENDPOINTS).toEqual(['https://rpc.mainnet.chain.robinhood.com/', 'https://robinhood-mainnet.g.alchemy.com/v2/***']);
+    expect(redactUrl('http://10.66.0.1:8547')).toBe('http://10.66.0.1:8547/');
+    expect(redactUrl('')).toBe('');
   });
 });
 

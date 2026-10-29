@@ -159,10 +159,38 @@ export function executorKeys(c: Config): Hex[] {
   return (c.EXECUTOR_PRIVATE_KEYS.length ? c.EXECUTOR_PRIVATE_KEYS : c.EXECUTOR_PRIVATE_KEY ? [c.EXECUTOR_PRIVATE_KEY] : []) as Hex[];
 }
 
+/**
+ * Hide credentials embedded in an RPC/feed URL (user:pass@, an API key as a path segment such as
+ * Alchemy's `/v2/<key>`, query strings) so endpoint URLs can be logged. Non-URLs pass through.
+ */
+export function redactUrl(u: string): string {
+  try {
+    const url = new URL(u);
+    if (url.username || url.password) {
+      url.username = '***';
+      url.password = '';
+    }
+    url.pathname = url.pathname
+      .split('/')
+      .map((seg) => (seg.length >= 16 && /^[A-Za-z0-9_-]+$/.test(seg) ? '***' : seg))
+      .join('/');
+    if (url.search) url.search = '?***';
+    return url.toString();
+  } catch {
+    return u;
+  }
+}
+
 /** Config with the secrets redacted, for logs and /healthz. */
 export function redactedConfig(c: Config): Record<string, unknown> {
   return {
     ...c,
+    NODE_HTTP: redactUrl(c.NODE_HTTP),
+    NODE_WS: redactUrl(c.NODE_WS),
+    PUBLIC_RPC: redactUrl(c.PUBLIC_RPC),
+    FEED_URL: redactUrl(c.FEED_URL),
+    FEED_URL_SECONDARY: c.FEED_URL_SECONDARY.map(redactUrl),
+    SEND_ENDPOINTS: c.SEND_ENDPOINTS.map(redactUrl),
     EXECUTOR_PRIVATE_KEY: c.EXECUTOR_PRIVATE_KEY ? '<set>' : '',
     EXECUTOR_PRIVATE_KEYS: c.EXECUTOR_PRIVATE_KEYS.map(() => '<set>'),
     DATABASE_URL: c.DATABASE_URL ? '<set>' : '',

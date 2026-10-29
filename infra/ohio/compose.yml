@@ -1,0 +1,363 @@
+# HoodSniper - Path A: the whole PAPER stack on ONE Ohio box (AWS us-east-2), no own node.
+#
+# Alchemy serves Robinhood Chain (HTTP + WS, debug_traceTransaction with callTracer, 20k-block
+# eth_getLogs), so it is NODE_HTTP / NODE_WS for the indexer, agent and sniper; the public sequencer
+# feed stays the sniper's detection source. The sniper is hard-wired to EXECUTION_MODE=paper here:
+# no executor keys ever reach this file. LIVE runs the sniper on the host (infra/executor/
+# install-executor.sh), see infra/ohio/README.md.
+#
+# Always run it through the wrapper (it passes --env-file and the project name):
+#   hoodctl up                     # build + start postgres, migrate(+seed), indexer, tracker, agent, sniper
+#   hoodctl backfill               # one-shot backfill of the last BACKFILL_DAYS (profile "backfill")
+#   hoodctl ps | logs -f sniper | status | pnl 7
+# Raw equivalent:
+#   docker compose -f infra/ohio/compose.yml --env-file .env.ohio up -d --build
+#
+# Every secret and tunable is interpolated from /opt/hood/hoodsniper/.env.ohio (template:
+# infra/env/ohio.env.example). Containers get ONLY the variables listed below (no env_file), so the
+# Anthropic key reaches the agent/telegram only and the Alchemy key only the chain readers.
+# Published ports bind to 127.0.0.1 (Docker bypasses ufw); reach them with `ssh -L`.
+
+name: hoodohio
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-db-url: &db-url postgres://hood:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.ohio (bootstrap.sh generates it)}@postgres:5432/hood
+x-alchemy-http: &alchemy-http https://${ALCHEMY_HOST:-robinhood-mainnet.g.alchemy.com}/v2/${ALCHEMY_KEY:?set ALCHEMY_KEY in .env.ohio}
+x-alchemy-ws: &alchemy-ws wss://${ALCHEMY_HOST:-robinhood-mainnet.g.alchemy.com}/v2/${ALCHEMY_KEY:?set ALCHEMY_KEY in .env.ohio}
+
+x-app: &app
+  build:
+    context: ../..
+    dockerfile: infra/Dockerfile
+    args:
+      TYPECHECK: ${HOOD_BUILD_TYPECHECK:-1}
+  image: hoodsniper/app:${HOOD_IMAGE_TAG:-local}
+  restart: unless-stopped
+  init: true
+  stop_grace_period: 30s
+  logging: *logging
+  depends_on:
+    postgres:
+      condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
+  healthcheck:
+    test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.HEALTH_PORT||8080)+'/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 90s
+
+services:
+  # -------------------------------------------------------------------------------------------
+  # Sized for a 2-4 vCPU / 4-16 GB VM. On 16 GB raise PG_SHARED_BUFFERS=2GB, PG_EFFECTIVE_CACHE_SIZE=8GB.
+  postgres:
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    shm_size: 256mb
+    stop_grace_period: 2m
+    logging: *logging
+    environment:
+      POSTGRES_USER: hood
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.ohio (bootstrap.sh generates it)}
+      POSTGRES_DB: hood
+      POSTGRES_INITDB_ARGS: --data-checksums
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-512MB}
+      - -c
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-1536MB}
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - max_connections=100
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - min_wal_size=512MB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - wal_compression=on
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - jit=off
+      - -c
+      - log_min_duration_statement=1000
+      - -c
+      - log_lock_waits=on
+      - -c
+      - idle_in_transaction_session_timeout=5min
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${PG_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hood -d hood"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: ${PG_MEM_LIMIT:-1536m}
+
+  # -------------------------------------------------------------------------------------------
+  # One-shot: packages/db migrations, then the idempotent seed (generic plays, kill_switch off,
+  # auto_approve). Runs on every `up`; the seed never overwrites an existing play or setting.
+  migrate:
+    <<: *app
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: *db-url
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TZ: UTC
+    command: ["sh", "-c", "pnpm --filter @hood/db migrate && pnpm --filter @hood/db seed"]
+    healthcheck:
+      disable: true
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+
+  # -------------------------------------------------------------------------------------------
+  # Live indexer: newHeads + Pons logs over Alchemy WS (set INDEXER_NODE_WS= empty to poll
+  # eth_blockNumber once a second instead, which is far cheaper in compute units), blocks + receipts
+  # + callTracer traces over Alchemy HTTP. Starts at the head on first run (START_BLOCK).
+  indexer:
+    <<: *app
+    environment:
+      SERVICE: indexer
+      DATABASE_URL: *db-url
+      NODE_HTTP: *alchemy-http
+      NODE_WS: ${INDEXER_NODE_WS-wss://${ALCHEMY_HOST:-robinhood-mainnet.g.alchemy.com}/v2/${ALCHEMY_KEY:?set ALCHEMY_KEY in .env.ohio}}
+      TRACE_INTERNAL: "1"
+      START_BLOCK: ${START_BLOCK:-}
+      CONFIRMATIONS: ${CONFIRMATIONS:-0}
+      REORG_DEPTH: ${REORG_DEPTH:-10}
+      RPC_MIN_INTERVAL_MS: ${INDEXER_RPC_MIN_INTERVAL_MS:-0}
+      HEALTH_PORT: "8080"
+      HEALTH_MAX_LAG_BLOCKS: ${INDEXER_HEALTH_MAX_LAG_BLOCKS:-600}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TZ: UTC
+    ports:
+      - "127.0.0.1:8081:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768m
+
+  # One-shot backfill (profile "backfill", started once by bootstrap.sh / `hoodctl backfill`):
+  #   1. --mode logs   for BACKFILL_DAYS: launches, curve trades, token transfers, metrics (minutes)
+  #   2. --mode blocks for BACKFILL_BLOCKS_DAYS: ETH transfers, wallets, internal traces = the
+  #      funding trails the agent needs. Sequential and bound by Alchemy THROUGHPUT (CU/s), not
+  #      by billing: eth_getBlockReceipts weighs 500 CU/s, so at the default 100 ms spacing it runs
+  #      ~5 blocks/s next to the live indexer (~2 days of wall time per day of chain; 0 skips it).
+  #   Idempotent; never moves the live indexer's checkpoint.
+  backfill:
+    <<: *app
+    profiles: ["backfill"]
+    restart: "no"
+    environment:
+      SERVICE: indexer
+      DATABASE_URL: *db-url
+      NODE_HTTP: *alchemy-http
+      TRACE_INTERNAL: "1"
+      RPC_MIN_INTERVAL_MS: ${BACKFILL_RPC_MIN_INTERVAL_MS:-100}
+      BACKFILL_DAYS: ${BACKFILL_DAYS:-3}
+      BACKFILL_BLOCKS_DAYS: ${BACKFILL_BLOCKS_DAYS:-1}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TZ: UTC
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        if [ "$${BACKFILL_DAYS}" != "0" ]; then
+          echo "backfill: logs mode, last $${BACKFILL_DAYS} day(s)"
+          pnpm --filter @hood/indexer backfill --since-days "$${BACKFILL_DAYS}"
+        fi
+        if [ "$${BACKFILL_BLOCKS_DAYS}" != "0" ]; then
+          echo "backfill: blocks mode (ETH transfers + traces), last $${BACKFILL_BLOCKS_DAYS} day(s)"
+          pnpm --filter @hood/indexer backfill --since-days "$${BACKFILL_BLOCKS_DAYS}" --mode blocks
+        fi
+        echo "backfill: done"
+    healthcheck:
+      disable: true
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+
+  # -------------------------------------------------------------------------------------------
+  tracker:
+    <<: *app
+    environment:
+      SERVICE: tracker
+      DATABASE_URL: *db-url
+      HEALTH_PORT: "8080"
+      CONTRACT_MAX_AGE_BLOCKS: ${CONTRACT_MAX_AGE_BLOCKS:-}
+      SWEEP_INTERVAL_MS: ${TRACKER_SWEEP_INTERVAL_MS:-}
+      POLL_MS: ${TRACKER_POLL_MS:-}
+      INITIAL_LOOKBACK_BLOCKS: ${INITIAL_LOOKBACK_BLOCKS:-}
+      UNKNOWN_NONCE_IS_FRESH: ${UNKNOWN_NONCE_IS_FRESH:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TZ: UTC
+    ports:
+      - "127.0.0.1:8082:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 384m
+
+  # -------------------------------------------------------------------------------------------
+  # `serve`: scout every SCOUT_INTERVAL_MIN + the nightly refit / auto-disable / blacklist job at
+  # NIGHTLY_HOUR_UTC. CSV + markdown reports land in HOOD_REPORTS_DIR on the host.
+  agent:
+    <<: *app
+    command: ["pnpm", "--filter", "@hood/agent", "start", "serve"]
+    environment:
+      SERVICE: agent
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY in .env.ohio}
+      DATABASE_URL: *db-url
+      NODE_HTTP: *alchemy-http
+      REPORTS_DIR: /reports
+      HEALTH_PORT: "8080"
+      AGENT_HEALTH_PORT: "8080"
+      AGENT_MAX_ROUNDS: ${AGENT_MAX_ROUNDS:-60}
+      AGENT_MAX_COST_USD: ${AGENT_MAX_COST_USD:-8}
+      SCOUT_INTERVAL_MIN: ${SCOUT_INTERVAL_MIN:-15}
+      SCOUT_SINCE_MIN: ${SCOUT_SINCE_MIN:-30}
+      SCOUT_MIN_PEAK10_PCT: ${SCOUT_MIN_PEAK10_PCT:-100}
+      SCOUT_MAX_CLUSTERS: ${SCOUT_MAX_CLUSTERS:-2}
+      SCOUT_MIN_CLUSTER_SIZE: ${SCOUT_MIN_CLUSTER_SIZE:-2}
+      SCOUT_IGNORE: ${SCOUT_IGNORE:-}
+      NIGHTLY_HOUR_UTC: ${NIGHTLY_HOUR_UTC:-3}
+      REFIT_DAYS: ${REFIT_DAYS:-3}
+      REFIT_MIN_COINS: ${REFIT_MIN_COINS:-20}
+      REFIT_MARGIN_ETH: ${REFIT_MARGIN_ETH:-0.0005}
+      ROLLING_TRADES: ${ROLLING_TRADES:-30}
+      DISABLE_MIN_TRADES: ${DISABLE_MIN_TRADES:-10}
+      BLACKLIST_MIN_LAUNCHES: ${BLACKLIST_MIN_LAUNCHES:-5}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TZ: UTC
+    volumes:
+      - ${HOOD_REPORTS_DIR:-/opt/hood/reports}:/reports
+    ports:
+      - "127.0.0.1:8083:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+
+  # -------------------------------------------------------------------------------------------
+  # PAPER sniper: public feed -> rules -> planned burst -> simulated fill (PAPER_FILL=last: behind
+  # every other buy of the +1 s block, the pessimistic model) -> exits. Nothing is ever signed.
+  # SEND_ENDPOINTS: the first entry is used for the RTT measurement (burst timing), so the public
+  # RPC (the sequencer's own front door, ~3 ms from us-east-2) goes first, Alchemy second.
+  sniper:
+    <<: *app
+    environment:
+      SERVICE: sniper
+      EXECUTION_MODE: paper
+      PAPER_FILL: ${PAPER_FILL:-last}
+      PAPER_BANKROLL_ETH: ${PAPER_BANKROLL_ETH:-0.1}
+      PAPER_MAX_QUOTE_IN_ETH: ${PAPER_MAX_QUOTE_IN_ETH:-0.3}
+      PAPER_MAX_SPEND_PER_WINDOW_ETH: ${PAPER_MAX_SPEND_PER_WINDOW_ETH:-}
+      PAPER_SPEND_WINDOW_SEC: ${PAPER_SPEND_WINDOW_SEC:-3600}
+      MAX_CONCURRENT: ${MAX_CONCURRENT:-3}
+      MAX_GAS_PRICE_GWEI: ${MAX_GAS_PRICE_GWEI:-1}
+      DAILY_LOSS_LIMIT_ETH: ${DAILY_LOSS_LIMIT_ETH:-}
+      DAILY_LOSS_LIMIT_PCT: ${DAILY_LOSS_LIMIT_PCT:-15}
+      FEED_URL: ${FEED_URL:-wss://feed.mainnet.chain.robinhood.com}
+      FEED_URL_SECONDARY: ${FEED_URL_SECONDARY:-wss://delayed-feed.mainnet.chain.robinhood.com}
+      NODE_HTTP: *alchemy-http
+      NODE_WS: *alchemy-ws
+      PUBLIC_RPC: ${PUBLIC_RPC:-https://rpc.mainnet.chain.robinhood.com}
+      SEND_ENDPOINTS: ${PUBLIC_RPC:-https://rpc.mainnet.chain.robinhood.com},https://${ALCHEMY_HOST:-robinhood-mainnet.g.alchemy.com}/v2/${ALCHEMY_KEY:?set ALCHEMY_KEY in .env.ohio}
+      DATABASE_URL: *db-url
+      FEED_BLOCKS_RETENTION_DAYS: ${FEED_BLOCKS_RETENTION_DAYS:-7}
+      HEALTH_PORT: "8080"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TZ: UTC
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "127.0.0.1:8084:8080"
+    deploy:
+      # PAPER_SNIPER=0 once the live sniper runs on the host (install-executor.sh): never two snipers on one DB
+      replicas: ${PAPER_SNIPER:-1}
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768m
+
+  # -------------------------------------------------------------------------------------------
+  # Optional (profile "telegram": COMPOSE_PROFILES=telegram in .env.ohio, or `hoodctl telegram`).
+  # Runs /play, /scout and /backtest in-process, so it also gets the Anthropic key and the reports.
+  telegram:
+    <<: *app
+    profiles: ["telegram"]
+    environment:
+      SERVICE: telegram
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ADMIN_IDS: ${TELEGRAM_ADMIN_IDS:-}
+      TELEGRAM_NOTIFY_CHAT_IDS: ${TELEGRAM_NOTIFY_CHAT_IDS:-}
+      TELEGRAM_DAILY_SUMMARY_HOUR: ${TELEGRAM_DAILY_SUMMARY_HOUR:-8}
+      TELEGRAM_TZ: ${TELEGRAM_TZ:-America/New_York}
+      TELEGRAM_MAX_BUY_ETH: ${TELEGRAM_MAX_BUY_ETH:-1}
+      TELEGRAM_MAX_WATCH_ETH: ${TELEGRAM_MAX_WATCH_ETH:-100}
+      SCOUT_SINCE_MIN: ${SCOUT_SINCE_MIN:-30}
+      SCOUT_MIN_PEAK10_PCT: ${SCOUT_MIN_PEAK10_PCT:-100}
+      SCOUT_MAX_CLUSTERS: ${SCOUT_MAX_CLUSTERS:-2}
+      SCOUT_MIN_CLUSTER_SIZE: ${SCOUT_MIN_CLUSTER_SIZE:-2}
+      SCOUT_IGNORE: ${SCOUT_IGNORE:-}
+      EXPLORER_URL: ${EXPLORER_URL:-https://robinhoodchain.blockscout.com}
+      GMGN_CHAIN: ${GMGN_CHAIN:-robinhood}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AGENT_MAX_ROUNDS: ${AGENT_MAX_ROUNDS:-60}
+      AGENT_MAX_COST_USD: ${AGENT_MAX_COST_USD:-8}
+      DATABASE_URL: *db-url
+      NODE_HTTP: *alchemy-http
+      PUBLIC_RPC: ${PUBLIC_RPC:-https://rpc.mainnet.chain.robinhood.com}
+      REPORTS_DIR: /reports
+      HEALTH_PORT: "8080"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TZ: UTC
+    volumes:
+      - ${HOOD_REPORTS_DIR:-/opt/hood/reports}:/reports
+    ports:
+      - "127.0.0.1:8085:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 768m
+
+volumes:
+  pgdata:

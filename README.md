@@ -33,6 +33,9 @@ Entering at +1 s and exiting mechanically within seconds is the whole edge. See
 pnpm install && pnpm typecheck && pnpm test      # Node 22, pnpm 10; tests never touch the network
 ```
 
+Paper week first, on one AWS Ohio VM with Alchemy as the node (no Chicago box):
+**[infra/ohio/README.md](infra/ohio/README.md)** (`sudo bash infra/ohio/bootstrap.sh`, then `hoodctl status`).
+
 Production, from zero to live: **[docs/RUNBOOK.md](docs/RUNBOOK.md)**. It covers providers, the
 Cherry box and snapshot restore, the backfill, the services, play discovery and approval, contract
 deploy, the ≥ 3-day paper gate, a small live canary, daily ops, incidents and costs. Read
@@ -101,7 +104,9 @@ until then) and when to add capital.
 Env templates: `.env.example`, `infra/env/chicago.env.example`, `infra/env/executor.env.example`.
 Infra: `infra/docker-compose.yml`, `infra/Dockerfile` (one image; the service is picked by
 `SERVICE`), `infra/cherry/` (API provisioning + cloud-init + Terraform), `infra/executor/` (Ohio
-install, systemd, chrony), `infra/backup.sh`, `infra/healthcheck.sh`.
+install, systemd, chrony), `infra/ohio/` (Path A: the paper stack on one Ohio box against Alchemy,
+`bootstrap.sh` + `compose.yml` + `hoodctl`; env template `infra/env/ohio.env.example`),
+`infra/backup.sh`, `infra/healthcheck.sh`.
 
 Telegram commands: `/status /play <ca> /scout /plays /play_on /play_off /watch /armed /positions
 /pnl [days] /preset <id> k=v… /backtest <id> /kill /resume`. Proposed plays arrive with
@@ -138,4 +143,6 @@ pnpm --filter @hood/db ctl pnl 7           # realised PnL per day and per play
 pnpm --filter @hood/db ctl kill | resume   # global kill switch
 pnpm --filter @hood/db ctl plays | play on|off <id> | events 50
 ```
+On the Path A Ohio box the same commands run inside a container: `hoodctl status`, `hoodctl pnl 7`,
+`hoodctl kill`, … ([infra/ohio/README.md](infra/ohio/README.md)).
 Health endpoints: every service exposes `/healthz`; logs are JSON (pino).

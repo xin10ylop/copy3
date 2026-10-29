@@ -17,6 +17,77 @@ Cherry Servers, Chicago (bare metal)                         AWS us-east-2, Ohio
 
 ---
 
+## Path A: paper week on one Ohio box (Alchemy, no node)
+
+Use this path to run the system in paper mode before you rent the Chicago box. One Ubuntu VM in
+AWS us-east-2 runs Postgres, migrate+seed, the indexer, the tracker, the agent (`serve`) and the
+sniper (`EXECUTION_MODE=paper`, `PAPER_FILL=last`, `PAPER_BANKROLL_ETH=0.1`). Telegram is
+optional. Alchemy is `NODE_HTTP`/`NODE_WS` for every chain reader: it serves `debug_traceTransaction`
+(callTracer), `newHeads` and 20k-block `eth_getLogs` on Robinhood Chain. The sniper's detection
+source is still the public feed `wss://feed.mainnet.chain.robinhood.com`. Details, troubleshooting
+and the full cost table: [`infra/ohio/README.md`](../infra/ohio/README.md).
+
+**You need:** a VM with 2-4 vCPU, at least 4 GB RAM and a 50 GB gp3 root disk (`c7i.large` works,
+`c7i.xlarge` is more comfortable), with a security group that allows 22/tcp only. You also need an
+Alchemy Pay-As-You-Go app with Robinhood Chain enabled, an Anthropic key with a Console spend limit,
+and a read-only GitHub token if the repo is private. Push the branch first: the box clones it.
+
+```bash
+# laptop
+scp -i ~/.ssh/sniper-ohio.pem infra/ohio/bootstrap.sh ubuntu@<ip>:
+ssh -i ~/.ssh/sniper-ohio.pem ubuntu@<ip>
+# box, 1st run: Docker + compose, Node 22 + pnpm, /opt/hood/hoodsniper, .env.ohio (0600,
+# POSTGRES_PASSWORD generated), chrony, swap if < 8 GB, ufw SSH-only. Then it STOPS (exit 2).
+sudo HOOD_REPO_URL=https://github.com/<owner>/<repo> HOOD_REPO_REF=<branch> HOOD_GIT_TOKEN=<ro token> bash bootstrap.sh
+sudo nano /opt/hood/hoodsniper/.env.ohio          # ALCHEMY_KEY=<bare key>, ANTHROPIC_API_KEY=sk-ant-...
+# 2nd run: checks the key (eth_chainId 4663), builds, `up -d`, waits for migrate+seed, starts the backfill once
+sudo HOOD_GIT_TOKEN=<ro token> bash /opt/hood/hoodsniper/infra/ohio/bootstrap.sh
+```
+
+**Check it.** `hoodctl` is installed in `/usr/local/bin`. It wraps
+`docker compose -f infra/ohio/compose.yml --env-file .env.ohio` and execs
+`pnpm --filter @hood/db ctl …` inside the tracker container.
+```bash
+hoodctl ps                  # every service running (healthy); migrate exited (0)
+hoodctl health              # /healthz of indexer (lagBlocks), tracker, agent (lastScout), sniper (ok, feed)
+hoodctl status              # kill switch, plays (team-buy-0.1 enabled by the seed), armed, open, today's PnL
+hoodctl logs -f sniper      # feed connected; [paper] snipe planned / filled / closed
+hoodctl logs -f backfill    # logs mode for BACKFILL_DAYS (3), then blocks mode for BACKFILL_BLOCKS_DAYS (1)
+```
+
+**Reports and PnL.** Agent CSV and markdown reports land in `/opt/hood/reports` on the host
+(`hoodctl reports`). For paper PnL, `hoodctl pnl 7` prints per day and per play (`mode = paper`).
+`hoodctl events 50` shows each snipe's planned, filled, closed or aborted event with its reason.
+`PAPER_FILL=last` fills behind every other buy of the +1 s block, so these numbers are the
+pessimistic case. Judge them with the §7 gate.
+
+**Alchemy cost.** Alchemy bills compute units (CU): $0.52 per 1M on Pay-As-You-Go, with
+10,000 CU/s of throughput included. The chain makes ~10 blocks/s. For each block, the live
+indexer calls `eth_getBlockByNumber` and `eth_getBlockReceipts` (20 + 20 CU) and receives a
+`newHeads` event over WS (~25-30 CU at 0.04 CU/byte). Traces for value calls (40 CU each) come on
+top. That adds up to about 60-65M CU/day, ≈ $32/day, ≈ $230 for a week.
+`INDEXER_NODE_WS=` (empty) polls `eth_blockNumber` once a second instead of subscribing, which
+brings it to ≈ $140/week. The backfill is a one-off. Logs mode for 3 days costs < 1M CU. Blocks
+mode costs about one live day (~35-40M CU) per day of chain. **So the steady per-block reads, not
+the backfill, are the bulk of the bill.** The free tier (30M CU/month) does not last a day. Blocks
+mode is limited by throughput (`eth_getBlockReceipts` counts 500 CU/s against the limit), which is
+why it is spaced at 100 ms per call and defaults to 1 day.
+
+**Going live later** (§6-8 apply unchanged):
+1. Pass the §7 gate on this box.
+2. Install the **live sniper on the host** with `infra/executor/install-executor.sh`: bare Node,
+   low-latency sysctls, optional CPU pinning, no Docker network hop. Postgres, the indexer, the
+   tracker and the agent can stay in this compose stack. In `.env.executor`, set
+   `DATABASE_URL=postgres://hood:<POSTGRES_PASSWORD>@127.0.0.1:5432/hood`, `NODE_HTTP`/`NODE_WS`
+   to the Alchemy URLs, and `SEND_ENDPOINTS=https://rpc.mainnet.chain.robinhood.com,<alchemy https url>`.
+3. Generate the executor keys on the box, deploy `PonsSniper` with the cold owner, `setOperator`
+   each key, and fund the keys and the contract (§6.2-6.4). Keys go in `.env.executor` only,
+   never in `.env.ohio`.
+4. Set `PAPER_SNIPER=0` in `.env.ohio` and run `hoodctl up`, so only one sniper uses the DB. Then
+   set `EXECUTION_MODE=live` in `.env.executor` and run `systemctl restart hood-sniper` (§8).
+
+---
+
 ## 1. Accounts and providers
 
 | Need | What exactly | Notes |

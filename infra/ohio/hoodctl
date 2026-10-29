@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# hoodctl - operate the Path A Ohio paper stack (infra/ohio/compose.yml) without Telegram.
+# Installed as /usr/local/bin/hoodctl by bootstrap.sh; re-execs itself with sudo when the caller
+# cannot talk to Docker.
+#
+#   hoodctl up | down | restart [svc] | ps | logs [-f] [svc...] | build
+#   hoodctl status | pnl [days] | kill [reason] | resume | plays | play on|off <id> | events [n]
+#                                   (= pnpm --filter @hood/db ctl ..., run inside an app container)
+#   hoodctl health                  /healthz of indexer, tracker, agent, sniper (127.0.0.1:8081-8084)
+#   hoodctl backfill [--force]      (re)start the one-shot backfill job (profile "backfill")
+#   hoodctl telegram                start the optional bot (profile "telegram")
+#   hoodctl nightly | scout         run the agent's nightly job / one scout pass now
+#   hoodctl psql [args]             psql as hood inside the postgres container
+#   hoodctl reports                 list the newest agent reports
+#   hoodctl compose <args...>       any docker compose command on this project
+set -euo pipefail
+
+HOOD_DIR="${HOOD_DIR:-/opt/hood/hoodsniper}"
+ENV_FILE="${HOOD_ENV_FILE:-$HOOD_DIR/.env.ohio}"
+COMPOSE_FILE="$HOOD_DIR/infra/ohio/compose.yml"
+STATE_DIR="${HOOD_STATE_DIR:-/opt/hood/state}"
+
+if ! docker info >/dev/null 2>&1 || [[ ! -r "$ENV_FILE" ]]; then
+  [[ $EUID -eq 0 ]] && { echo "hoodctl: docker not reachable or $ENV_FILE missing (run bootstrap.sh)" >&2; exit 1; }
+  exec sudo -E HOOD_DIR="$HOOD_DIR" HOOD_ENV_FILE="$ENV_FILE" "$0" "$@"
+fi
+
+compose() { docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"; }
+tty=()
+[[ -t 0 && -t 1 ]] || tty=(-T)
+
+# run a command in an app container: exec into a running tracker (fast), else a one-off container
+app_run() {
+  if [[ -n "$(compose ps -q --status running tracker 2>/dev/null)" ]]; then
+    compose exec "${tty[@]}" tracker "$@"
+  else
+    compose run --rm --no-deps "${tty[@]}" migrate "$@"
+  fi
+}
+
+ctl() { app_run pnpm --silent --filter @hood/db ctl "$@"; }
+
+cmd="${1:-help}"
+[[ $# -gt 0 ]] && shift
+case "$cmd" in
+  up)       compose up -d --build "$@" ;;
+  down)     compose down "$@" ;;
+  restart)  compose restart "$@" ;;
+  build)    compose build "$@" ;;
+  ps)       compose ps -a "$@" ;;
+  logs)     compose logs --tail "${HOOD_LOG_TAIL:-200}" "$@" ;;
+  status|pnl|kill|resume|plays|play|events)
+            ctl "$cmd" "$@" ;;
+  health)
+    rc=0
+    for pair in indexer:8081 tracker:8082 agent:8083 sniper:8084; do
+      name="${pair%%:*}" port="${pair##*:}"
+      code="$(curl -sS -m 5 -o /tmp/hoodctl-health.$$ -w '%{http_code}' "http://127.0.0.1:$port/healthz" 2>/dev/null || true)"
+      summary="$(jq -c '{ok, mode, lagBlocks, head, lastBlock, feedBlocks: .feed.blocks?, lastScout, lastError}
+                        | with_entries(select(.value != null))' /tmp/hoodctl-health.$$ 2>/dev/null || true)"
+      rm -f /tmp/hoodctl-health.$$
+      if [[ "$code" == 200 ]]; then lvl=OK; else lvl=FAIL; rc=1; fi
+      printf '%-4s %-8s http %-3s %s\n' "$lvl" "$name" "${code:-000}" "${summary:-no answer on 127.0.0.1:$port}"
+    done
+    exit "$rc" ;;
+  backfill)
+    if [[ "${1:-}" != "--force" && -n "$(compose ps -q --status running backfill 2>/dev/null)" ]]; then
+      echo "backfill is already running (hoodctl logs -f backfill); --force restarts it" >&2; exit 1
+    fi
+    compose --profile backfill up -d --no-deps --force-recreate backfill
+    mkdir -p "$STATE_DIR" && date -u +%FT%TZ > "$STATE_DIR/backfill.started"
+    echo "started: hoodctl logs -f backfill" ;;
+  telegram) compose --profile telegram up -d --build telegram ;;
+  nightly)  compose exec "${tty[@]}" agent pnpm --filter @hood/agent start nightly ;;
+  scout)    compose exec "${tty[@]}" agent pnpm --filter @hood/agent start scout "$@" ;;
+  psql)     compose exec "${tty[@]}" postgres psql -U hood -d hood "$@" ;;
+  reports)
+    dir="$(sed -n 's/^HOOD_REPORTS_DIR=//p' "$ENV_FILE" | tail -n 1)"
+    # shellcheck disable=SC2012  # human-readable listing of our own report files
+    ls -lt "${dir:-/opt/hood/reports}" | head -n "${1:-20}" ;;
+  compose)  compose "$@" ;;
+  help|-h|--help) sed -n '2,17p' "$0" ;;
+  *) echo "hoodctl: unknown command '$cmd' (hoodctl help)" >&2; exit 64 ;;
+esac
