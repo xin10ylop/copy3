@@ -79,7 +79,8 @@ export const PresetSchema = z.object({
   /** slippage tolerance in bps; default 3000 plus impact-aware minOut (SPEC). */
   slippageBps: z.number().int().min(0).default(3000),
   burst: BurstSchema.default({ startMs: -120, spacingMs: 15, count: 10 }),
-  gasLimit: z.number().int().positive().default(300_000),
+  /** 300k ran out of gas live on 29 Oct 2026 (a buy used 231k; a launcher-contract token needed more): a limit costs nothing unless consumed */
+  gasLimit: z.number().int().positive().default(600_000),
   maxFeeGwei: z.number().positive().default(1),
   priorityFeeGwei: z.number().min(0).default(0),
   stopAfter: z.number().int().positive().default(1),
