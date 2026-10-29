@@ -150,7 +150,7 @@ services:
       DATABASE_URL: *db-url
       NODE_HTTP: *alchemy-http
       NODE_WS: ${INDEXER_NODE_WS-wss://${ALCHEMY_HOST:-robinhood-mainnet.g.alchemy.com}/v2/${ALCHEMY_KEY:?set ALCHEMY_KEY in .env.ohio}}
-      TRACE_INTERNAL: "1"
+      TRACE_INTERNAL: ${INDEXER_TRACE_INTERNAL:-1}
       START_BLOCK: ${START_BLOCK:-}
       CONFIRMATIONS: ${CONFIRMATIONS:-0}
       REORG_DEPTH: ${REORG_DEPTH:-10}
