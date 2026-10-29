@@ -33,7 +33,11 @@ feed (wss, deflate) ─► FeedClient ─► SequencerClock.ingest ─► Launch
 Nothing on the decide path touches the DB. The RPC calls on it are the launch receipt (needed to
 prove the launch, H1) and `getReserves` on the new curve, which is not waited on for more than 5 ms
 when the launch config's start reserves are known. Plays, armed candidates and settings are loaded
-at start and refreshed on `NOTIFY plays_changed / armed_changed / settings_changed`.
+at start and refreshed on `NOTIFY plays_changed / armed_changed / settings_changed`. NOTIFY alone is
+not trusted (NEW-2): postgres.js re-LISTENs after a reconnect but never replays what was sent
+meanwhile (a `hoodctl kill` during a reconnect was lost), so everything is reloaded on every
+(re)connect of the LISTEN connection (`onlisten`), settings every `SETTINGS_RELOAD_MS` (10 s) and
+plays + armed candidates every `PLAYS_RELOAD_MS` (60 s).
 
 A second entry point fires **later in the launch second**: launch-second plays
 (`trigger.launchSecond`, e.g. the seeded `team-buy-0.1`) are matched by the per-launch
@@ -62,26 +66,35 @@ in whole seconds. That is 99 % in the launch second `T`, 6.18 % at `T+1`, 0.19 %
    predicted first `T+1` seal, so the early members are already queued when the last `T` block
    seals, and it continues 15 ms past the seal.
 3. **Idempotent contract.** Every member calls
-   `PonsSniper.snipe(curve, token, quoteIn, minTokensOut, maxTaxBps, deadlineBlock)` with
+   `PonsSniper.snipe(curve, token, quoteIn, minTokensOut, maxTaxBps, deadlineBlock, deadlineTs)` with
    `msg.value = 0`; the contract pays from its own ETH balance. The checks run in this order:
-   - `Expired()`: L2 block from `ArbSys` > deadline. 23 k gas.
+   - `Expired()`: `block.timestamp > deadlineTs` (launch ts + 3, NEW-3) or the L2 block from
+     `ArbSys` > `deadlineBlock`. The wall-clock deadline matters when the sequencer stalls: the L2
+     block number does not advance while no blocks are produced, the timestamp does, so a member
+     held back by a stall cannot buy minutes later. 23 k gas.
    - `MaxTaxTooHigh()`: `maxTaxBps ≥ 9900` would disable the tax gate (M3; the service also clamps
      to 5000 and zod caps presets at 5000).
    - `NotOperator()`.
    - `AlreadyBought()`: a sibling already bought. 27.5 k gas.
    - `TaxTooHigh(tax)`: the member landed in a `T` block. 37.6 k gas.
-   - `QuoteTooLarge(quoteIn, maxQuoteIn)`, `SpendLimitExceeded(spent, quoteIn, maxSpend)` and
+   - `QuoteTooLarge(quoteIn, maxQuoteIn)`, `SpendLimitExceeded(level, quoteIn, maxSpend)` and
      `UnknownCurve()`: an operator key can only spend up to the owner-set `maxQuoteIn` per snipe and
-     `maxSpendPerWindow` per rolling `spendWindow` in total, and only on the curve the immutable
-     factory returns for the token (`getLaunchedToken(token).curve`).
+     within the **decaying spend budget** (NEW-5): a level that drains at
+     `maxSpendPerWindow / spendWindow` per second and must stay ≤ `maxSpendPerWindow` after a buy —
+     at most `maxSpendPerWindow` at once and `maxSpendPerWindow × (1 + t / spendWindow)` in any
+     interval of t seconds (the earlier tumbling window let 2 × through across a window boundary).
+     `spendAvailable()` returns what is left now. `setSpendLimit(max, window)` refuses `window = 0`
+     (`InvalidSpendWindow`); `setSpendLimit(0, 1)` is the buy stop; turning the budget **off** is
+     the separate owner call `disableSpendLimit()`. Buys only go to the curve the immutable factory
+     returns for the token (`getLaunchedToken(token).curve`).
    - Otherwise it buys once and keeps the tokens, pre-approved to the curve. ~210 k gas (mock curve,
      first buy of a spend window; ~185 k afterwards).
 
    **What a stolen operator key can still do (N4).** It cannot send ETH anywhere, but it can launch
    real Pons tokens itself (0.0005 ETH each) and `snipe` them with `minTokensOut = 0`, sandwiching
-   the buy and keeping a 10 % creator tax. Each such snipe costs at most `maxQuoteIn`; the rolling
+   the buy and keeping a 10 % creator tax. Each such snipe costs at most `maxQuoteIn`; the decaying
    budget (`MAX_SPEND_PER_WINDOW_ETH` per `SPEND_WINDOW_SEC`, default 4 × `maxQuoteIn` per hour,
-   owner-settable with `setSpendLimit`) caps the total. **Keep the contract's working balance at a
+   owner-settable with `setSpendLimit`) caps the total at that amount at once plus the refill rate. **Keep the contract's working balance at a
    few × `buyEth`** (top it up from the cold owner), rotate keys on any suspicion and revoke a
    compromised key with `setOperator(key, false)` from the owner.
 
@@ -123,7 +136,12 @@ in whole seconds. That is 99 % in the launch second `T`, 6.18 % at `T+1`, 0.19 %
    `nameRegex`, `symbolRegex` or `teamWalletsAny` (chosen by whoever launches) arm paper runs only.
 5. **minTokensOut.**
    - With `maxEntryMcapEth`: the output at the cap price, using the curve invariant `k = Q·T`. The
-     buy then reverts on-chain if the launch-second team buys pushed the price past the cap.
+     buy then reverts on-chain if the launch-second team buys pushed the price past the cap. No buy
+     can move `k` (fees leave the pool), so this bound does not depend on what the ledger believes
+     happened in the launch second. The seeded generic plays use `maxEntryMcapEth = 4.2`
+     (2.5 × the 1.68 ETH start mcap; the video's +1 s entry was ≈ 2.8 ETH, AMLIL's team lifted the
+     price ~49 %, NEW-1). A database seeded earlier keeps its preset: set it with
+     `/preset <id> maxEntryMcapEth=4.2`.
    - Otherwise: `slippageBps` below the expected output at the worst tax the preset allows
      (618 bps for `maxTaxBps` 1000).
 
@@ -143,7 +161,11 @@ in whole seconds. That is 99 % in the launch second `T`, 6.18 % at `T+1`, 0.19 %
    the member receipts are read once more and then the contract is asked (`bought(token)`,
    `token.balanceOf(sniper)`); tokens in the contract always become a position (reviewer H3). If the
    chain cannot be read the run stays `pending` (slot held, `snipe_unresolved` alert) and the
-   reconcile timer retries every `RECONCILE_MS`. The executor's late `burst_final` write only ever
+   reconcile timer retries every `RECONCILE_MS`. **"No buy" is final only when that read was made
+   past the burst's `deadlineBlock`** (the head is read first, NEW-3): while the head is at or below
+   it — a stalled sequencer, a backlog — a member can still land, so the run stays `pending` with its
+   slot held and is re-checked about when the head should pass the deadline (and by the reconcile
+   timer). The executor's late `burst_final` write only ever
    updates the run's row (N7). A run holds a `MAX_CONCURRENT` slot only from the moment its launch
    is confirmed (N10: reverted spoofs to the real factory cannot fill the slots).
 
@@ -157,7 +179,11 @@ the node there is logged, never fatal (reviewer M2).
 `EXECUTOR_PRIVATE_KEYS=exitKey,burstKey1,burstKey2,…` — every key is a `PonsSniper` operator with
 its own nonce sequence:
 
-- the **first** key only sends exits, so an exit never queues behind a burst's nonces;
+- the **first** key only sends exits, so an exit never queues behind a burst's nonces. With one
+  exit key exits are strictly **FIFO**: each holds the key until its receipt (or
+  `EXIT_RECEIPT_TIMEOUT_MS`), so a second position's stop loss waits behind the first exit.
+  `EXIT_KEYS=n` makes the first n keys exit keys: a new exit takes a key with no exit queued or
+  running (and gas), otherwise round-robin (NEW-9). The remaining keys are burst keys;
 - every further key is one **burst slot**: a burst holds its key from signing until its nonces are
   settled, so concurrent bursts never share a sequence. With all slots busy a new burst is refused
   (`no free burst key`); give at least `MAX_CONCURRENT` burst keys;
@@ -171,8 +197,8 @@ its own nonce sequence:
 
 Fund each key with gas (≥ `MIN_GAS_BALANCE_ETH`; a burst member reserves `gasLimit × maxFee` up
 front). Before every burst the executor checks the cached balances (refreshed every
-`BALANCE_POLL_MS` and after every burst/exit): contract ETH ≥ `quoteIn`, the burst key and the exit
-key ≥ max(`MIN_GAS_BALANCE_ETH`, `gasLimit × maxFee`). A failing check aborts the burst and writes a
+`BALANCE_POLL_MS` and after every burst/exit): contract ETH ≥ `quoteIn`, the burst key and at least
+one exit key ≥ max(`MIN_GAS_BALANCE_ETH`, `gasLimit × maxFee`). A failing check aborts the burst and writes a
 `low_balance` event (reviewer L8).
 
 ### Exits (Positions)
@@ -242,6 +268,13 @@ for telegram, the snipe row stays `open` with the reason in `notes`, the positio
   row `closed`; no buy or no token → row `failed` (`stale_snipe_failed`). Rows whose chain read fails
   stay unresolved and are retried. Paper rows are rebuilt from their own data. A rebuilt position
   keeps its original open time, so a timeout that expired while the service was down fires at once.
+- **Orphan sweep (NEW-3).** After that, in the background, the contract's `Sniped` events since the
+  stored checkpoint (`settings` key `sniper_cursor:sniped_sweep:<contract>`; the first run looks
+  back `SWEEP_LOOKBACK_BLOCKS`, ~1 day; chunked ≤ 10 000 blocks per `eth_getLogs`) are checked:
+  a token the contract still holds that no position, run or unresolved row manages becomes a
+  position again (`orphan_position_recovered`, error). Its newest `failed`/`aborted` row is reused
+  (preset, notes), otherwise a new row is written. The checkpoint advances only when every token
+  could be read.
 - A run aborted ("exempt wallet sold") while burst members are in flight keeps its row `pending`
   (reason in `notes`) until the run ends, so a restart in between reconciles it like any pending row
   (N3); legacy rows written as `aborted` with a member still `sent` are loaded too. A pending row is
@@ -300,13 +333,20 @@ teamWalletsNotIn?: string[]  // blacklist: exemptions ∪ creatorFeeRecipient
 - **Last moment.** The send guard re-checks the play (maximums against everything seen, e.g. a
   later team buy above `maxTeamBuyEth`) and the exempt outflows right before the first member
   (paper: before the simulated fill).
-- **Pricing.** `minTokensOut` is computed against the launch-config reserves **plus the ledger's
-  launch-second buys** (team buys move the price: AMLIL +49 %), not the pre-team price.
+- **Pricing.** `minTokensOut` is computed against the launch-config reserves **plus the CONFIRMED
+  launch-second buys** (CurveBuy logs, applied with their exact quoteIn / tokensOut / fee / creator
+  tax; team buys move the price: AMLIL +49 %), not the pre-team price. Feed hints never price
+  (NEW-1): a deployer could send a feed-visible `curve.buy(3 ETH, minOut = max)` that reverts (gas
+  only) and our minTokensOut would have absorbed a fake 3 ETH buy (30 % slippage became 89.6 %).
+  A pending real buy that is not counted only makes minTokensOut stricter (a revert, not a loss).
+- **Taxed or team (NEW-1).** A confirmed buy is classified by `CurveBuy.fee`, which includes the
+  snipe tax: fee > 5 % of quoteIn = it paid the tax, whatever the recipient's exemption state now.
+  A wallet exempted later in the second (`exemptFromSnipeTax`) is a team wallet for its later buys
+  only; without a fee word the (block, logIndex) order of the exemption log decides.
 - **Residual risk (accepted, it is the backtested game).** The operator really spent the ETH and
   can dump on us right after the +1 s block; exits (dump exit on the first exempt transfer-out,
-  trailing 50/20, SL 40, 60 s timeout) are what the backtest measured. Not counted: exemptions
-  added after the launch (`exemptFromSnipeTax` in the launch second) and buys through the trade
-  router that the node's logs do not show before T+1. Like every play, a team buy late in the second
+  trailing 50/20, SL 40, 60 s timeout) are what the backtest measured. Not counted: buys through
+  the trade router that the node's logs do not show before T+1. Like every play, a team buy late in the second
   (> ~T+800 ms) is confirmed only after the T+1 boundary, so the burst starts late (still 6.18 % or
   0.19 % tax, REVIEW N16).
 
@@ -330,9 +370,15 @@ sizing: { mode: 'fixed' | 'bankroll', fraction: 0.25, minEth: 0.01, maxEth: 0.3 
   balance (0.1 × 0.25 / 3 = 0.008 → the 0.01 floor until the balance passes 0.12 ETH). For
   proceeds to compound, set the contract's treasury to the contract itself (`setTreasury(sniper)`
   from the owner); otherwise exits pay the owner and the bankroll only shrinks.
-- `maxEth` must not exceed the contract's `maxQuoteIn`: such a preset (or a `fixed` preset whose
-  `buyEth` does) is refused at decide time once the live gate has read `maxQuoteIn` (N15), and the
-  gate warns at startup.
+- **Contract caps (NEW-6).** A bankroll size is clamped to `min(maxEth, maxQuoteIn, remaining spend
+  budget)` (rounded down to 0.001 ETH; `decision.sizing.clamped = 'contract'`); it is refused only
+  if that leaves it below `minEth`. A `fixed` preset whose `buyEth` exceeds `maxQuoteIn` is refused
+  at decide time (it could never buy, N15). A remaining spend budget below quoteIn refuses the
+  snipe with a `spend_budget_exhausted` alert (NEW-4; at most every 10 min) instead of a burst whose
+  members all revert `SpendLimitExceeded`. Live, the caps come from the gate's chain read
+  (refreshed every `GATE_REFRESH_MS`) and our own fills are charged locally in between; paper uses
+  `PAPER_MAX_QUOTE_IN_ETH` / `PAPER_MAX_SPEND_PER_WINDOW_ETH` / `PAPER_SPEND_WINDOW_SEC` (defaults =
+  the deploy defaults 0.3 / 4 × / 3600 s), so paper refuses what live would.
 - **Daily loss limit as a share of the bankroll.** With `DAILY_LOSS_LIMIT_ETH` unset, the limit is
   `DAILY_LOSS_LIMIT_PCT` (default 15 %) of the first bankroll figure of the UTC day (0.5 ETH until a
   balance is known). `settings.daily_loss_limit_eth` / `daily_loss_limit_pct` override at runtime.
@@ -356,7 +402,7 @@ From the 3-day walk-forward (`docs/BACKTEST.md`, Backtest #2):
 | `timeoutSec` | `60` | |
 | `exitIfExemptSellsPct` | `0` | exit on the first exempt-wallet transfer-out/sell |
 | `abortIfExemptSellInLaunchBlock` | `true` | |
-| `minQuoteReserveEth`, `maxEntryMcapEth` | unset | |
+| `minQuoteReserveEth`, `maxEntryMcapEth` | unset | the seeded generic plays set `maxEntryMcapEth: 4.2` (NEW-1) |
 
 ## Environment
 
@@ -402,15 +448,24 @@ From the 3-day walk-forward (`docs/BACKTEST.md`, Backtest #2):
 | `STUCK_REARM_MS` | `300000` | re-arm a `stuck` position that still holds tokens this long after it got stuck (N2) |
 | `RECONCILE_MS` | `30000` | retry unresolved runs/rows, re-check graduated/stuck positions (re-arm / close; paper too) |
 | `GAS_CHECK` | `1` | live startup `eth_estimateGas` of `snipe()` against a recent curve (L6); `0` skips it explicitly |
-| `GAS_CHECK_LOOKBACK_BLOCKS` | `36000` | how far back to look for that curve (~1 h) |
+| `GAS_CHECK_LOOKBACK_BLOCKS` | `36000` | how far back to look for that curve (~1 h); read in `eth_getLogs` chunks of ≤ 10 000 blocks (public RPCs cap the range, NEW-8) |
 | `ALLOW_HOT_OWNER` | `0` | allow an executor key to be the contract owner (refused by default, M4) |
 | `ALLOW_SINGLE_KEY` | `0` | allow live mode with ONE executor key (refused by default, N5) |
 | `GATE_RETRY_MS` | `60000` | retry the live gate while it fails (new entries blocked meanwhile, N1) |
+| `GATE_REFRESH_MS` | `60000` | while the gate passes, re-read the contract config (owner, factory, operators, `maxQuoteIn`, spend budget); the decide path uses the latest; a changed config that fails blocks entries (NEW-8) |
+| `EXIT_KEYS` | `1` | the first n keys of `EXECUTOR_PRIVATE_KEYS` serve exits (a free key first, else round-robin); must leave ≥ 1 burst key (NEW-9) |
+| `SETTINGS_RELOAD_MS` | `10000` | re-read settings (kill switch, limits) whatever NOTIFY delivered (NEW-2) |
+| `PLAYS_RELOAD_MS` | `60000` | re-read plays and armed candidates (NEW-2) |
+| `FEED_BLOCKS_RETENTION_DAYS` | `7` | `feed_blocks` rows older than this are deleted (hourly, from the reconcile timer); `0` keeps everything |
+| `SWEEP_LOOKBACK_BLOCKS` | `864000` | live startup orphan sweep: how far back the first run scans `Sniped` events (~1 day); `0` = off (NEW-3) |
+| `PAPER_MAX_QUOTE_IN_ETH` | `0.3` | paper: the contract's `maxQuoteIn` to model (NEW-4/6) |
+| `PAPER_MAX_SPEND_PER_WINDOW_ETH` | 4 × `PAPER_MAX_QUOTE_IN_ETH` | paper: the spend budget to model |
+| `PAPER_SPEND_WINDOW_SEC` | `3600` | paper: its window; `0` = budget off |
 
 DB `settings` keys read at start and on `settings_changed`:
 - `kill_switch`: `true`, `"on"`, `"true"`, `1`, `{"on":true}`, `{"enabled":true}` or `{"killed":true,…}`
   (the shapes the telegram bot writes) block every new snipe — at decide time and again right
-  before the first member is sent (reviewer L2).
+  before the first member is sent (reviewer L2). `hoodctl status` shows `ON` for exactly these.
 - `daily_loss_limit_eth`, `daily_loss_limit_pct` and `max_concurrent` override the env values.
 
 ## Paper mode
@@ -445,6 +500,12 @@ follows:
   `first` and `last` side by side and expect live results in between, nearer `last` until the burst
   is tuned.
 - **Sells:** `quoteSell` on the latest book.
+- **Refusals live would make:** the contract caps (`PAPER_MAX_QUOTE_IN_ETH`, the spend budget) at
+  decide time, and the simulated contract balance (`PAPER_BANKROLL_ETH` + realised paper PnL − ETH
+  in other open paper runs) below quoteIn right before the burst (`low_balance`). Set
+  `PAPER_BANKROLL_ETH` to the balance the contract will hold (a fixed 0.07 ETH play on the default
+  0.1 ETH holds one position at a time, like the contract would). Paper PnL counts toward the paper
+  daily loss limit at runtime, exactly like live.
 
 The paper e2e test replays the real AMLIL trade sequence. Entry is 2.777e-9 ETH/token (the real
 first taxed buyer averaged 2.79e-9), TP1 (+150 %) fires at +6.5 s, and 0.07 ETH realises
@@ -510,7 +571,16 @@ open positions are managed whatever it says — and **blocks only new entries** 
 - `exitAll()` on the same curve (the contract given a balance by a state override, ERC-20 slots 0/1)
   fits the gas limit; estimate + the 50 k treasury allowance above it → warning; not estimable →
   warning (N15);
-- a preset that can buy more than `maxQuoteIn` → warning; such presets are refused at decide time.
+- a `fixed` preset that buys more than `maxQuoteIn` → warning; such presets are refused at decide
+  time; a bankroll `maxEth` above it → warning (sizes are clamped);
+- NEW-4: the spend budget (`maxSpendPerWindow`, `spendWindow`, `spendLevel`, `spendUpdatedAt`) is
+  read: below the largest preset buy (fixed `buyEth`, bankroll `min(maxEth, maxQuoteIn)`) → blocked;
+  budget off → warning.
+
+While the gate passes it re-reads the contract config every `GATE_REFRESH_MS` (no gas estimates,
+NEW-8): the decide path always uses the latest `maxQuoteIn` and budget; a config that now fails
+(operator revoked, hot owner, budget too small) blocks entries until a full check passes; a read
+that merely failed keeps the previous state.
 
 At runtime: fewer burst keys than `MAX_CONCURRENT` logs a warning; balance pre-checks block bursts
 (L8).
@@ -536,14 +606,16 @@ At runtime: fewer burst keys than `MAX_CONCURRENT` logs a warning; balance pre-c
      the first key and makes every key an operator; `EXECUTOR_PRIVATE_KEY=<deployer>` and
      `OPERATORS=` override that.
    - `MAX_SPEND_PER_WINDOW_ETH` (default 4 × `MAX_QUOTE_IN_ETH`) per `SPEND_WINDOW_SEC` (default
-     3600; `0` = off) caps all buys of the window on chain.
+     3600, must be ≥ 1) is the decaying on-chain budget. `MAX_QUOTE_IN_ETH` defaults to 0.3 (the
+     preset default `sizing.maxEth`). To run without a budget the owner calls `disableSpendLimit()`.
    - Dry run first:
      ```bash
      DRY_RUN=1 OWNER=<cold> MAX_QUOTE_IN_ETH=0.1 pnpm --filter @hood/contracts run deploy
      ```
-   - Then for real. This deploys, checks `owner`, `operators`, `factory` and
-     `arbBlockNumbers()==true`, funds the contract and prints the `setOperator` (and optional
-     `TREASURY` → `setTreasury`) calldata the cold owner must send for the other operators:
+   - Then for real. This deploys, checks `owner`, `operators`, `factory`, `arbBlockNumbers()==true`,
+     `maxQuoteIn`, `maxSpendPerWindow` and `spendWindow`, funds the contract when `FUND_ETH` is set
+     (no default: unset = no funding) and prints the `setOperator` (and optional `TREASURY` →
+     `setTreasury`) calldata the cold owner must send for the other operators:
      ```bash
      FUND_ETH=0.2 MAX_QUOTE_IN_ETH=0.1 OWNER=<cold> pnpm --filter @hood/contracts run deploy
      ```
@@ -602,7 +674,8 @@ right before the first send). Open positions keep being managed and exited.
 - **Paper e2e:** the AMLIL timeline.
 - **Review fixes:** orchestrator-level regression tests for every finding (spoofed launches, fill
   after abort, chain reconciliation and restart, crash paths, tax cap, kill switch, paper fill
-  model, startup gate, balances).
+  model, startup gate, balances): `review-fixes.test.ts` (round 1), `review-n.test.ts` (round 2),
+  `review-r3.test.ts` (round 3: NEW-2…NEW-9; NEW-1 in `launch-second.test.ts`).
 - **PgStore:** runs against the real `@hood/db` migrations on PGlite (incl. per-mode stats).
 - **Config and metrics.**
 

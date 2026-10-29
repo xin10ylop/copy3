@@ -217,9 +217,11 @@ First close the open items in RESEARCH §7 (`buy`/`sell` argument order, contrac
    another deployer), and the constructor makes it the first operator. Every `exit` forwards its
    sale proceeds straight to the owner (the treasury), so profits never sit on a hot key.
    `MAX_QUOTE_IN_ETH` caps one snipe. `MAX_SPEND_PER_WINDOW_ETH` (default 4 × `MAX_QUOTE_IN_ETH`) per
-   `SPEND_WINDOW_SEC` (default 3600) caps all buys in a rolling window (`SpendLimitExceeded`). Both
+   `SPEND_WINDOW_SEC` (default 3600) is a decaying budget: at most that much at once, refilling
+   continuously at `MAX_SPEND_PER_WINDOW_ETH / SPEND_WINDOW_SEC` per second (`SpendLimitExceeded`). Both
    bound what a stolen operator key can lose by buying its own launches with the contract's ETH.
-   The owner can change them later with `setMaxQuoteIn` and `setSpendLimit`.
+   The owner can change them later with `setMaxQuoteIn` and `setSpendLimit` (a window of 0 is
+   refused; turning the budget off is the separate `disableSpendLimit()`).
    ```bash
    deploy() { sudo -u hood -H bash -c "cd /opt/hood/hoodsniper && set -a && . ./.env.executor && set +a && $*"; }
    deploy OWNER=<cold wallet> MAX_QUOTE_IN_ETH=0.1 DRY_RUN=1 pnpm --filter @hood/contracts run deploy   # predicted address

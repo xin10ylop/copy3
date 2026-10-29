@@ -3,17 +3,24 @@
  * live in the scratchpad as poc3/*.mts). NEW-1 is in launch-second.test.ts / pricing.test.ts and
  * packages/db/test/seed.test.ts, NEW-3's and NEW-5's contract parts in contracts/test.
  */
-import { SequencerClock, type FeedBlock, type Reserves } from '@hood/core';
-import { parseEther, type Address, type Hex } from 'viem';
+import { PONS_V2, SequencerClock, factoryAbi, type FeedBlock, type Reserves } from '@hood/core';
+import { custom, encodeAbiParameters, encodeEventTopics, parseEther, recoverTransactionAddress, type Address, type Hex } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
 import { afterEach, describe, expect, it } from 'vitest';
+import { LOG_CHUNK_BLOCKS, ViemChain, type SpendBudgetState } from '../src/chain.js';
+import { loadConfig } from '../src/config.js';
 import { LaunchDetector } from '../src/detector.js';
-import type { ExecutionBackend, ExitOrder, ExitResult, SnipeOrder } from '../src/executor.js';
+import { LiveExecutor, type ExecutionBackend, type ExitOrder, type ExitResult, type SnipeOrder } from '../src/executor.js';
+import { ContractLimits } from '../src/limits.js';
 import { silentLogger } from '../src/log.js';
+import { PaperExecutor } from '../src/paper.js';
+import { LiveGate, liveStartupChecks, type StartupCheckResult } from '../src/preflight.js';
+import { Risk } from '../src/risk.js';
 import { ManualScheduler } from '../src/scheduler.js';
 import { Sniper, type SniperOptions } from '../src/sniper.js';
 import { MemoryStore } from '../src/store.js';
 import type { Fill } from '../src/types.js';
-import { FakeChain } from './helpers/fakes.js';
+import { FakeChain, FakeSender } from './helpers/fakes.js';
 import { LAUNCH, emptyBlock, launchBlock, launchReceipt, play, tokenLaunchedLog } from './helpers/fixtures.js';
 
 const T = LAUNCH.ts;
@@ -298,5 +305,318 @@ describe('NEW-2: config survives a lost NOTIFY (LISTEN reconnect)', () => {
     store.emitChange('plays_changed');
     await waitFor(() => h.sniper.risk.killSwitch, 2000);
     await waitFor(() => h.sniper.rules.playCount === 2, 2000);
+  });
+});
+
+// ----------------------------------------------------------------------------------- NEW-4 / NEW-6
+const nowS = (): number => Math.floor(Date.now() / 1000);
+const budget = (maxSpend: string, levelEth: string, window = 3600): SpendBudgetState => ({ maxSpend: parseEther(maxSpend), window, level: parseEther(levelEth), updatedAt: nowS() });
+
+describe('NEW-4: the contract spend budget is read and respected', () => {
+  const KEYS = ['0x00000000000000000000000000000000000e0001', '0x00000000000000000000000000000000000b0001'] as Address[];
+  const gateChain = (spend: SpendBudgetState): FakeChain => {
+    const c = new FakeChain();
+    c.sniperConfig = { owner: '0x00000000000000000000000000000000000c01d0', factory: PONS_V2.factory as Address, maxQuoteIn: parseEther('0.2'), operators: [true, true], spend };
+    return c;
+  };
+  const gate = (c: FakeChain, o: { maxBuyEth?: number; maxBankrollEth?: number } = {}) =>
+    liveStartupChecks({ chain: c, sniper: SNIPER, keys: KEYS, estimateFrom: KEYS[1]!, gasLimit: 300_000, gasCheck: false, ...o });
+
+  it('the gate fails when the budget cannot cover the largest preset buy and warns when the budget is off', async () => {
+    const low = await gate(gateChain(budget('0.1', '0')), { maxBuyEth: 0.15 });
+    expect(low.ok).toBe(false);
+    expect(low.errors).toEqual([expect.stringMatching(/NEW-4: the contract's spend budget 0\.1 ETH per 3600 s is below the largest preset buy 0\.15 ETH/)]);
+    expect(low.spend).toMatchObject({ maxSpend: parseEther('0.1'), window: 3600 });
+    // a bankroll preset's largest buy is its maxEth clamped to maxQuoteIn (0.2)
+    expect((await gate(gateChain(budget('0.15', '0')), { maxBankrollEth: 0.3 })).errors).toEqual([expect.stringMatching(/below the largest preset buy 0\.2 ETH/)]);
+    expect((await gate(gateChain(budget('0.8', '0')), { maxBuyEth: 0.15, maxBankrollEth: 0.3 })).ok).toBe(true);
+    const off = await gate(gateChain(budget('0', '0', 0)), { maxBuyEth: 0.15 });
+    expect(off.ok).toBe(true);
+    expect(off.warnings).toEqual([expect.stringMatching(/spend budget is OFF/)]);
+  });
+
+  it('decide time: a remaining budget below quoteIn refuses the snipe with a spend_budget_exhausted alert (no burst member would have bought)', async () => {
+    const h = harness();
+    h.sniper.setContractLimits({ maxQuoteIn: parseEther('0.2'), spend: budget('1', '0.98') });
+    await h.sniper.start();
+    h.warm();
+    h.launchSecond();
+    await waitFor(() => h.sniper.counters.aborted === 1);
+    expect(h.scripted!.orders).toHaveLength(0);
+    await h.sniper.recorder.idle();
+    expect([...h.store.snipes.values()][0]!.notes).toMatch(/spend budget exhausted: 0\.02 ETH left < quoteIn 0\.07 ETH/);
+    const alert = h.store.events.find((e) => e.type === 'spend_budget_exhausted')!;
+    expect(alert.level).toBe('error');
+    expect(alert.payload).toMatchObject({ quoteInEth: '0.07', maxSpendEth: '1', windowSec: 3600 });
+  });
+
+  it('our own fill is charged locally until the next chain read (the next decision sees the smaller budget)', () => {
+    const t = nowS();
+    const lim = new ContractLimits({ maxQuoteIn: parseEther('0.2'), spend: { ...budget('0.1', '0'), updatedAt: t } });
+    expect(lim.available(t)).toBe(parseEther('0.1'));
+    lim.charge(parseEther('0.07'), t);
+    expect(lim.available(t)).toBe(parseEther('0.03'));
+    expect(lim.cap(t)).toBe(parseEther('0.03'));
+    // it refills continuously like the contract (0.1 ETH per 3600 s), lagging the clock by 2 s so it never runs ahead of the chain
+    expect(lim.available(t + 1802)).toBe(parseEther('0.08'));
+    expect(lim.available(t + 1800)).toBeLessThan(parseEther('0.08'));
+    // a fresh chain read replaces the local estimate
+    lim.set({ spend: budget('0.1', '0.05') });
+    expect(lim.available(nowS())).toBe(parseEther('0.05'));
+    // budget off on chain: no cap from it
+    lim.set({ spend: budget('0', '0', 0) });
+    expect(lim.available()).toBeNull();
+    expect(lim.cap()).toBe(parseEther('0.2'));
+  });
+});
+
+describe('NEW-6: sizes are clamped to the contract caps; only a FIXED buyEth above maxQuoteIn is refused', () => {
+  const BANKROLL_PLAY = { ...DEPLOYER_PLAY, preset: { maxEntryMcapEth: 4, sizing: { mode: 'bankroll', fraction: 0.25, minEth: 0.01, maxEth: 0.3 } } };
+
+  it('a bankroll play (maxEth 0.3 > maxQuoteIn 0.2) buys maxQuoteIn instead of being refused', async () => {
+    const backend = new ScriptedBackend();
+    backend.balance = parseEther('3'); // 3 × 0.25 / 3 = 0.25 ETH before the caps
+    const h = harness({ store: new MemoryStore({ plays: [play(BANKROLL_PLAY)] }), backend });
+    h.sniper.setContractLimits({ maxQuoteIn: parseEther('0.2'), spend: budget('0.8', '0') });
+    await h.sniper.start();
+    h.warm();
+    h.launchSecond();
+    await waitFor(() => backend.orders.length === 1);
+    const run = backend.orders[0]!.run;
+    expect(run.quoteIn).toBe(parseEther('0.2'));
+    expect(run.sizing).toMatchObject({ mode: 'bankroll', clamped: 'contract' });
+    expect(run.notes.join()).toMatch(/clamped to the contract cap 0\.2 ETH/);
+    backend.resolveFill!(null);
+  });
+
+  it('a bankroll size is clamped to the remaining spend budget; below minEth it is refused with spend_budget_exhausted', async () => {
+    const backend = new ScriptedBackend();
+    backend.balance = parseEther('3');
+    const h = harness({ store: new MemoryStore({ plays: [play(BANKROLL_PLAY)] }), backend });
+    h.sniper.setContractLimits({ maxQuoteIn: parseEther('0.2'), spend: budget('0.8', '0.75') });
+    await h.sniper.start();
+    h.warm();
+    h.launchSecond();
+    await waitFor(() => backend.orders.length === 1);
+    expect(backend.orders[0]!.run.quoteIn).toBe(parseEther('0.05'));
+    backend.resolveFill!(null);
+
+    const b2 = new ScriptedBackend();
+    b2.balance = parseEther('3');
+    const h2 = harness({ store: new MemoryStore({ plays: [play(BANKROLL_PLAY)] }), backend: b2 });
+    h2.sniper.setContractLimits({ maxQuoteIn: parseEther('0.2'), spend: budget('0.8', '0.795') });
+    await h2.sniper.start();
+    h2.warm();
+    h2.launchSecond();
+    await waitFor(() => h2.sniper.counters.aborted === 1);
+    expect(b2.orders).toHaveLength(0);
+    await h2.sniper.recorder.idle();
+    expect([...h2.store.snipes.values()][0]!.notes).toMatch(/bankroll size clamped to the contract cap 0\.005 ETH < minEth 0\.01/);
+    expect(h2.store.events.map((e) => e.type)).toContain('spend_budget_exhausted');
+  });
+
+  it('paper applies the same caps: maxQuoteIn clamp, spend budget and the contract balance (L8 twin)', async () => {
+    const mk = (o: { plays: Parameters<typeof play>[0][]; paperBankrollEth?: number; paperLimits?: SniperOptions['paperLimits'] }) => {
+      const chain = new FakeChain();
+      // eslint-disable-next-line prefer-const
+      let sniper: Sniper;
+      const backend = new PaperExecutor({ chain, logger: silentLogger, book: (c) => sniper.positions.book(c), creatorTaxBps: (c) => sniper.creatorTaxBps(c) });
+      const h = harness({
+        mode: 'paper',
+        chain,
+        backend,
+        store: new MemoryStore({ plays: o.plays.map((x) => play(x)) }),
+        opts: { ...(o.paperBankrollEth !== undefined ? { paperBankrollEth: o.paperBankrollEth } : {}), ...(o.paperLimits ? { paperLimits: o.paperLimits } : {}) },
+      });
+      sniper = h.sniper;
+      return h;
+    };
+    // (a) maxQuoteIn 0.04 clamps a bankroll size (0.6 × 0.25 / 3 = 0.05)
+    const a = mk({ plays: [BANKROLL_PLAY], paperBankrollEth: 0.6, paperLimits: { maxQuoteIn: parseEther('0.04'), maxSpend: parseEther('1'), spendWindow: 3600 } });
+    await a.sniper.start();
+    a.warm();
+    a.launchSecond();
+    await waitFor(() => a.sniper.activeRuns[0]?.plan !== undefined);
+    expect(a.sniper.activeRuns[0]!.quoteIn).toBe(parseEther('0.04'));
+    // (b) a budget below a fixed 0.07 buy refuses at decide time (paper default limits otherwise)
+    const b = mk({ plays: [DEPLOYER_PLAY], paperLimits: { maxQuoteIn: parseEther('0.3'), maxSpend: parseEther('0.05'), spendWindow: 3600 } });
+    await b.sniper.start();
+    b.warm();
+    b.launchSecond();
+    await waitFor(() => b.sniper.counters.aborted === 1);
+    expect(b.store.events.map((e) => e.type)).toContain('spend_budget_exhausted');
+    // (c) the simulated contract balance (paper bankroll 0.05) cannot pay a fixed 0.07 buy
+    const c = mk({ plays: [DEPLOYER_PLAY], paperBankrollEth: 0.05 });
+    await c.sniper.start();
+    c.warm();
+    c.launchSecond();
+    await waitFor(() => c.sniper.counters.aborted === 1);
+    await c.sniper.recorder.idle();
+    expect([...c.store.snipes.values()][0]!.notes).toMatch(/paper: contract balance 0\.05 ETH < quoteIn 0\.07 ETH/);
+    expect(c.store.events.map((e) => e.type)).toContain('low_balance');
+  });
+});
+
+describe('paper mode accumulates its daily loss at runtime (it stops like live would)', () => {
+  it('a paper position closing at a loss counts toward the paper daily loss limit', () => {
+    const r = new Risk({ mode: 'paper', maxConcurrent: 3, dailyLossLimitEth: 0.05, maxGasPriceGwei: 1 });
+    r.reserve();
+    r.onPositionClosed(-0.03);
+    expect(r.realizedToday).toBeCloseTo(-0.03, 12);
+    expect(r.sendCheck().ok).toBe(true);
+    r.bookRealized(-0.03);
+    expect(r.sendCheck().reasons).toEqual([expect.stringMatching(/daily loss -0\.0600 ETH ≥ limit 0\.05/)]);
+  });
+});
+
+// ----------------------------------------------------------------------------------- NEW-8
+describe('NEW-8: chunked log reads and a refreshed contract config', () => {
+  it('recentLaunches walks back in eth_getLogs ranges of ≤ 10 000 blocks (public RPCs refuse 36 000 at once)', async () => {
+    const head = 1_000_000;
+    const ranges: [number, number][] = [];
+    const launchAt = [head - 2_000, head - 15_000, head - 25_000];
+    const transport = custom({
+      async request({ method, params }: { method: string; params?: unknown }) {
+        if (method === 'eth_blockNumber') return `0x${head.toString(16)}`;
+        if (method === 'eth_getLogs') {
+          const f = (params as [{ fromBlock: Hex; toBlock: Hex }])[0];
+          const [a, b] = [Number(f.fromBlock), Number(f.toBlock)];
+          if (b - a + 1 > LOG_CHUNK_BLOCKS) throw new Error('query exceeds max block range 10000');
+          ranges.push([a, b]);
+          return launchAt
+            .filter((n) => n >= a && n <= b)
+            .map((n, i) => ({
+              address: PONS_V2.factory,
+              topics: encodeEventTopics({ abi: factoryAbi, eventName: 'TokenLaunched', args: { token: `0x${n.toString(16).padStart(40, '0')}` as Address, curve: `0x${(n + 1).toString(16).padStart(40, '0')}` as Address, deployer: LAUNCH.deployer } }),
+              data: encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }, { type: 'uint256' }], ['0x0000000000000000000000000000000000000000', 0n, 4_200_000_000_000_000_000n]),
+              blockNumber: `0x${n.toString(16)}`,
+              transactionHash: `0x${n.toString(16).padStart(64, '0')}`,
+              transactionIndex: '0x0',
+              blockHash: `0x${'11'.repeat(32)}`,
+              logIndex: `0x${i.toString(16)}`,
+              removed: false,
+            }));
+        }
+        throw new Error(`unexpected ${method}`);
+      },
+    });
+    const chain = new ViemChain({ httpUrl: 'http://unused', transport });
+    const got = await chain.recentLaunches(36_000, 2);
+    expect(got.map((l) => l.block)).toEqual([head - 2_000, head - 15_000]); // newest first, stops at the limit
+    expect(ranges.every(([a, b]) => b - a + 1 <= LOG_CHUNK_BLOCKS)).toBe(true);
+    // [head − 36 000, head] in 10 000-block chunks, newest first; stops once the limit is reached
+    expect(ranges).toEqual([
+      [head - 6_000, head],
+      [head - 16_000, head - 6_001],
+    ]);
+    expect((await chain.recentLaunches(36_000, 8)).map((l) => l.block)).toEqual(launchAt);
+  });
+
+  it('while the gate passes the contract config is re-read every GATE_REFRESH_MS and the latest limits reach the decide path', async () => {
+    const results: StartupCheckResult[] = [];
+    let mq = parseEther('0.2');
+    let operatorOk = true;
+    let readable = true;
+    const base: StartupCheckResult = { ok: true, errors: [], warnings: [], gasEstimate: 180_000n, exitGasEstimate: 90_000n, maxQuoteIn: mq, spend: budget('0.8', '0'), estimatedOn: null };
+    const h = harness();
+    const gate = new LiveGate({
+      logger: silentLogger,
+      refreshMs: 10,
+      retryMs: 10_000,
+      check: async () => ({ ...base, maxQuoteIn: mq }),
+      refresh: async () =>
+        !readable
+          ? { ...base, ok: false, errors: ['reading the PonsSniper config failed: HTTP 429'], maxQuoteIn: null, gasEstimate: null, exitGasEstimate: null }
+          : operatorOk
+            ? { ...base, maxQuoteIn: mq, gasEstimate: null, exitGasEstimate: null }
+            : { ...base, ok: false, errors: ['executor key 0xb is not an operator'], maxQuoteIn: mq, gasEstimate: null, exitGasEstimate: null },
+      onResult: (r) => {
+        results.push(r);
+        if (r.maxQuoteIn !== null) h.sniper.setContractLimits({ maxQuoteIn: r.maxQuoteIn, spend: r.spend ?? null });
+        h.sniper.risk.blockEntries(r.ok ? null : r.errors.join('; '));
+      },
+    });
+    await gate.run();
+    expect(h.sniper.limits.maxQuoteIn).toBe(parseEther('0.2'));
+    mq = parseEther('0.1'); // the owner lowered maxQuoteIn
+    await waitFor(() => h.sniper.limits.maxQuoteIn === parseEther('0.1'), 2000);
+    expect(results.at(-1)!.gasEstimate).toBe(180_000n); // the full check's estimates are kept
+    operatorOk = false; // a key was revoked: entries blocked at the next refresh
+    await waitFor(() => h.sniper.risk.entriesBlocked !== null, 2000);
+    expect(h.sniper.risk.entriesBlocked).toMatch(/not an operator/);
+    gate.stop();
+    // a refresh that merely could not read keeps the previous state (the contract enforces anyway)
+    const g2Results: StartupCheckResult[] = [];
+    readable = false;
+    operatorOk = true;
+    const g2 = new LiveGate({ logger: silentLogger, refreshMs: 5, check: async () => base, refresh: async () => ({ ...base, ok: false, errors: ['reading the PonsSniper config failed'], maxQuoteIn: null }), onResult: (r) => g2Results.push(r) });
+    await g2.run();
+    await sleep(40);
+    g2.stop();
+    expect(g2Results).toHaveLength(1);
+  });
+});
+
+// ----------------------------------------------------------------------------------- NEW-9
+describe('NEW-9: exit keys (EXIT_KEYS)', () => {
+  const EXIT_A = privateKeyToAccount('0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d');
+  const EXIT_B = privateKeyToAccount('0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6');
+  const BURST = privateKeyToAccount('0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a');
+  const mk = (exitKeys: number) => {
+    const sched = new ManualScheduler(1_000_000);
+    const chain = new FakeChain();
+    const sender = new FakeSender('http://a', () => sched.now());
+    const ex = new LiveExecutor({ accounts: [EXIT_A, EXIT_B, BURST], exitKeys, sniper: SNIPER, chainId: 4663, senders: [sender], chain, scheduler: sched, logger: silentLogger, receiptPollMs: 1, exitReceiptTimeoutMs: 80, settleTimeoutMs: 5 });
+    return { ex, sender };
+  };
+  const order = (n: number): ExitOrder => ({ key: `k${n}`, curve: LAUNCH.curve, token: LAUNCH.token, tokensIn: 10n ** 24n, all: true, minQuoteOut: 0n, reason: 'timeout', gasLimit: 300_000, maxFeeGwei: 1 });
+  const senders = async (raws: { raw: Hex }[]): Promise<string[]> => Promise.all(raws.map(async (r) => (await recoverTransactionAddress({ serializedTransaction: r.raw as `0x02${string}` })).toLowerCase()));
+
+  it('one exit key serves exits strictly FIFO; with EXIT_KEYS=2 concurrent exits go out at once on different keys', async () => {
+    const one = mk(1);
+    expect(one.ex.exitKeys.map((k) => k.address)).toEqual([EXIT_A.address.toLowerCase()]);
+    expect(one.ex.burstKeys.map((k) => k.address)).toEqual([EXIT_B.address.toLowerCase(), BURST.address.toLowerCase()]);
+    const p1 = Promise.all([one.ex.exit(order(1)), one.ex.exit(order(2))]);
+    await sleep(30);
+    expect(one.sender.sent).toHaveLength(1); // the second exit waits for the first one's receipt / timeout
+    await p1;
+    expect(new Set(await senders(one.sender.sent.slice(0, 2)))).toEqual(new Set([EXIT_A.address.toLowerCase()]));
+
+    const two = mk(2);
+    expect(two.ex.exitKeys.map((k) => k.address)).toEqual([EXIT_A.address.toLowerCase(), EXIT_B.address.toLowerCase()]);
+    expect(two.ex.burstKeys.map((k) => k.address)).toEqual([BURST.address.toLowerCase()]);
+    const p2 = Promise.all([two.ex.exit(order(1)), two.ex.exit(order(2))]);
+    await sleep(30);
+    expect(two.sender.sent).toHaveLength(2); // both on the wire before either receipt timeout
+    expect(new Set(await senders(two.sender.sent))).toEqual(new Set([EXIT_A.address.toLowerCase(), EXIT_B.address.toLowerCase()]));
+    await p2;
+    // round-robin afterwards
+    expect(two.ex.pickExitKey().address).not.toBe(two.ex.pickExitKey().address);
+  });
+
+  it('config: EXIT_KEYS must leave at least one burst key', () => {
+    const k = (n: number): string => `0x${String(n).repeat(64)}`;
+    const base = { EXECUTION_MODE: 'live', SNIPER_CONTRACT: SNIPER, DATABASE_URL: 'postgres://x', SEND_ENDPOINTS: 'http://a', EXECUTOR_PRIVATE_KEYS: `${k(1)},${k(2)},${k(3)}` };
+    expect(loadConfig({ ...base, EXIT_KEYS: '2' }).EXIT_KEYS).toBe(2);
+    expect(loadConfig(base).EXIT_KEYS).toBe(1);
+    expect(() => loadConfig({ ...base, EXIT_KEYS: '3' })).toThrow(/leaves no burst key/);
+  });
+});
+
+// ----------------------------------------------------------------------------------- feed_blocks retention
+describe('feed_blocks retention (FEED_BLOCKS_RETENTION_DAYS, pruned from the reconcile timer)', () => {
+  it('drops rows older than the retention at most hourly', async () => {
+    const h = harness({ opts: { feedBlocksRetentionDays: 7 } });
+    const now = Date.now();
+    await h.store.insertFeedBlocks([
+      { block: 1, ts: Math.floor((now - 8 * 86_400_000) / 1000), arrivalMs: 0, nTxs: 0 },
+      { block: 2, ts: Math.floor((now - 6 * 86_400_000) / 1000), arrivalMs: 0, nTxs: 0 },
+      { block: 3, ts: Math.floor(now / 1000), arrivalMs: 0, nTxs: 0 },
+    ]);
+    expect(await h.sniper.pruneFeedBlocks(now)).toBe(1);
+    expect(h.store.feedBlocks.map((r) => r.block)).toEqual([2, 3]);
+    await h.store.insertFeedBlocks([{ block: 4, ts: Math.floor((now - 9 * 86_400_000) / 1000), arrivalMs: 0, nTxs: 0 }]);
+    expect(await h.sniper.pruneFeedBlocks(now + 60_000)).toBe(0); // rate-limited to once an hour
+    expect(await h.sniper.pruneFeedBlocks(now + 3_600_000)).toBe(1);
   });
 });

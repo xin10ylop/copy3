@@ -159,6 +159,9 @@ export class Sniper {
   private readonly secondTxs = new Map<number, { block: number; tx: DecodedTx }[]>();
   private ledgerSecond = 0;
   private readonly timers: NodeJS.Timeout[] = [];
+  /** NEW-3: one-shot re-checks of runs waiting for their deadline block */
+  private readonly retryTimers = new Set<NodeJS.Timeout>();
+  private stopped = false;
   private unsubs: (() => void | Promise<void>)[] = [];
   private seq = 0;
   private statsLoaded = false;
@@ -356,7 +359,10 @@ export class Sniper {
   }
 
   async stop(): Promise<void> {
+    this.stopped = true;
     for (const t of this.timers) clearInterval(t);
+    for (const t of this.retryTimers) clearTimeout(t);
+    this.retryTimers.clear();
     for (const lg of this.ledgers.values()) lg.unwatch?.();
     this.ledgers.clear();
     for (const u of this.unsubs) await u();
@@ -1152,10 +1158,13 @@ export class Sniper {
   /** NEW-3: re-check a run waiting for its deadline block about when the head should pass it. */
   private retrySoon(run: SnipeRun, head: number | null): void {
     const ms = Math.min(10_000, Math.max(500, ((head === null ? 10 : run.deadlineBlock - head) + 1) * 100 + 300));
+    if (this.stopped) return;
     const t = setTimeout(() => {
-      void this.retryUnresolved(run).catch((e: unknown) => this.error(`unresolved run ${run.key}`, e));
+      this.retryTimers.delete(t);
+      if (!this.stopped) void this.retryUnresolved(run).catch((e: unknown) => this.error(`unresolved run ${run.key}`, e));
     }, ms);
     t.unref?.();
+    this.retryTimers.add(t);
   }
 
   private async retryUnresolved(run: SnipeRun): Promise<void> {
@@ -1386,8 +1395,8 @@ export class Sniper {
       txHash: ev.txHash,
       deadlineBlock: 0,
     };
-    // a closed row whose cost was booked already: the leftover is free (cost 0); no row: the buy's own cost
-    const cost = reusable ? (reusable.quoteIn ?? ev.quoteIn) : prev ? 0n : ev.quoteIn;
+    // the buy's own cost (a newer closed row, if any, is named in the alert: its PnL may then count twice)
+    const cost = reusable ? (reusable.quoteIn ?? ev.quoteIn) : ev.quoteIn;
     const row: ActiveSnipe = reusable
       ? { ...reusable, curve: reusable.curve || ev.curve, quoteIn: cost, tokensOut: reusable.tokensOut ?? ev.tokensOut, buyBlock: reusable.buyBlock ?? ev.block }
       : {

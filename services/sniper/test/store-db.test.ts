@@ -1,6 +1,6 @@
 /** PgStore against the real @hood/db migrations on in-process PGlite. */
 import { PGlite } from '@electric-sql/pglite';
-import { applyMigrations, fromPglite, setSetting, upsertPlay, armCandidate, type Sql } from '@hood/db';
+import { applyMigrations, fromPglite, fromPostgres, setSetting, upsertPlay, armCandidate, type Sql } from '@hood/db';
 
 type PgliteClient = Parameters<typeof fromPglite>[0];
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -138,5 +138,60 @@ describe('PgStore (@hood/db on PGlite)', () => {
     const ev = await sql.query<{ type: string; payload: Record<string, unknown> }>('SELECT type, payload FROM events ORDER BY id');
     expect(ev.map((e) => e.type)).toEqual(['snipe_filled', 'feed_gap']);
     expect(ev[1]!.payload).toEqual({ from: '1', to: 2 });
+  });
+
+  it('feed_blocks retention, sweep cursors and rows by token (NEW-3) on the real schema', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    await store.insertFeedBlocks([
+      { block: 100, ts: now - 8 * 86_400, arrivalMs: 0, nTxs: 0 },
+      { block: 101, ts: now - 6 * 86_400, arrivalMs: 0, nTxs: 0 },
+    ]);
+    const before = Number((await sql.query<{ n: string }>('SELECT count(*)::text AS n FROM feed_blocks'))[0]!.n);
+    expect(await store.pruneFeedBlocks(new Date((now - 7 * 86_400) * 1000))).toBeGreaterThanOrEqual(1);
+    const left = await sql.query<{ block: string }>('SELECT block FROM feed_blocks WHERE block >= 100 ORDER BY block');
+    expect(left.map((r) => Number(r.block))).toEqual([101]);
+    expect(Number((await sql.query<{ n: string }>('SELECT count(*)::text AS n FROM feed_blocks'))[0]!.n)).toBeLessThan(before);
+    expect(await store.getCursor('sniped_sweep:0xabc')).toBeNull();
+    await store.setCursor('sniped_sweep:0xabc', 123_456);
+    await store.setCursor('sniped_sweep:0xabc', 123_999);
+    expect(await store.getCursor('sniped_sweep:0xabc')).toBe(123_999);
+    const tok = '0x00000000000000000000000000000000000d0c01';
+    const id = await store.insertSnipe({ playId: 0, token: tok, curve: tok, decidedAt: new Date(), decision: {}, mode: 'live', burst: [], status: 'failed', sells: [], quoteIn: 7n });
+    const rows = await store.findSnipesByToken(tok.toUpperCase().replace('0X', '0x'), 'live');
+    expect(rows.map((r) => [r.id, r.status, r.quoteIn])).toEqual([[id, 'failed', 7n]]);
+    expect(await store.findSnipesByToken(tok, 'paper')).toEqual([]);
+  });
+
+  it('NEW-2: onChange reports every (re)connect of the LISTEN connection (postgres.js onlisten) — PGlite once, a reconnecting client each time', async () => {
+    let connects = 0;
+    const off = await store.onChange(
+      () => undefined,
+      () => connects++,
+    );
+    expect(connects).toBe(1); // PGlite: connected once
+    await off();
+    // the postgres.js wrapper passes onlisten through: a client that reconnects calls it again
+    const onlistens: (() => void)[] = [];
+    const client = {
+      unsafe: () => Object.assign(Promise.resolve([]), { simple: () => Promise.resolve([]) }),
+      begin: async () => undefined,
+      listen: async (_c: string, _n: (p: string) => void, onlisten?: () => void) => {
+        if (onlisten) {
+          onlistens.push(onlisten);
+          onlisten();
+        }
+        return { unlisten: async () => undefined };
+      },
+      notify: async () => undefined,
+      end: async () => undefined,
+    } as unknown as Parameters<typeof fromPostgres>[0];
+    let reconnects = 0;
+    await new PgStore(fromPostgres(client)).onChange(
+      () => undefined,
+      () => reconnects++,
+    );
+    expect(onlistens).toHaveLength(1); // wired once (all channels share the LISTEN connection)
+    onlistens[0]!(); // postgres.js re-LISTENed after a reconnect
+    expect(reconnects).toBe(2);
   });
 });
