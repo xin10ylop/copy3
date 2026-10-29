@@ -161,6 +161,7 @@ export class Sniper {
   private readonly curveTax = new Map<string, number>();
   /** launch tx hash → launch-second ledger (only while a launch-second play is enabled) */
   private readonly ledgers = new Map<string, LaunchSecondLedger>();
+  private settingsReloadTimer: ReturnType<typeof setTimeout> | null = null;
   /** block timestamp → feed txs with a ledger selector (buy/sell/transfer), last few seconds */
   private readonly secondTxs = new Map<number, { block: number; tx: DecodedTx }[]>();
   private ledgerSecond = 0;
@@ -412,7 +413,21 @@ export class Sniper {
         g.applied = ++g.next;
         this.rules.removeArmed(playId, n.wallet);
       } else await this.loadConfig('armed', 'notify');
-    } else if (channel === 'settings_changed') await this.loadConfig('settings', 'notify');
+    } else if (channel === 'settings_changed') {
+      // Checkpoint-style keys are filtered by the trigger (migration 0004); coalesce the rest so a
+      // burst of settings writes causes one reload (R4-5 generations keep the newest load).
+      const key = tryParse<{ key?: string }>(payload)?.key ?? '';
+      if (/checkpoint|^indexer:|^sweep:/.test(key)) return;
+      if (this.settingsReloadTimer) return;
+      this.settingsReloadTimer = setTimeout(() => {
+        this.settingsReloadTimer = null;
+        this.loadConfig('settings', 'notify').then(
+          () => this.o.logger.info({ channel, plays: this.rules.playCount, armed: this.rules.armedCount }, 'config refreshed'),
+          (e: unknown) => this.error('settings reload', e),
+        );
+      }, 250);
+      return;
+    }
     this.o.logger.info({ channel, plays: this.rules.playCount, armed: this.rules.armedCount }, 'config refreshed');
   }
 
