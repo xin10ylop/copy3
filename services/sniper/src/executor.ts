@@ -67,6 +67,22 @@ export interface ExitResult {
   unknown?: boolean;
   /** mined and reverted on chain (a verdict; everything else failed before the chain decided) */
   reverted?: boolean;
+  /** R4-4: the result of an EARLIER receipt-less exit of this position that has now landed (re-sent as is) */
+  replayed?: boolean;
+  /** the landed tx was an `exitAll` (a replayed result may differ from the current order's `all`) */
+  all?: boolean;
+}
+
+/** R4-4: an exit broadcast without a receipt in time — re-sent as is (same key, nonce, raw) until final. */
+interface PendingExit {
+  key: ExecutorKey;
+  nonce: number;
+  raw: Hex;
+  hash: Hex;
+  tokensIn: bigint;
+  all: boolean;
+  /** mined (its receipt is read by the position's next exit call); no longer holds the key */
+  landed?: boolean;
 }
 
 export interface PreflightInput {
@@ -250,6 +266,8 @@ export class LiveExecutor implements ExecutionBackend {
   readonly exitKeys: ExecutorKey[];
   readonly burstKeys: ExecutorKey[];
   private nextExit = 0;
+  /** R4-4: receipt-less exits by position key */
+  readonly pendingExits = new Map<string, PendingExit>();
   /** PonsSniper ETH balance (cached, refreshed off the hot path) */
   contractBalanceWei: bigint | null = null;
   private readonly cancels = new Map<string, (() => void)[]>();
@@ -339,7 +357,7 @@ export class LiveExecutor implements ExecutionBackend {
     const pool = funded.length ? funded : ks;
     for (let i = 0; i < ks.length; i++) {
       const k = ks[(this.nextExit + i) % ks.length]!;
-      if (pool.includes(k) && k.pendingExits === 0) {
+      if (pool.includes(k) && k.pendingExits === 0 && !this.hasPendingExit(k)) {
         this.nextExit = (this.nextExit + i + 1) % ks.length;
         return k;
       }
@@ -579,10 +597,30 @@ export class LiveExecutor implements ExecutionBackend {
    * [chain count, highest broadcast] were sent but never consumed (a hole in front of them):
    * consume each with a 0-value self-transfer so nothing stale can execute later, then resync.
    */
+  private hasPendingExit(key: ExecutorKey): boolean {
+    for (const p of this.pendingExits.values()) if (p.key === key && !p.landed) return true;
+    return false;
+  }
+
   async settle(key: ExecutorKey): Promise<void> {
     if (key.nonces.busy) return;
     const latest = await this.o.chain.getTransactionCount(key.address, 'latest').catch(() => null);
     if (latest === null) return;
+    // R4-4: a receipt-less exit on this key keeps its nonce: never fill it with a self-transfer or
+    // resync below it; re-send it (same raw) so the queue behind it keeps moving. Final once the
+    // chain consumed its nonce (mined — the next exit call reads its receipt — or replaced).
+    let holding = false;
+    for (const [k, p] of this.pendingExits) {
+      if (p.key !== key) continue;
+      if (latest > p.nonce) {
+        if (await this.o.chain.getReceipt(p.hash).catch(() => null)) p.landed = true;
+        else this.pendingExits.delete(k); // replaced: nothing to wait for
+      } else {
+        holding = true;
+        await this.broadcast(p.raw, []).catch(() => false);
+      }
+    }
+    if (holding) return;
     const maxSent = key.nonces.maxSent;
     if (latest > maxSent) {
       key.nonces.resync(latest);
@@ -694,9 +732,76 @@ export class LiveExecutor implements ExecutionBackend {
     }
   }
 
+  /** A mined exit receipt → ExitResult (Exited event: tokens sold, proceeds). */
+  private exitResult(r: ReceiptLite, hash: Hex, tokensIn: bigint): ExitResult {
+    if (r.status !== 'success') return { ok: false, tokensIn, quoteOut: 0n, txHash: hash, block: r.blockNumber, error: 'exit reverted', reverted: true };
+    let quoteOut = 0n;
+    let sold = tokensIn;
+    for (const l of r.logs) {
+      if (l.address.toLowerCase() !== this.o.sniper.toLowerCase()) continue;
+      try {
+        const d = decodeEventLog({ abi: sniperAbi, data: l.data as Hex, topics: l.topics as [Hex, ...Hex[]] });
+        if (d.eventName === 'Exited') {
+          quoteOut = d.args.quoteOut;
+          sold = d.args.tokensIn;
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    return { ok: true, tokensIn: sold, quoteOut, txHash: hash, block: r.blockNumber };
+  }
+
+  private async waitReceipt(hash: Hex): Promise<ReceiptLite | null> {
+    const deadline = Date.now() + (this.o.exitReceiptTimeoutMs ?? 10_000);
+    while (Date.now() < deadline) {
+      const r = await this.o.chain.getReceipt(hash).catch(() => null);
+      if (r) return r;
+      await sleep(this.poll);
+    }
+    return null;
+  }
+
+  /**
+   * R4-4: the position's previous exit had no receipt in time. Re-signing on another key (or a new
+   * nonce) could make BOTH sells execute when the first one lands late, so the SAME raw tx is
+   * re-sent on its key and nonce until it is final: mined (its result is returned, `replayed`) or
+   * its nonce consumed by another tx (then nothing was sold by it and a fresh exit may follow).
+   */
+  private resumeExit(posKey: string, p: PendingExit): Promise<ExitResult> {
+    p.key.pendingExits++;
+    return p.key
+      .lock(async (): Promise<ExitResult> => {
+        const done = (r: ReceiptLite): ExitResult => {
+          this.pendingExits.delete(posKey);
+          return { ...this.exitResult(r, p.hash, p.tokensIn), replayed: true, all: p.all };
+        };
+        const r0 = await this.o.chain.getReceipt(p.hash).catch(() => null);
+        if (r0) return done(r0);
+        const latest = await this.o.chain.getTransactionCount(p.key.address, 'latest').catch(() => null);
+        if (latest !== null && latest > p.nonce) {
+          const r1 = await this.o.chain.getReceipt(p.hash).catch(() => null);
+          if (r1) return done(r1);
+          this.pendingExits.delete(posKey);
+          await this.settle(p.key).catch(() => undefined);
+          return { ok: false, tokensIn: p.tokensIn, quoteOut: 0n, txHash: p.hash, error: 'the earlier receipt-less exit was dropped (its nonce went to another tx): nothing sold by it' };
+        }
+        this.stats.exits++;
+        await this.broadcast(p.raw, []);
+        const r = await this.waitReceipt(p.hash);
+        if (r) return done(r);
+        return { ok: false, tokensIn: p.tokensIn, quoteOut: 0n, txHash: p.hash, error: 'exit receipt timeout (same tx re-sent)', unknown: true };
+      })
+      .finally(() => {
+        p.key.pendingExits--;
+      });
+  }
+
   async exit(order: ExitOrder): Promise<ExitResult> {
     this.stats.exits++;
     if (!order.all && order.tokensIn <= 0n) return { ok: false, tokensIn: 0n, quoteOut: 0n, error: 'zero-size exit refused (L1)' };
+    const pending = this.pendingExits.get(order.key);
+    if (pending) return this.resumeExit(order.key, pending);
     const key = this.pickExitKey();
     key.pendingExits++;
     return key.lock(async () => {
@@ -722,29 +827,10 @@ export class LiveExecutor implements ExecutionBackend {
         if (!(await this.broadcast(raw, sends)))
           return { ok: false, tokensIn: order.tokensIn, quoteOut: 0n, txHash: hash, error: sends.map((s) => s.error).filter(Boolean).join('; ') || 'not accepted' };
         key.nonces.markSent(nonce!);
-        const deadline = Date.now() + (this.o.exitReceiptTimeoutMs ?? 10_000);
-        while (Date.now() < deadline) {
-          const r = await this.o.chain.getReceipt(hash).catch(() => null);
-          if (r) {
-            if (r.status !== 'success') return { ok: false, tokensIn: order.tokensIn, quoteOut: 0n, txHash: hash, block: r.blockNumber, error: 'exit reverted', reverted: true };
-            let quoteOut = 0n;
-            let tokensIn = order.tokensIn;
-            for (const l of r.logs) {
-              if (l.address.toLowerCase() !== this.o.sniper.toLowerCase()) continue;
-              try {
-                const d = decodeEventLog({ abi: sniperAbi, data: l.data as Hex, topics: l.topics as [Hex, ...Hex[]] });
-                if (d.eventName === 'Exited') {
-                  quoteOut = d.args.quoteOut;
-                  tokensIn = d.args.tokensIn;
-                }
-              } catch {
-                /* ignore */
-              }
-            }
-            return { ok: true, tokensIn, quoteOut, txHash: hash, block: r.blockNumber };
-          }
-          await sleep(this.poll);
-        }
+        const r = await this.waitReceipt(hash);
+        if (r) return this.exitResult(r, hash, order.tokensIn);
+        // R4-4: keep key + nonce + raw: the next attempt for this position re-sends this very tx
+        this.pendingExits.set(order.key, { key, nonce: nonce!, raw, hash, tokensIn: order.tokensIn, all: order.all });
         return { ok: false, tokensIn: order.tokensIn, quoteOut: 0n, txHash: hash, error: 'exit receipt timeout', unknown: true };
       } finally {
         key.nonces.release();

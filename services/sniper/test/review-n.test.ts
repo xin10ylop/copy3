@@ -453,6 +453,8 @@ describe('N11: readSniper pins bought() and balanceOf() to one block', () => {
       request: async ({ method, params }: { method: string; params: unknown[] }) => {
         calls.push({ method, params });
         if (method === 'eth_blockNumber') return '0x5f5e100';
+        // R4-2: readSniper pins to the latest block header (number + timestamp)
+        if (method === 'eth_getBlockByNumber') return { number: '0x5f5e100', timestamp: '0x6a000000', hash: `0x${'ab'.repeat(32)}`, transactions: [] };
         if (method === 'eth_call') {
           const data = (params[0] as { data: string }).data;
           return data.startsWith('0x667022fd') ? encodeAbiParameters([{ type: 'bool' }], [true]) : encodeAbiParameters([{ type: 'uint256' }], [123n]);
@@ -462,7 +464,7 @@ describe('N11: readSniper pins bought() and balanceOf() to one block', () => {
       },
     });
     const vc = new ViemChain({ httpUrl: 'http://unused', transport });
-    expect(await vc.readSniper(SNIPER, LAUNCH.token)).toEqual({ bought: true, balance: 123n });
+    expect(await vc.readSniper(SNIPER, LAUNCH.token)).toEqual({ bought: true, balance: 123n, block: 100_000_000, blockTs: 0x6a000000 });
     const tags = calls.filter((c) => c.method === 'eth_call').map((c) => c.params[1]);
     expect(tags).toEqual(['0x5f5e100', '0x5f5e100']);
   });

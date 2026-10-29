@@ -42,6 +42,9 @@ export interface ReceiptLite {
 export interface SniperHolding {
   bought: boolean;
   balance: bigint;
+  /** R4-2: the block both values were read at (and its timestamp): "no buy" is final only past the deadline of THIS read */
+  block?: number;
+  blockTs?: number;
 }
 
 export interface RecentLaunch {
@@ -86,6 +89,53 @@ export interface SnipedLog {
 /** Public RPCs cap eth_getLogs ranges (often 10 000 blocks): every log scan is chunked (NEW-8). */
 export const LOG_CHUNK_BLOCKS = 10_000;
 
+/** R4-7: the smallest chunk a range error halves down to (some RPCs cap eth_getLogs at 1-5k blocks). */
+export const MIN_LOG_CHUNK_BLOCKS = 500;
+const RANGE_ERR_RE =
+  /block range|range (is )?too (large|wide|big)|exceeds? (the )?(max|maximum|limit)|max(imum)? (block )?range|too many (blocks|results|logs)|query returned more than|response size|range limit|blocks? limit/i;
+
+/** An eth_getLogs error that a smaller range fixes (not a rate limit / outage). */
+export function isRangeError(e: unknown): boolean {
+  const m = e instanceof Error ? `${e.message} ${(e as { details?: string }).details ?? ''}` : String(e);
+  return RANGE_ERR_RE.test(m) && !/\b429\b|rate.?limit/i.test(m);
+}
+
+/**
+ * R4-7: walk [from, to] in chunks — ascending or descending — fetching each with `fetch(a, b)`
+ * and handing the result to `onChunk` (return false to stop). A range error halves the chunk
+ * (down to MIN_LOG_CHUNK_BLOCKS) and retries the same range; the size learnt sticks in `state`.
+ */
+export async function scanChunks<T>(
+  from: number,
+  to: number,
+  dir: 'asc' | 'desc',
+  fetch: (a: number, b: number) => Promise<T>,
+  onChunk: (r: T, a: number, b: number) => boolean | void | Promise<boolean | void>,
+  state: { chunk: number } = { chunk: LOG_CHUNK_BLOCKS },
+): Promise<void> {
+  let lo = Math.max(0, from);
+  let hi = to;
+  while (lo <= hi) {
+    const size = Math.max(1, state.chunk);
+    const a = dir === 'asc' ? lo : Math.max(lo, hi - size + 1);
+    const b = dir === 'asc' ? Math.min(hi, lo + size - 1) : hi;
+    let r: T;
+    try {
+      r = await fetch(a, b);
+    } catch (e) {
+      if (isRangeError(e) && size > MIN_LOG_CHUNK_BLOCKS) {
+        state.chunk = Math.max(MIN_LOG_CHUNK_BLOCKS, Math.floor(size / 2));
+        continue;
+      }
+      throw e;
+    }
+    const go = await onChunk(r, a, b);
+    if (dir === 'asc') lo = b + 1;
+    else hi = a - 1;
+    if (go === false) return;
+  }
+}
+
 /** [from, to] (inclusive) split into ranges of at most `chunk` blocks, oldest first. */
 export function blockRanges(from: number, to: number, chunk = LOG_CHUNK_BLOCKS): [number, number][] {
   const out: [number, number][] = [];
@@ -103,8 +153,12 @@ export interface ChainClient {
   estimateGas(tx: { from: Address; to: Address; data: Hex; value?: bigint; stateOverride?: StateOverride }): Promise<bigint>;
   /** most recent TokenLaunched logs within `lookbackBlocks`, newest first, at most `limit` (startup checks; chunked, NEW-8) */
   recentLaunches(lookbackBlocks: number, limit: number): Promise<RecentLaunch[]>;
-  /** PonsSniper `Sniped` events in [fromBlock, toBlock], oldest first (chunked ≤ LOG_CHUNK_BLOCKS) */
-  snipedLogs(sniper: Address, fromBlock: number, toBlock: number): Promise<SnipedLog[]>;
+  /**
+   * PonsSniper `Sniped` events in [fromBlock, toBlock], oldest first (chunked, halving on range
+   * errors). `onChunk(logs, toBlock)` runs after each chunk (return false to stop): the orphan
+   * sweep advances its checkpoint per chunk (R4-7).
+   */
+  snipedLogs(sniper: Address, fromBlock: number, toBlock: number, onChunk?: (logs: SnipedLog[], toBlock: number) => boolean | void | Promise<boolean | void>): Promise<SnipedLog[]>;
   /** owner / factory / maxQuoteIn / operators(keys) of the PonsSniper contract */
   readSniperConfig(sniper: Address, keys: readonly Address[]): Promise<SniperConfigState>;
   getTransactionCount(address: Address, tag: 'latest' | 'pending'): Promise<number>;
@@ -120,6 +174,9 @@ export interface ChainClient {
   watchToken?(token: Address, curve: Address, cb: (log: RawLog) => void): () => void;
 }
 
+/** Logs a reorg removed (`removed: true`) are dropped everywhere (R4-8). */
+const live = <L extends { removed?: boolean }>(logs: readonly L[]): L[] => logs.filter((l) => l.removed !== true);
+
 const toRaw = (l: Log): RawLog => ({
   address: l.address.toLowerCase(),
   topics: l.topics as string[],
@@ -132,6 +189,8 @@ const toRaw = (l: Log): RawLog => ({
 export class ViemChain implements ChainClient {
   private readonly http: PublicClient;
   private readonly ws: PublicClient | null;
+  /** R4-7: the eth_getLogs chunk size this endpoint accepts (learnt from range errors) */
+  readonly logChunk = { chunk: LOG_CHUNK_BLOCKS };
 
   /** `transport` replaces the http transport (tests). */
   constructor(opts: { httpUrl: string; wsUrl?: string; transport?: Transport }) {
@@ -158,13 +217,16 @@ export class ViemChain implements ChainClient {
   }
 
   async readSniper(sniper: Address, token: Address): Promise<SniperHolding> {
-    // N11: both reads pinned to one block, or a buy landing in between gives bought=false + balance>0
-    const blockNumber = await this.http.getBlockNumber({ cacheTime: 0 });
+    // N11: both reads pinned to one block, or a buy landing in between gives bought=false + balance>0.
+    // R4-2: that block (and its timestamp) is returned — the caller judges finality on THIS read, not
+    // on a head read from another (possibly lagging, load-balanced) backend
+    const blk = await this.http.getBlock({ blockTag: 'latest' });
+    const blockNumber = blk.number!;
     const [bought, balance] = await Promise.all([
       this.http.readContract({ address: sniper, abi: sniperAbi, functionName: 'bought', args: [token], blockNumber }),
       this.http.readContract({ address: token, abi: tokenAbi, functionName: 'balanceOf', args: [sniper], blockNumber }),
     ]);
-    return { bought, balance };
+    return { bought, balance, block: Number(blockNumber), blockTs: Number(blk.timestamp) };
   }
 
   curveGraduated(curve: Address): Promise<boolean> {
@@ -184,30 +246,36 @@ export class ViemChain implements ChainClient {
   async recentLaunches(lookbackBlocks: number, limit: number): Promise<RecentLaunch[]> {
     // NEW-8: one eth_getLogs over 36 000 blocks is refused by public RPCs (range caps) and the gate
     // then failed closed forever: walk back in chunks of ≤ LOG_CHUNK_BLOCKS, newest first
+    // R4-7: the chunk halves on a range error (RPCs capping at 1-5k blocks)
     const head = Number(await this.http.getBlockNumber({ cacheTime: 0 }));
     const out: RecentLaunch[] = [];
-    for (const [a, b] of blockRanges(head - lookbackBlocks, head).reverse()) {
-      const logs = await this.http.getLogs({
-        address: PONS_V2.factory as Address,
-        event: getAbiItem({ abi: factoryAbi, name: 'TokenLaunched' }),
-        fromBlock: BigInt(a),
-        toBlock: BigInt(b),
-      });
-      for (const l of [...logs].reverse()) {
-        const p = parseTokenLaunchedLog(toRaw(l as Log));
-        out.push({ token: p.token as Address, curve: p.curve as Address, block: Number(l.blockNumber ?? 0n) });
-        if (out.length >= limit) return out;
-      }
-    }
+    await scanChunks(
+      head - lookbackBlocks,
+      head,
+      'desc',
+      (a, b) => this.http.getLogs({ address: PONS_V2.factory as Address, event: getAbiItem({ abi: factoryAbi, name: 'TokenLaunched' }), fromBlock: BigInt(a), toBlock: BigInt(b) }),
+      (logs) => {
+        for (const l of live(logs).reverse()) {
+          const p = parseTokenLaunchedLog(toRaw(l as Log));
+          out.push({ token: p.token as Address, curve: p.curve as Address, block: Number(l.blockNumber ?? 0n) });
+          if (out.length >= limit) return false;
+        }
+        return true;
+      },
+      this.logChunk,
+    );
     return out;
   }
 
-  async snipedLogs(sniper: Address, fromBlock: number, toBlock: number): Promise<SnipedLog[]> {
+  async snipedLogs(sniper: Address, fromBlock: number, toBlock: number, onChunk?: (logs: SnipedLog[], toBlock: number) => boolean | void | Promise<boolean | void>): Promise<SnipedLog[]> {
     const out: SnipedLog[] = [];
-    for (const [a, b] of blockRanges(fromBlock, toBlock)) {
-      const logs = await this.http.getLogs({ address: sniper, event: getAbiItem({ abi: sniperAbi, name: 'Sniped' }), fromBlock: BigInt(a), toBlock: BigInt(b) });
-      for (const l of logs) {
-        out.push({
+    await scanChunks(
+      fromBlock,
+      toBlock,
+      'asc',
+      (a, b) => this.http.getLogs({ address: sniper, event: getAbiItem({ abi: sniperAbi, name: 'Sniped' }), fromBlock: BigInt(a), toBlock: BigInt(b) }),
+      async (logs, _a, b) => {
+        const chunk = live(logs).map((l) => ({
           token: l.args.token!.toLowerCase() as Address,
           curve: l.args.curve!.toLowerCase() as Address,
           quoteIn: l.args.quoteIn!,
@@ -215,9 +283,12 @@ export class ViemChain implements ChainClient {
           taxBps: Number(l.args.taxBps!),
           block: Number(l.blockNumber ?? 0n),
           txHash: (l.transactionHash ?? '0x') as Hex,
-        });
-      }
-    }
+        }));
+        out.push(...chunk);
+        return onChunk ? onChunk(chunk, b) : true;
+      },
+      this.logChunk,
+    );
     return out;
   }
 
@@ -251,7 +322,7 @@ export class ViemChain implements ChainClient {
         status: r.status,
         blockNumber: Number(r.blockNumber),
         gasUsed: r.gasUsed,
-        logs: r.logs.map((l) => toRaw(l as Log)),
+        logs: live(r.logs).map((l) => toRaw(l as Log)),
       };
     } catch (e) {
       if ((e as { name?: string }).name === 'TransactionReceiptNotFoundError') return null;
@@ -305,7 +376,7 @@ export class ViemChain implements ChainClient {
     return this.ws.watchEvent({
       address: PONS_V2.factory as Address,
       event: getAbiItem({ abi: factoryAbi, name: 'TokenLaunched' }),
-      onLogs: (logs) => logs.forEach((l) => cb(toRaw(l as Log))),
+      onLogs: (logs) => live(logs).forEach((l) => cb(toRaw(l as Log))),
     });
   }
 
@@ -319,12 +390,12 @@ export class ViemChain implements ChainClient {
         getAbiItem({ abi: curveAbi, name: 'CurveCompleted' }),
         getAbiItem({ abi: curveAbi, name: 'SnipeTaxExempted' }),
       ],
-      onLogs: (logs) => logs.forEach((l) => cb(toRaw(l as Log))),
+      onLogs: (logs) => live(logs).forEach((l) => cb(toRaw(l as Log))),
     });
     const b = this.ws.watchEvent({
       address: token,
       event: getAbiItem({ abi: tokenAbi, name: 'Transfer' }),
-      onLogs: (logs) => logs.forEach((l) => cb(toRaw(l as Log))),
+      onLogs: (logs) => live(logs).forEach((l) => cb(toRaw(l as Log))),
     });
     return () => {
       a();

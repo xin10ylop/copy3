@@ -59,7 +59,10 @@ export class FakeChain implements ChainClient {
   async readSniper(_sniper: Address, token: Address): Promise<SniperHolding> {
     this.calls.push(`readSniper:${token}`);
     if (this.readSniperFails) throw new Error('HTTP 429 rate limited');
-    return this.holdings.get(token.toLowerCase()) ?? { bought: false, balance: 0n };
+    // R4-2: the block the read was pinned to (a lagging backend: `readSniperBlock` overrides the head)
+    const block = this.readSniperBlock ?? this.blockNumber;
+    const ts = this.blockTs.get(block);
+    return { ...(this.holdings.get(token.toLowerCase()) ?? { bought: false, balance: 0n }), block, ...(ts !== undefined ? { blockTs: ts } : {}) };
   }
   async curveGraduated(curve: Address): Promise<boolean> {
     this.calls.push(`curveGraduated:${curve}`);
@@ -77,10 +80,22 @@ export class FakeChain implements ChainClient {
   /** PonsSniper Sniped events (startup orphan sweep) */
   sniped: SnipedLog[] = [];
   snipedRanges: [number, number][] = [];
-  async snipedLogs(_sniper: Address, from: number, to: number): Promise<SnipedLog[]> {
+  /** chunk size of the fake scan, and a block from which every chunk read fails (RPC outage) */
+  snipedChunk = 1_000_000;
+  snipedFailFrom: number | null = null;
+  readSniperBlock: number | null = null;
+  async snipedLogs(_sniper: Address, from: number, to: number, onChunk?: (logs: SnipedLog[], toBlock: number) => boolean | void | Promise<boolean | void>): Promise<SnipedLog[]> {
     this.calls.push(`snipedLogs:${from}:${to}`);
     this.snipedRanges.push([from, to]);
-    return this.sniped.filter((l) => l.block >= from && l.block <= to);
+    const out: SnipedLog[] = [];
+    for (let a = from; a <= to; a += this.snipedChunk) {
+      const b = Math.min(to, a + this.snipedChunk - 1);
+      if (this.snipedFailFrom !== null && b >= this.snipedFailFrom) throw new Error('HTTP 503');
+      const chunk = this.sniped.filter((l) => l.block >= a && l.block <= b);
+      out.push(...chunk);
+      if (onChunk && (await onChunk(chunk, b)) === false) break;
+    }
+    return out;
   }
   async readSniperConfig(_s: Address, keys: readonly Address[]): Promise<SniperConfigState> {
     if (!this.sniperConfig) throw new Error('no contract');

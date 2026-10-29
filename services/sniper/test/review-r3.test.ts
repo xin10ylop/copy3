@@ -180,7 +180,7 @@ describe('NEW-3: a runtime "no fill" is final only once the chain head passed th
     expect(run.status).toBe('pending');
     expect(run.ended).not.toBe(true);
     expect(h.sniper.risk.open).toBe(1); // slot held
-    expect(run.notes.join()).toMatch(/has not passed the deadline block/);
+    expect(run.notes.join()).toMatch(/not past the deadline \(block/);
     await h.sniper.recorder.idle();
     expect([...h.store.snipes.values()].map((r) => r.status)).toEqual(['pending']);
     // the queued member lands after the stall
@@ -245,11 +245,11 @@ describe('NEW-3: startup sweep of Sniped events — bought tokens with a balance
         [OTHER.token, 3n * 10n ** 25n],
       ].sort(),
     );
-    expect(h.sniper.risk.open).toBe(2); // both hold a MAX_CONCURRENT slot
+    expect(h.sniper.risk.open).toBe(0); // R4-1: adopted orphans hold no MAX_CONCURRENT slot
     expect(store.snipes.get(failed)!.status).toBe('open'); // the failed row is reused …
-    expect(store.snipes.get(failed)!.notes).toMatch(/orphan recovered by the startup sweep/);
+    expect(store.snipes.get(failed)!.notes).toMatch(/orphan recovered by the sweep/);
     const fresh = [...store.snipes.entries()].find(([, r]) => r.token === OTHER.token)!;
-    expect(fresh[1]).toMatchObject({ status: 'open', mode: 'live', quoteIn: parseEther('0.07') }); // … a row is written for the other
+    expect(fresh[1]).toMatchObject({ status: 'open', mode: 'live', quoteIn: 0n }); // … a row is written for the other (R4-1: cost 0)
     const alerts = store.events.filter((e) => e.type === 'orphan_position_recovered');
     expect(alerts.map((e) => (e.payload as { token: string }).token).sort()).toEqual([LAUNCH.token, OTHER.token].sort());
     expect(alerts.every((e) => e.level === 'error')).toBe(true);
@@ -352,7 +352,7 @@ describe('NEW-4: the contract spend budget is read and respected', () => {
 
   it('our own fill is charged locally until the next chain read (the next decision sees the smaller budget)', () => {
     const t = nowS();
-    const lim = new ContractLimits({ maxQuoteIn: parseEther('0.2'), spend: { ...budget('0.1', '0'), updatedAt: t } });
+    const lim = new ContractLimits({ maxQuoteIn: parseEther('0.2'), spend: { ...budget('0.1', '0'), updatedAt: t - 1 } });
     expect(lim.available(t)).toBe(parseEther('0.1'));
     lim.charge(parseEther('0.07'), t);
     expect(lim.available(t)).toBe(parseEther('0.03'));
@@ -360,9 +360,9 @@ describe('NEW-4: the contract spend budget is read and respected', () => {
     // it refills continuously like the contract (0.1 ETH per 3600 s), lagging the clock by 2 s so it never runs ahead of the chain
     expect(lim.available(t + 1802)).toBe(parseEther('0.08'));
     expect(lim.available(t + 1800)).toBeLessThan(parseEther('0.08'));
-    // a fresh chain read replaces the local estimate
-    lim.set({ spend: budget('0.1', '0.05') });
-    expect(lim.available(nowS())).toBe(parseEther('0.05'));
+    // a fresh chain read that already contains the fill (spendUpdatedAt ≥ its block time) replaces the local charge
+    lim.set({ spend: { ...budget('0.1', '0.05'), updatedAt: t } });
+    expect(lim.available(t)).toBe(parseEther('0.05'));
     // budget off on chain: no cap from it
     lim.set({ spend: budget('0', '0', 0) });
     expect(lim.available()).toBeNull();
@@ -506,8 +506,8 @@ describe('NEW-8: chunked log reads and a refreshed contract config', () => {
     expect(ranges.every(([a, b]) => b - a + 1 <= LOG_CHUNK_BLOCKS)).toBe(true);
     // [head − 36 000, head] in 10 000-block chunks, newest first; stops once the limit is reached
     expect(ranges).toEqual([
-      [head - 6_000, head],
-      [head - 16_000, head - 6_001],
+      [head - 9_999, head],
+      [head - 19_999, head - 10_000],
     ]);
     expect((await chain.recentLaunches(36_000, 8)).map((l) => l.block)).toEqual(launchAt);
   });

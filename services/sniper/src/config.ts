@@ -105,13 +105,15 @@ export const ConfigSchema = z
     /** NEW-9: the first n executor keys serve exits (round-robin, a free key first); the rest are burst keys */
     EXIT_KEYS: z.coerce.number().int().min(1).default(1),
     /** NEW-2: re-read settings (kill switch) this often, whatever NOTIFY delivered */
-    SETTINGS_RELOAD_MS: num(10_000),
+    SETTINGS_RELOAD_MS: z.coerce.number().min(1_000).default(10_000),
     /** NEW-2: re-read plays and armed candidates this often */
-    PLAYS_RELOAD_MS: num(60_000),
+    PLAYS_RELOAD_MS: z.coerce.number().min(5_000).default(60_000),
     /** keep feed_blocks rows this many days (pruned hourly); 0 = keep everything */
     FEED_BLOCKS_RETENTION_DAYS: num(7),
     /** NEW-3: startup sweep of the contract's Sniped events; the first run looks back this many blocks (0 = off) */
     SWEEP_LOOKBACK_BLOCKS: num(864_000),
+    /** R4-2: re-run the orphan sweep from its checkpoint this often */
+    SWEEP_INTERVAL_MS: z.coerce.number().min(10_000).default(300_000),
     /** NEW-4/6 paper mode: the contract caps live would enforce (defaults = the deploy defaults) */
     PAPER_MAX_QUOTE_IN_ETH: z.coerce.number().positive().default(0.3),
     /** paper spend budget per PAPER_SPEND_WINDOW_SEC; unset = 4 × PAPER_MAX_QUOTE_IN_ETH */

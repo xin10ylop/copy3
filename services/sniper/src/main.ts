@@ -111,6 +111,7 @@ async function main(): Promise<void> {
     playsReloadMs: cfg.PLAYS_RELOAD_MS,
     feedBlocksRetentionDays: cfg.FEED_BLOCKS_RETENTION_DAYS,
     sweepLookbackBlocks: cfg.SWEEP_LOOKBACK_BLOCKS,
+    sweepIntervalMs: cfg.SWEEP_INTERVAL_MS,
     paperLimits: {
       maxQuoteIn: parseEther(String(cfg.PAPER_MAX_QUOTE_IN_ETH)),
       maxSpend: parseEther(String(cfg.PAPER_MAX_SPEND_PER_WINDOW_ETH ?? cfg.PAPER_MAX_QUOTE_IN_ETH * 4)),
@@ -139,7 +140,7 @@ async function main(): Promise<void> {
         exitFrom: exec.exitKey.address,
         gasLimit: plays.length ? Math.min(...plays.map((p) => p.preset.gasLimit)) : 300_000,
         // fixed presets above maxQuoteIn are refused; bankroll sizes are clamped to it (NEW-6)
-        ...(fixed.length ? { maxBuyEth: Math.max(...fixed) } : {}),
+        ...(fixed.length ? { maxBuyEth: Math.max(...fixed), fixedBuysEth: fixed } : {}),
         ...(bankroll.length ? { maxBankrollEth: Math.max(...bankroll) } : {}),
         allowHotOwner: cfg.ALLOW_HOT_OWNER,
         gasCheck,

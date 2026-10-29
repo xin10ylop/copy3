@@ -236,9 +236,9 @@ export class Risk {
     return this.playDeployers.has(`${playId}:${deployer.toLowerCase()}`);
   }
 
-  /** A position rebuilt at startup holds a slot (and its token / play count). */
-  adoptPosition(playId: number, token: string, deployer: string | null): void {
-    this.openCount++;
+  /** A position rebuilt at startup holds a slot (and its token / play count); an adopted orphan does not (R4-1). */
+  adoptPosition(playId: number, token: string, deployer: string | null, holdSlot = true): void {
+    if (holdSlot) this.openCount++;
     this.tokens.add(token.toLowerCase());
     if (deployer) this.playDeployers.add(`${playId}:${deployer.toLowerCase()}`);
   }
@@ -250,9 +250,9 @@ export class Risk {
   }
 
   /** A position closed: free its slot and book its PnL toward this mode's daily loss (paper too). */
-  onPositionClosed(pnlEth: number): void {
+  onPositionClosed(pnlEth: number, heldSlot = true): void {
     this.rollDay();
-    this.openCount = Math.max(0, this.openCount - 1);
+    if (heldSlot) this.openCount = Math.max(0, this.openCount - 1);
     this.realizedTodayEth += pnlEth;
   }
 }

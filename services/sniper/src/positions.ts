@@ -493,6 +493,25 @@ export class Positions {
       // a receipt-less attempt may have sold: do not stack more sells on top, ask the chain
       if (res.unknown || (res.error !== undefined && GRADUATED_RE.test(res.error))) break;
     }
+    if (res?.ok && res.replayed) {
+      // R4-4: an earlier receipt-less exit landed. If the chain re-read already booked it (estimated,
+      // from balanceOf), correct that entry instead of booking the same tokens twice
+      const est = [...p.sales].reverse().find((s) => s.estimated === true && s.txHash === undefined && s.tokensIn === res!.tokensIn);
+      if (est) {
+        p.realizedQuote += res.quoteOut - est.quoteOut;
+        est.quoteOut = res.quoteOut;
+        delete est.estimated;
+        if (res.txHash) est.txHash = res.txHash;
+        if (res.block !== undefined) est.block = res.block;
+        this.o.onSale?.(p, est);
+        p.exitRounds = 0;
+        p.transientRounds = 0;
+        p.exiting = false;
+        if (p.state.tokensHeld === 0n) this.close(p);
+        else if (p.phase === 'open') this.evaluate(p);
+        return;
+      }
+    }
     if (res?.ok) {
       // N6: a sale the chain confirmed is booked even if the phase changed while we waited
       // (e.g. a CurveCompleted log arrived first) — never leave it to `recheck` as "external, 0"
@@ -507,7 +526,7 @@ export class Positions {
           ...(res.block !== undefined ? { block: res.block } : {}),
           at: this.o.now(),
         },
-        sig.all,
+        res.all ?? sig.all, // a replayed earlier exit (R4-4) reports what IT was
       );
       p.exitRounds = 0;
       p.transientRounds = 0;

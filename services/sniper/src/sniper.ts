@@ -18,6 +18,7 @@
  * before it is believed (H3); at startup every pending/open row is reconciled the same way.
  */
 import {
+  CURVE_FEE_BPS,
   TOPICS,
   decodedTxFromRpc,
   launchEventFromCall,
@@ -25,6 +26,7 @@ import {
   parsePlay,
   parsePreset,
   parseTokenLaunchedLog,
+  quoteSell,
   type ArmedCandidate,
   type DecodedTx,
   type FeedBlock,
@@ -36,9 +38,9 @@ import {
   type SequencerClock,
 } from '@hood/core';
 import { formatEther, parseEther, type Address, type Hex } from 'viem';
-import type { ChainClient, SnipedLog, SpendBudgetState } from './chain.js';
+import type { ChainClient, SnipedLog, SniperHolding, SpendBudgetState } from './chain.js';
 import { LaunchDetector, verifyLaunchReceipt, type ReceiptVerdict } from './detector.js';
-import { SNIPE_DEADLINE_SECONDS, decodeSniped, snipeTaxFromLogs, type ExecutionBackend } from './executor.js';
+import { SNIPE_DEADLINE_SECONDS, decodeSniped, snipeDeadlineTs, snipeTaxFromLogs, type ExecutionBackend } from './executor.js';
 import type { HealthState } from './health.js';
 import { LEDGER_SELECTORS, LaunchSecondLedger, SEL_SELL, SEL_TRANSFER, SEL_TRANSFER_FROM, outflowFrom } from './ledger.js';
 import type { Logger } from './log.js';
@@ -103,12 +105,16 @@ export interface SniperOptions {
   feedBlocksRetentionDays?: number;
   /** NEW-3: startup sweep of the contract's Sniped events — first run looks back this many blocks; 0 = off. Default 864 000 (~1 day). */
   sweepLookbackBlocks?: number;
+  /** R4-2: re-run the sweep from its checkpoint this often. Default 5 min. */
+  sweepIntervalMs?: number;
   /** NEW-4/6 paper mode: the contract caps live would have (live reads them from the chain via the gate) */
   paperLimits?: { maxQuoteIn: bigint; maxSpend: bigint; spendWindow: number };
 }
 
 /** NEW-4: alert at most this often for the same refusal type */
 const ALERT_EVERY_MS = 10 * 60_000;
+/** R4-2: a run unresolved longer than this raises `snipe_unresolved_long` */
+const UNRESOLVED_ALERT_MS = 120_000;
 
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -175,6 +181,13 @@ export class Sniper {
   /** runs whose no-fill check is being settled (timer and reconcile tick never overlap) */
   private readonly settling = new Set<string>();
   private lastFeedPrune = 0;
+  /** R4-2: the last bought()/balanceOf() read per run (with the block it was pinned to) */
+  private readonly lastRead = new Map<string, SniperHolding>();
+  private sweepRunning: Promise<number> | null = null;
+  /** R4-5: generation of the config loads started / last applied, per kind */
+  private readonly cfgGen = { settings: { next: 0, applied: 0 }, plays: { next: 0, applied: 0 }, armed: { next: 0, applied: 0 } };
+  /** R4-8: how often a ledger was re-opened after a refuted launch-second confirmation */
+  private readonly ledgerReopens = new WeakMap<LaunchSecondLedger, number>();
   /** NEW-3: the startup orphan sweep (tests await it) */
   sweeping: Promise<number> = Promise.resolve(0);
   private readonly startedAt = Date.now();
@@ -214,7 +227,8 @@ export class Sniper {
         p.run.status = 'closed';
         p.run.ended = true;
         this.counters.closed!++;
-        this.risk.onPositionClosed(pnl);
+        // R4-1: an adopted orphan holds no MAX_CONCURRENT slot and its PnL is not daily-loss PnL
+        this.risk.onPositionClosed(p.run.orphan ? 0 : pnl, p.run.slot !== false);
         this.paperBank?.close(p.key, pnl);
         this.runs.delete(p.key);
         this.recorder.snipe(p.run, p, 'snipe_closed');
@@ -340,6 +354,9 @@ export class Sniper {
     // NEW-2: never rely on NOTIFY alone (a kill switch written during a reconnect is not replayed)
     every(this.o.settingsReloadMs ?? 10_000, () => this.reloadConfig('settings', 'periodic'), 'settings reload');
     every(this.o.playsReloadMs ?? 60_000, () => this.reloadConfig('all', 'periodic'), 'plays reload');
+    // R4-2: the orphan sweep runs from its checkpoint periodically, not only at startup
+    if (this.o.mode === 'live' && this.o.sniperContract && (this.o.sweepLookbackBlocks ?? 864_000) > 0)
+      every(this.o.sweepIntervalMs ?? 300_000, () => this.periodicSweep(), 'orphan sweep');
   }
 
   /**
@@ -347,15 +364,29 @@ export class Sniper {
    * plays + armed candidates + settings (every 60 s and on every LISTEN (re)connect).
    */
   async reloadConfig(scope: 'settings' | 'all', why: string): Promise<void> {
+    if (scope === 'all') await Promise.all([this.loadConfig('plays', why), this.loadConfig('armed', why), this.loadConfig('settings', why)]);
+    else await this.loadConfig('settings', why);
+  }
+
+  /**
+   * R4-5: every config load (NOTIFY-driven, periodic, on reconnect) takes a generation number when
+   * it STARTS; a load that finishes after a newer one already applied is dropped. An older periodic
+   * read can therefore never put back a kill switch a newer NOTIFY load just turned on.
+   */
+  private async loadConfig(what: 'settings' | 'plays' | 'armed', why: string): Promise<boolean> {
+    const g = this.cfgGen[what];
+    const mine = ++g.next;
     const { store } = this.o;
-    const wasKilled = this.risk.killSwitch;
-    if (scope === 'all') {
-      const [plays, armed, settings] = await Promise.all([store.loadPlays(), store.loadArmed(), store.loadSettings()]);
-      this.rules.setPlays(plays);
-      this.rules.setArmed(armed);
-      this.risk.setSettings(settings);
-    } else this.risk.setSettings(await store.loadSettings());
-    if (this.risk.killSwitch !== wasKilled) this.o.logger.warn({ killSwitch: this.risk.killSwitch, why }, 'kill switch changed (picked up by a reload, not a NOTIFY)');
+    const value = what === 'settings' ? await store.loadSettings() : what === 'plays' ? await store.loadPlays() : await store.loadArmed();
+    if (mine < g.applied) return false; // a newer load already applied
+    g.applied = mine;
+    if (what === 'settings') {
+      const wasKilled = this.risk.killSwitch;
+      this.risk.setSettings(value as Record<string, unknown>);
+      if (this.risk.killSwitch !== wasKilled) this.o.logger.warn({ killSwitch: this.risk.killSwitch, why }, 'kill switch changed');
+    } else if (what === 'plays') this.rules.setPlays(value as Awaited<ReturnType<SniperStore['loadPlays']>>);
+    else this.rules.setArmed(value as ArmedCandidate[]);
+    return true;
   }
 
   async stop(): Promise<void> {
@@ -370,15 +401,18 @@ export class Sniper {
   }
 
   private async onChange(channel: ChangeChannel, payload: string): Promise<void> {
-    if (channel === 'plays_changed') this.rules.setPlays(await this.o.store.loadPlays());
+    if (channel === 'plays_changed') await this.loadConfig('plays', 'notify');
     else if (channel === 'armed_changed') {
       // @hood/db trigger payload: {op, id, play_id, wallet, status}
       const n = tryParse<{ play_id: number; playId: number; wallet: string; status: ArmedCandidate['status'] }>(payload);
       const playId = n?.play_id ?? n?.playId;
       if (n && playId !== undefined && n.wallet && n.status && n.status !== 'armed') {
+        // R4-5: newer than any armed load still in flight (that one may predate the removal)
+        const g = this.cfgGen.armed;
+        g.applied = ++g.next;
         this.rules.removeArmed(playId, n.wallet);
-      } else this.rules.setArmed(await this.o.store.loadArmed());
-    } else if (channel === 'settings_changed') this.risk.setSettings(await this.o.store.loadSettings());
+      } else await this.loadConfig('armed', 'notify');
+    } else if (channel === 'settings_changed') await this.loadConfig('settings', 'notify');
     this.o.logger.info({ channel, plays: this.rules.playCount, armed: this.rules.armedCount }, 'config refreshed');
   }
 
@@ -604,7 +638,7 @@ export class Sniper {
    * logs of the receipt-proven curve), fetching the receipts of pending feed hints, until the
    * play holds or `until` (scheduler ms) passes. A buy that reverted never counts.
    */
-  private async confirmLaunchSecond(run: SnipeRun, until: number): Promise<{ ok: boolean; reason: string }> {
+  private async confirmLaunchSecond(run: SnipeRun, until: number): Promise<{ ok: boolean; reason: string; refuted?: boolean }> {
     const lg = run.ledger;
     if (!lg) return { ok: false, reason: 'launch-second play without a ledger (the feed did not show the launch second)' };
     const poll = this.o.receiptPollMs ?? 20;
@@ -616,7 +650,7 @@ export class Sniper {
         return { ok: true, reason: '' };
       }
       const pending = lg.pendingHints();
-      if (pending.length === 0) return { ok: false, reason: `launch-second fingerprint not confirmed: ${v.reasons.join('; ')}` };
+      if (pending.length === 0) return { ok: false, reason: `launch-second fingerprint not confirmed: ${v.reasons.join('; ')}`, refuted: true };
       if (this.o.scheduler.now() >= until || Date.now() >= realUntil) {
         return { ok: false, reason: `launch-second buys not confirmed in time (${pending.length} pending): ${v.reasons.join('; ')}` };
       }
@@ -873,6 +907,7 @@ export class Sniper {
     }
     // N10: no MAX_CONCURRENT slot yet — it is taken once the launch receipt proved the launch
     this.paperBank?.commit(run.key, run.quoteIn);
+    this.limits.reserve(run.key, run.quoteIn); // R4-6: concurrent runs cannot both count on the same budget
     this.runs.set(run.key, run);
     this.recorder.snipe(run, undefined, 'snipe_decided');
     try {
@@ -925,6 +960,8 @@ export class Sniper {
     this.counters[final]!++;
     this.risk.release(run.playId, run.confirmed === true, run.slot === true);
     this.paperBank?.release(run.key);
+    this.limits.release(run.key);
+    this.lastRead.delete(run.key);
     this.runs.delete(run.key);
     this.unresolvedRuns.delete(run.key);
     this.recorder.snipe(run, undefined, final === 'failed' ? 'snipe_failed' : 'snipe_aborted');
@@ -1012,6 +1049,18 @@ export class Sniper {
       if (!lc.ok) {
         this.counters.launch_second_unconfirmed!++;
         this.endRun(run, 'aborted', lc.reason);
+        // R4-8: a reverting fake team-buy hint must not use up the launch: once the hints behind
+        // the match are refuted, the ledger may decide again on later CONFIRMED buys (bounded; the
+        // burst window still applies — a late re-decision ends "too late")
+        const lg2 = run.ledger;
+        if (lc.refuted && lg2 && !lg2.dead) {
+          const n = this.ledgerReopens.get(lg2) ?? 0;
+          if (n < 3) {
+            this.ledgerReopens.set(lg2, n + 1);
+            lg2.decided = false;
+            this.onLedgerChanged(lg2);
+          }
+        }
         return;
       }
     }
@@ -1119,15 +1168,20 @@ export class Sniper {
   }
 
   /**
-   * H3 + NEW-3: the burst reported no fill. "No buy" is final only when the contract's state was
-   * read at a block PAST `deadlineBlock` (members expire there; the chain head is read BEFORE
-   * bought()/balanceOf(), so a member landing in between cannot be missed). Until then — a stalled
-   * sequencer, a backlog — the run stays unresolved with its MAX_CONCURRENT slot held and is
-   * retried (soon, and by the reconcile timer); an unreadable chain likewise (`snipe_unresolved`).
+   * H3 + NEW-3 + R4-2: the burst reported no fill. "No buy" is final only when bought()/balanceOf()
+   * were read AT a block past `deadlineBlock`, or at a block whose timestamp is past `deadlineTs`
+   * (members expire there on chain). The block is the one `readSniper` pinned both calls to — not a
+   * separate head read, which a load-balanced RPC may serve from another (fresher) backend. Until
+   * then — a stalled sequencer, a backlog, a stale node — the run stays unresolved with its
+   * MAX_CONCURRENT slot held and is retried (soon, and by the reconcile timer); an unreadable chain
+   * likewise (`snipe_unresolved`). A run unresolved for more than 2 min raises
+   * `snipe_unresolved_long` (e.g. a NODE_HTTP stuck on an old block).
    */
   private async settleNoFill(run: SnipeRun): Promise<'filled' | 'pending' | 'no_buy'> {
     const first = !this.unresolvedRuns.has(run.key);
-    const head = await this.o.chain.getBlockNumber().catch(() => null);
+    run.unresolvedSince ??= Date.now();
+    // fallback only for a ChainClient whose readSniper does not report its block: read the head FIRST
+    const headBefore = await this.o.chain.getBlockNumber().catch(() => null);
     const rec = await this.recoverFill(run);
     if (rec === 'unknown') {
       if (first) {
@@ -1142,17 +1196,36 @@ export class Sniper {
       this.onFill(run, rec);
       return 'filled';
     }
-    if (head === null || head <= run.deadlineBlock) {
+    const read = this.lastRead.get(run.key);
+    const at = read?.block ?? headBefore;
+    const deadlineTs = snipeDeadlineTs(run);
+    const final = (at !== null && at !== undefined && at > run.deadlineBlock) || (read?.blockTs !== undefined && read.blockTs > deadlineTs);
+    if (!final) {
       if (first) {
-        run.notes.push(`no fill seen yet but the chain head (${head ?? 'unknown'}) has not passed the deadline block ${run.deadlineBlock}: run kept (slot held) until it has (NEW-3)`);
-        this.o.logger.info({ key: run.key, head, deadlineBlock: run.deadlineBlock }, 'no fill yet; waiting for the burst deadline');
+        run.notes.push(
+          `no fill seen yet but bought()/balanceOf() were read at block ${at ?? 'unknown'} (ts ${read?.blockTs ?? '?'}), not past the deadline (block ${run.deadlineBlock}, ts ${deadlineTs}): run kept (slot held) until a read is (NEW-3, R4-2)`,
+        );
+        this.o.logger.info({ key: run.key, at, deadlineBlock: run.deadlineBlock, deadlineTs }, 'no fill yet; waiting for the burst deadline');
       }
       this.unresolvedRuns.set(run.key, run);
-      this.retrySoon(run, head);
+      this.alertLongUnresolved(run, at ?? null);
+      this.retrySoon(run, at ?? null);
       return 'pending';
     }
     this.unresolvedRuns.delete(run.key);
+    this.lastRead.delete(run.key);
     return 'no_buy';
+  }
+
+  /** R4-2: an unresolved run older than 2 min is an operational problem (stale node, stalled sequencer). */
+  private alertLongUnresolved(run: SnipeRun, at: number | null): void {
+    if (run.unresolvedAlerted || run.unresolvedSince === undefined || Date.now() - run.unresolvedSince < UNRESOLVED_ALERT_MS) return;
+    run.unresolvedAlerted = true;
+    this.alert(
+      'snipe_unresolved_long',
+      { key: run.key, token: run.launch.token, readAtBlock: at, deadlineBlock: run.deadlineBlock, deadlineTs: snipeDeadlineTs(run), sinceSec: Math.round((Date.now() - run.unresolvedSince) / 1000), note: 'slot held: is NODE_HTTP stuck / the sequencer down?' },
+      'error',
+    );
   }
 
   /** NEW-3: re-check a run waiting for its deadline block about when the head should pass it. */
@@ -1185,7 +1258,9 @@ export class Sniper {
     run.status = 'open';
     this.unresolvedRuns.delete(run.key);
     this.counters.fills!++;
-    this.limits.charge(fill.quoteIn); // NEW-4: our own buy used spend budget (the next chain read replaces the estimate)
+    // NEW-4 / R4-6: the reservation becomes a charge at the fill's block time (kept until a chain read includes it)
+    this.limits.release(run.key);
+    this.limits.charge(fill.quoteIn, fill.ts > 0 ? fill.ts : Date.now() / 1000);
     if (fill.recovered) this.counters.fills_recovered!++;
     // team set: the launch's exemptions plus any wallet exempted later in the launch second
     const team = [...new Set([...run.launch.event.exemptions.map((x) => x.toLowerCase()), ...(run.ledger?.exemptions ?? [])])];
@@ -1244,6 +1319,7 @@ export class Sniper {
     for (let i = 0; i < 3; i++) {
       try {
         const h = await this.o.chain.readSniper(sniper, token);
+        this.lastRead.set(run.key, h);
         if (h.balance > 0n) {
           run.notes.push(`H3: receipts missed the buy; chain shows bought=${h.bought} balance=${h.balance}`);
           this.alert('fill_recovered_from_chain', { key: run.key, token, balance: h.balance.toString(), bought: h.bought }, 'error');
@@ -1333,15 +1409,31 @@ export class Sniper {
     return n;
   }
 
-  // ------------------------------------------------------------------ startup orphan sweep (NEW-3)
+  // ------------------------------------------------------------------ orphan sweep (NEW-3, R4-1/2/7)
   /**
    * Every token the contract bought (`Sniped` events since the stored checkpoint; the first run
    * looks back `sweepLookbackBlocks`) that still has a balance but is not managed — no position,
-   * no unresolved run or row — becomes a position again (`orphan_position_recovered`, error). Its
-   * newest failed/aborted row is reused (its preset, its notes); otherwise a new row is written.
-   * The checkpoint advances only when every token could be read.
+   * no run, no unresolved row. Runs at startup and every `sweepIntervalMs` (R4-2: a run written off
+   * at runtime is caught without a restart).
+   *  - R4-1 dust (< 0.5 % of the tokens bought, or worth less than the exit gas, e.g. a 1-wei
+   *    transfer by anyone): ignored (`orphan_dust_ignored`, info);
+   *  - the token's newest row is `closed` (its PnL is booked): alert only
+   *    (`orphan_balance_on_closed_row`), nothing is adopted or re-booked;
+   *  - otherwise the balance becomes a position at COST 0 that holds no MAX_CONCURRENT slot and
+   *    books no daily-loss PnL (`orphan_position_recovered`, error); its newest row is reused when
+   *    there is one (preset, notes), else a row is written.
+   * R4-7: the checkpoint advances after every chunk whose tokens could all be read.
    */
   async sweepOrphans(): Promise<number> {
+    if (this.sweepRunning) return this.sweepRunning;
+    const run = this.doSweep().finally(() => {
+      this.sweepRunning = null;
+    });
+    this.sweepRunning = run;
+    return run;
+  }
+
+  private async doSweep(): Promise<number> {
     const sniper = this.o.sniperContract;
     const lookback = this.o.sweepLookbackBlocks ?? 864_000;
     if (this.o.mode !== 'live' || !sniper || lookback <= 0) return 0;
@@ -1350,25 +1442,72 @@ export class Sniper {
     const cp = await this.o.store.getCursor(key);
     const from = cp !== null ? cp + 1 : Math.max(0, head - lookback);
     if (from > head) return 0;
-    const latest = new Map<string, SnipedLog>();
-    for (const ev of await this.o.chain.snipedLogs(sniper, from, head)) latest.set(ev.token.toLowerCase(), ev);
     let recovered = 0;
+    let seen = 0;
     let complete = true;
-    for (const ev of latest.values()) {
-      if (this.managesToken(ev.token)) continue;
-      try {
-        const h = await this.o.chain.readSniper(sniper, ev.token);
-        if (h.balance <= 0n || this.managesToken(ev.token)) continue;
-        await this.adoptOrphan(ev, h.balance);
-        recovered++;
-      } catch (e) {
-        complete = false;
-        this.error(`orphan sweep: ${ev.token} could not be read`, e);
+    await this.o.chain.snipedLogs(sniper, from, head, async (chunk, toBlock) => {
+      const latest = new Map<string, SnipedLog>();
+      for (const ev of chunk) latest.set(ev.token.toLowerCase(), ev);
+      seen += latest.size;
+      for (const ev of latest.values()) {
+        if (this.managesToken(ev.token)) continue;
+        try {
+          const h = await this.o.chain.readSniper(sniper, ev.token);
+          if (h.balance <= 0n || this.managesToken(ev.token)) continue;
+          if (await this.handleOrphan(ev, h.balance)) recovered++;
+        } catch (e) {
+          complete = false;
+          this.error(`orphan sweep: ${ev.token} could not be read`, e);
+        }
       }
-    }
-    if (complete) await this.o.store.setCursor(key, head);
-    this.o.logger.info({ from, head, sniped: latest.size, recovered, complete }, 'startup orphan sweep done');
+      if (!complete) return false; // retried from this chunk next time
+      await this.o.store.setCursor(key, toBlock);
+      return true;
+    });
+    this.o.logger.info({ from, head, sniped: seen, recovered, complete }, 'orphan sweep done');
     return recovered;
+  }
+
+  /** the periodic sweep (R4-2): failures are alerted at most every 10 min */
+  private async periodicSweep(): Promise<void> {
+    try {
+      await this.sweepOrphans();
+    } catch (e) {
+      this.alertThrottled('orphan_sweep_failed', { err: (e as Error).message }, 'warn');
+    }
+  }
+
+  /** R4-1: dust is never adopted: < 0.5 % of the tokens bought, or worth less than an exit's gas. */
+  private async dustReason(ev: SnipedLog, balance: bigint, gasLimit: number): Promise<string | null> {
+    if (ev.tokensOut > 0n && balance * 200n < ev.tokensOut) return `balance ${balance} < 0.5 % of the ${ev.tokensOut} tokens bought`;
+    const r = await this.o.chain.getReserves(ev.curve).catch(() => null);
+    if (!r) return null;
+    const gasPrice = this.risk.gasPriceWei ?? (await this.o.chain.getGasPrice().catch(() => null));
+    if (gasPrice === null) return null;
+    const value = quoteSell(r, balance, CURVE_FEE_BPS, 0);
+    const gas = BigInt(gasLimit) * gasPrice;
+    return value < gas ? `worth ${formatEther(value)} ETH < exit gas ${formatEther(gas)} ETH` : null;
+  }
+
+  /** One unmanaged balance found by the sweep: ignore dust, alert on a closed row, else adopt (true). */
+  private async handleOrphan(ev: SnipedLog, balance: bigint): Promise<boolean> {
+    const rows = await this.o.store.findSnipesByToken(ev.token, 'live');
+    const prev = rows[0];
+    const dec0 = prev ? decisionOf(prev) : null;
+    const gasLimit = dec0 ? parsePlay({ name: 'x', trigger: {}, preset: dec0.preset }).preset.gasLimit : 300_000;
+    const dust = await this.dustReason(ev, balance, gasLimit);
+    const info = { token: ev.token, curve: ev.curve, balance: balance.toString(), snipedBlock: ev.block, tx: ev.txHash, previousRow: prev?.id ?? null, previousStatus: prev?.status ?? null };
+    if (dust) {
+      this.recorder.event('info', 'orphan_dust_ignored', { ...info, why: dust });
+      return false;
+    }
+    if (prev?.status === 'closed') {
+      // its PnL is booked already: a leftover (or a transfer to the contract) is not re-adopted
+      this.alert('orphan_balance_on_closed_row', { ...info, action: 'not adopted; sweep it with the owner (sweepToken) if it matters' }, 'warn');
+      return false;
+    }
+    await this.adoptOrphan(ev, balance, prev);
+    return true;
   }
 
   /** A position, a run (in flight or unresolved) or an unresolved startup row already covers `token`. */
@@ -1379,10 +1518,8 @@ export class Sniper {
     return [...this.unresolvedRows.values()].some((r) => r.token.toLowerCase() === t);
   }
 
-  private async adoptOrphan(ev: SnipedLog, balance: bigint): Promise<void> {
-    const rows = await this.o.store.findSnipesByToken(ev.token, 'live');
-    const prev = rows[0];
-    const reusable = prev && (prev.status === 'failed' || prev.status === 'aborted') ? prev : undefined;
+  private async adoptOrphan(ev: SnipedLog, balance: bigint, prev: ActiveSnipe | undefined): Promise<void> {
+    const reusable = prev && prev.status !== 'closed' ? prev : undefined;
     const ts = this.blockTs.get(ev.block) ?? (await this.o.chain.getBlockTimestamp(ev.block).catch(() => 0));
     const fromRow = reusable ? decisionOf(reusable) : null;
     const dec: StoredDecision = fromRow ?? {
@@ -1394,11 +1531,14 @@ export class Sniper {
       ts: ts > 0 ? ts - 1 : 0,
       txHash: ev.txHash,
       deadlineBlock: 0,
+      deadlineTs: 0,
     };
-    // the buy's own cost (a newer closed row, if any, is named in the alert: its PnL may then count twice)
-    const cost = reusable ? (reusable.quoteIn ?? ev.quoteIn) : ev.quoteIn;
+    // R4-1: cost basis 0 (the original spend is never booked a second time); the exit rules price
+    // from the real entry (quoteIn / tokensOut of the Sniped event)
+    const entryPrice = ev.tokensOut > 0n ? Number(ev.quoteIn) / Number(ev.tokensOut) : null;
+    const cost = 0n;
     const row: ActiveSnipe = reusable
-      ? { ...reusable, curve: reusable.curve || ev.curve, quoteIn: cost, tokensOut: reusable.tokensOut ?? ev.tokensOut, buyBlock: reusable.buyBlock ?? ev.block }
+      ? { ...reusable, curve: reusable.curve || ev.curve, quoteIn: cost, tokensOut: reusable.tokensOut ?? ev.tokensOut, entryPrice: reusable.entryPrice ?? entryPrice, buyBlock: reusable.buyBlock ?? ev.block }
       : {
           id: 0,
           playId: 0,
@@ -1410,7 +1550,7 @@ export class Sniper {
           decision: null,
           quoteIn: cost,
           tokensOut: ev.tokensOut,
-          entryPrice: cost > 0n && ev.tokensOut > 0n ? Number(cost) / Number(ev.tokensOut) : null,
+          entryPrice,
           buyBlock: ev.block,
           sells: [],
         };
@@ -1418,7 +1558,7 @@ export class Sniper {
     this.rebuild(row, dec, balance, sells, sells.reduce((a, s) => a + s.quoteOut, 0n), 'orphan');
     this.alert(
       'orphan_position_recovered',
-      { token: ev.token, curve: ev.curve, balance: balance.toString(), snipedBlock: ev.block, tx: ev.txHash, previousRow: prev?.id ?? null, previousStatus: prev?.status ?? null },
+      { token: ev.token, curve: ev.curve, balance: balance.toString(), snipedBlock: ev.block, tx: ev.txHash, previousRow: prev?.id ?? null, previousStatus: prev?.status ?? null, costBasis: '0', holdsSlot: false },
       'error',
     );
   }
@@ -1453,8 +1593,9 @@ export class Sniper {
       this.alert('stale_snipe_failed', { snipeId: row.id, reason: 'no token' });
       return;
     }
-    // NEW-3: the head BEFORE bought()/balanceOf(): only a read past the deadline block proves "no buy"
-    const head = dec && dec.deadlineBlock > 0 ? await this.o.chain.getBlockNumber() : null;
+    // NEW-3 / R4-2: "no buy" is final only for a read pinned past the deadline (block or ts); the head
+    // read before is only the fallback for a chain client that does not report its read block
+    const headBefore = dec && dec.deadlineBlock > 0 ? await this.o.chain.getBlockNumber() : null;
     const h = await this.o.chain.readSniper(this.o.sniperContract, token); // throws → unresolved, retried
     if (h.balance > 0n) {
       if (!dec) throw new Error(`row ${row.id}: decision JSON unreadable`);
@@ -1468,8 +1609,13 @@ export class Sniper {
       this.alert('position_closed_externally', { snipeId: row.id, token, realizedEth: pnl }, 'error');
       return;
     }
-    // N12 / NEW-3: members of an unfinished burst may still land up to the deadline block
-    if (dec && head !== null && head <= dec.deadlineBlock) throw new NotFinalYet(`chain head ${head} ≤ burst deadline ${dec.deadlineBlock}`);
+    // N12 / NEW-3 / R4-2: members of an unfinished burst may still land up to the deadline
+    if (dec && dec.deadlineBlock > 0) {
+      const at = h.block ?? headBefore;
+      const dts = dec.deadlineTs > 0 ? dec.deadlineTs : dec.ts > 0 ? dec.ts + SNIPE_DEADLINE_SECONDS : 0;
+      const final = (at !== null && at > dec.deadlineBlock) || (h.blockTs !== undefined && dts > 0 && h.blockTs > dts);
+      if (!final) throw new NotFinalYet(`read at block ${at} (ts ${h.blockTs ?? '?'}) not past the burst deadline (block ${dec.deadlineBlock}, ts ${dts})`);
+    }
     await this.markRow(row, 'failed', `reconciled at startup: chain shows no buy (bought=false) — stale ${row.status} row`);
     this.alert('stale_snipe_failed', { snipeId: row.id, token, status: row.status });
   }
@@ -1510,11 +1656,12 @@ export class Sniper {
       burst: [],
       notes: [
         how === 'orphan'
-          ? `orphan recovered by the startup sweep (balance ${balance}; previous row status ${row.id > 0 ? row.status : 'none'}) (NEW-3)`
+          ? `orphan recovered by the sweep (balance ${balance}; previous row status ${row.id > 0 ? row.status : 'none'}; cost basis 0, no slot, PnL not booked to the daily loss) (NEW-3, R4-1)`
           : `rebuilt at startup from chain state (balance ${balance})`,
       ],
       confirmed: true,
-      slot: true,
+      slot: how !== 'orphan',
+      ...(how === 'orphan' ? { orphan: true } : {}),
     };
     const fill: Fill = {
       block: row.buyBlock ?? dec.block + 1,
@@ -1530,7 +1677,7 @@ export class Sniper {
     this.curveTax.set(curve, event.creatorTaxBps);
     if (row.id > 0) this.recorder.adopt(run); // no row (orphan): the first write inserts one
     this.runs.set(run.key, run);
-    this.risk.adoptPosition(run.playId, token, event.deployer);
+    this.risk.adoptPosition(run.playId, token, event.deployer, how !== 'orphan');
     this.paperBank?.commit(run.key, quoteIn);
     const pos = this.positions.openPosition(run, fill, preset, event.exemptions, {
       tokensHeld: balance,
@@ -1612,6 +1759,8 @@ interface StoredDecision {
   txHash: Hex;
   /** the burst's deadline block (0 = unknown) */
   deadlineBlock: number;
+  /** the burst's wall-clock deadline (0 = unknown: launch ts + 3) */
+  deadlineTs: number;
 }
 
 /** A row whose outcome is not final on chain yet (burst deadline not reached): retry, no alert. */
@@ -1663,6 +1812,7 @@ function decisionOf(row: ActiveSnipe): StoredDecision | null {
     ts: Number(launch.ts ?? 0) || 0,
     txHash: str(launch.txHash, '0x') as Hex,
     deadlineBlock: Number(d.deadlineBlock ?? 0) || 0,
+    deadlineTs: Number(d.deadlineTs ?? 0) || 0,
   };
 }
 

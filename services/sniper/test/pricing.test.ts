@@ -24,10 +24,12 @@ describe('pricing', () => {
   });
 
   it('maxEntryMcapEth turns into an on-chain minTokensOut: above the cap the buy reverts', () => {
-    const p = parsePreset({ buyEth: 0.07, maxEntryMcapEth: 4 });
+    // with the video's 90 % slippage the cap is the binding (stricter) bound
+    const p = parsePreset({ buyEth: 0.07, maxEntryMcapEth: 4, slippageBps: 9000 });
     const q = parseEther('0.07');
     const plan = planMinOut(p, START, q, 200);
     expect(plan.basis).toBe('maxEntryMcap');
+    expect(plan.minTokensOut).toBe(plan.capOut);
     const k = Number(START.quote) * Number(START.token);
     const at = (mcap: number) => {
       const Q = BigInt(Math.floor(Math.sqrt((k * mcap) / 1e9)));
@@ -40,7 +42,26 @@ describe('pricing', () => {
     expect(plan.expectedOut).toBeGreaterThan(plan.minTokensOut);
   });
 
-  it('NEW-1: the seeded generic preset caps entry at 4.2 ETH mcap through k = Q·T — reserves moved along the curve (a fake 3 ETH buy) do not move minTokensOut', () => {
+  it('R4-3: minTokensOut is the STRICTER of the mcap cap and the slippage bound (the cap alone tolerated 44-55 %)', () => {
+    const q = parseEther('0.07');
+    const p = parsePreset({ buyEth: 0.07, maxEntryMcapEth: 4.2, slippageBps: 3000 });
+    // a typical entry well below the cap: the 30 % slippage bound binds, not the 4.2 ETH cap
+    const typical = { quote: START.quote + parseEther('0.3'), token: (START.quote * START.token) / (START.quote + parseEther('0.3')) };
+    const a = planMinOut(p, typical, q, 0);
+    expect(a.basis).toBe('slippage');
+    expect(a.capOut!).toBeLessThan(a.slippageOut);
+    expect(a.minTokensOut).toBe(a.slippageOut);
+    expect(1 - Number(a.minTokensOut) / Number(a.expectedOut)).toBeCloseTo(0.3, 6); // was ≈ 0.48 with the cap alone
+    expect(1 - Number(a.capOut!) / Number(a.expectedOut)).toBeGreaterThan(0.4);
+    // close to the cap: the cap binds (the buy reverts above 4.2 ETH whatever the slippage)
+    const near = { quote: START.quote + parseEther('1.0'), token: (START.quote * START.token) / (START.quote + parseEther('1.0')) };
+    const b = planMinOut(p, near, q, 0);
+    expect(b.basis).toBe('maxEntryMcap');
+    expect(b.minTokensOut).toBe(b.capOut);
+    expect(b.minTokensOut).toBeGreaterThan(b.slippageOut);
+  });
+
+  it('NEW-1: the seeded generic preset caps entry at 4.2 ETH mcap through k = Q·T — reserves moved along the curve (a fake 3 ETH buy) do not move the cap bound', () => {
     const p = genericPreset();
     expect(p.maxEntryMcapEth).toBe(4.2);
     const q = parseEther('0.07');
@@ -49,9 +70,10 @@ describe('pricing', () => {
     const moved = { quote: START.quote + net, token: START.token - quoteBuy(START, parseEther('3'), 100, 0, 0n) };
     expect(mcapFromReserves(moved)).toBeGreaterThan(5); // the fake price is above the cap …
     const attacked = planMinOut(p, moved, q, 0);
-    expect(attacked.basis).toBe('maxEntryMcap');
-    // … but the on-chain bound is the same (k is invariant; float rounding only)
-    expect(Math.abs(Number(attacked.minTokensOut - honest.minTokensOut)) / Number(honest.minTokensOut)).toBeLessThan(1e-9);
+    // … but the on-chain cap bound is the same (k is invariant; float rounding only), and minTokensOut never goes below it
+    expect(Math.abs(Number(attacked.capOut! - honest.capOut!)) / Number(honest.capOut!)).toBeLessThan(1e-9);
+    expect(attacked.minTokensOut).toBeGreaterThanOrEqual(attacked.capOut!);
+    expect(honest.minTokensOut).toBeGreaterThanOrEqual(honest.capOut!);
   });
 
   it('slippage basis: minOut = expected·(1 − slippage) at the worst allowed tax', () => {

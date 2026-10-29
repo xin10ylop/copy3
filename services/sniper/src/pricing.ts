@@ -16,15 +16,21 @@ export interface MinOutPlan {
   expectedOut: bigint;
   minTokensOut: bigint;
   taxBps: number;
+  /** which bound is binding (the larger minTokensOut): the mcap cap or the slippage */
   basis: 'maxEntryMcap' | 'slippage';
+  /** both bounds (R4-3): `capOut` only with `maxEntryMcapEth` */
+  slippageOut: bigint;
+  capOut?: bigint;
 }
 
 /**
- * minTokensOut for the burst:
- *  - with `maxEntryMcapEth`: tokens a buy would get when the pre-trade price equals the cap
- *    (k = Q·T is invariant on the curve, so Q' = √(k·p), T' = k/Q'). The contract then refuses
- *    any entry above that mcap — enforced at execution time without another RPC.
- *  - otherwise `slippageBps` below the expected output at the current reserves.
+ * minTokensOut for the burst — the STRICTER (larger) of two bounds (R4-3):
+ *  - slippage: `slippageBps` below the expected output at `r` — the reserves the decision priced
+ *    on (launch config + CONFIRMED launch-second buys, or getReserves), never feed hints (NEW-1);
+ *  - with `maxEntryMcapEth`: the tokens a buy would get with the pre-trade price AT the cap
+ *    (k = Q·T is invariant on the curve, so Q' = √(k·p), T' = k/Q'), so the contract refuses any
+ *    entry above that mcap whatever the ledger believed — enforced at execution, no extra RPC.
+ * The cap alone tolerated 44–55 % fewer tokens at typical entries; now it can only tighten.
  * Both assume the worst tax the preset allows (618 bps for the default maxTaxBps 1000).
  */
 export function planMinOut(p: Preset, r: Reserves, quoteIn: bigint, creatorTaxBps: number, feeBps = CURVE_FEE_BPS): MinOutPlan {
@@ -32,14 +38,17 @@ export function planMinOut(p: Preset, r: Reserves, quoteIn: bigint, creatorTaxBp
   const taxBps = worstTaxBps(Math.min(p.maxTaxBps, MAX_TAX_BPS));
   const snipeTax = snipeTaxWeiFor(quoteIn, taxBps);
   const expectedOut = quoteBuy(r, quoteIn, feeBps, creatorTaxBps, snipeTax);
+  const slippageOut = minOutWithSlippage(expectedOut, p.slippageBps);
   if (p.maxEntryMcapEth !== undefined && p.maxEntryMcapEth > 0) {
     const pMax = p.maxEntryMcapEth / 1e9; // ETH per whole token
     const k = Number(r.quote) * Number(r.token);
     const q = BigInt(Math.floor(Math.sqrt(k * pMax)));
     const t = BigInt(Math.floor(k / Number(q)));
-    return { expectedOut, minTokensOut: quoteBuy({ quote: q, token: t }, quoteIn, feeBps, creatorTaxBps, snipeTax), taxBps, basis: 'maxEntryMcap' };
+    const capOut = quoteBuy({ quote: q, token: t }, quoteIn, feeBps, creatorTaxBps, snipeTax);
+    const capWins = capOut > slippageOut;
+    return { expectedOut, minTokensOut: capWins ? capOut : slippageOut, taxBps, basis: capWins ? 'maxEntryMcap' : 'slippage', slippageOut, capOut };
   }
-  return { expectedOut, minTokensOut: minOutWithSlippage(expectedOut, p.slippageBps), taxBps, basis: 'slippage' };
+  return { expectedOut, minTokensOut: slippageOut, taxBps, basis: 'slippage', slippageOut };
 }
 
 /**

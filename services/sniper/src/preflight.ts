@@ -38,6 +38,8 @@ export interface StartupCheckInput {
   gasLimit: number;
   /** largest FIXED buy among the enabled presets (`buyEth`; refused at decide time above maxQuoteIn) */
   maxBuyEth?: number;
+  /** every FIXED `buyEth` of the enabled presets (R4-8: those above maxQuoteIn are refused at decide time, so the budget check ignores them) */
+  fixedBuysEth?: number[];
   /** largest `sizing.maxEth` among the enabled bankroll presets (clamped to maxQuoteIn, NEW-6) */
   maxBankrollEth?: number;
   factory?: Address;
@@ -91,7 +93,11 @@ export async function liveStartupChecks(i: StartupCheckInput): Promise<StartupCh
     // NEW-4: nothing read the budget before — exhausted, every member reverted SpendLimitExceeded silently
     spend = cfg.spend ?? null;
     if (spend) {
-      const fixed = i.maxBuyEth !== undefined ? parseEther(String(i.maxBuyEth)) : 0n;
+      // R4-8: a fixed preset above maxQuoteIn never buys (refused at decide time): not the "largest buy"
+      const fixed = (i.fixedBuysEth ?? (i.maxBuyEth !== undefined ? [i.maxBuyEth] : []))
+        .map((x) => parseEther(String(x)))
+        .filter((x) => x <= cfg.maxQuoteIn)
+        .reduce((a, b) => (b > a ? b : a), 0n);
       const bank = i.maxBankrollEth !== undefined ? parseEther(String(i.maxBankrollEth)) : 0n;
       const bankCapped = bank > cfg.maxQuoteIn ? cfg.maxQuoteIn : bank;
       const largest = fixed > bankCapped ? fixed : bankCapped;

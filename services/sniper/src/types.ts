@@ -135,6 +135,11 @@ export interface SnipeRun {
   signer?: Address;
   /** holds a MAX_CONCURRENT slot (taken once the launch is receipt-confirmed, N10) */
   slot?: boolean;
+  /** R4-1: adopted by the orphan sweep — cost basis 0, no slot, its PnL is not daily-loss PnL */
+  orphan?: boolean;
+  /** R4-2: local ms the run first became unresolved (a long-unresolved run alerts) */
+  unresolvedSince?: number;
+  unresolvedAlerted?: boolean;
   /** launch-second ledger of the launch (launch-second plays: confirmation + last-moment re-check) */
   ledger?: LaunchSecondLedger;
   /** how `quoteIn` was sized (Preset.sizing) */

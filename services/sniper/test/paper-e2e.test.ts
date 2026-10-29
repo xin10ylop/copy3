@@ -98,7 +98,9 @@ async function replayTrades(h: ReturnType<typeof harness>, untilSec: number): Pr
 
 describe('paper mode end-to-end (AMLIL timeline on the SHIBA launch fixture)', () => {
   it('detects, plans the burst, fills at the first +1 s block (618 bps), takes profit and records everything', async () => {
-    const h = harness({ buyEth: 0.07, maxEntryMcapEth: 4, takeProfits: [{ pct: 150, sellPct: 100 }], trailing: { activatePct: 1000, dropPct: 25 }, stopLossPct: 40 });
+    // R4-3: the mcap cap no longer replaces the slippage bound; a deployerIn play prices on the
+    // pre-team reserves, so on AMLIL (+49 % in the launch second) it needs the video's 90 % slippage
+    const h = harness({ buyEth: 0.07, maxEntryMcapEth: 4, slippageBps: 9000, takeProfits: [{ pct: 150, sellPct: 100 }], trailing: { activatePct: 1000, dropPct: 25 }, stopLossPct: 40 });
     await h.sniper.start();
     for (let s = 30; s >= 1; s--) h.second(T - s, LAUNCH.block - 2 - s * 10);
     h.second(T, LAUNCH.block - 2, 2, 0, 3); // … up to the launch block (3rd block of second T)
@@ -144,7 +146,7 @@ describe('paper mode end-to-end (AMLIL timeline on the SHIBA launch fixture)', (
   });
 
   it('exits on the operator dump signal (exempt Transfer at +6 s) before any TP; TokenLaunched via ws', async () => {
-    const h = harness({ buyEth: 0.07, maxEntryMcapEth: 4, takeProfits: [{ pct: 1000, sellPct: 100 }], exitIfExemptSellsPct: 1 }, { receipt: false });
+    const h = harness({ buyEth: 0.07, maxEntryMcapEth: 4, slippageBps: 9000, takeProfits: [{ pct: 1000, sellPct: 100 }], exitIfExemptSellsPct: 1 }, { receipt: false });
     await h.sniper.start();
     for (let s = 10; s >= 1; s--) h.second(T - s, LAUNCH.block - 2 - s * 10);
     h.second(T, LAUNCH.block - 2, 2);
