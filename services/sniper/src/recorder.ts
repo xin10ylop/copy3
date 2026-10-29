@@ -47,6 +47,8 @@ export function snipeRecord(run: SnipeRun, p?: PositionEntry): SnipeRecord {
           sizing: run.sizing,
           // launch-second plays: what the ledger knew (team/dev buys, confirmations, exempt outflows)
           launchSecond: run.ledger && run.decision.play.trigger.launchSecond ? run.ledger.snapshot() : undefined,
+          // probe tx / live buy: block offset vs the first T+1 block, tx index, buyers ahead (race.ts, `hoodctl race`)
+          race: run.race,
         },
         bigintReplacer,
       ),

@@ -175,6 +175,8 @@ describe('Positions manager', () => {
     await p.onFeedBlock(emptyBlock(LAUNCH.block + 60, LAUNCH.ts + 6, 0, [tx]));
     await new Promise((r) => setTimeout(r, 1));
     expect(be.exits.map((e) => e.reason)).toEqual(['exempt_dump', 'exempt_dump']);
+    // the order carries the trigger block: a sell lands after the block with the operator's transfer
+    expect(be.exits[0]!.atBlock).toBe(LAUNCH.block + 60);
     // retry widens slippage: 15 % then 40 % below the expected quote
     const [first, second] = be.exits.map((e) => Number(e.minQuoteOut));
     expect(second! / first!).toBeCloseTo(0.6 / 0.85, 6);

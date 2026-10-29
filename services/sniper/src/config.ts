@@ -34,7 +34,11 @@ const ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
 
 export const ConfigSchema = z
   .object({
-    EXECUTION_MODE: z.enum(['live', 'paper']).default('paper'),
+    /**
+     * paper: simulated fills, nothing sent; live: real bursts through PonsSniper; probe: paper fills
+     * + ONE real 0-value self-transfer per planned burst at its first slot (race measurement, gas only)
+     */
+    EXECUTION_MODE: z.enum(['live', 'paper', 'probe']).default('paper'),
     FEED_URL: z.string().default('wss://feed.mainnet.chain.robinhood.com'),
     /** comma list of extra feeds tried in order after FEED_URL fails */
     FEED_URL_SECONDARY: csv,
@@ -74,6 +78,8 @@ export const ConfigSchema = z
     RECEIPT_POLL_MS: num(20),
     /** burst / exit receipt polling (nonce-gated: one nonce read per tick + one receipt per landed member) */
     BURST_RECEIPT_POLL_MS: num(200),
+    /** probe mode: give up waiting for the probe tx's receipt after this long (`not mined`) */
+    PROBE_RECEIPT_TIMEOUT_MS: num(5000),
     /** give up waiting for an exit receipt after this long (the round then counts as failed) */
     EXIT_RECEIPT_TIMEOUT_MS: num(10_000),
     /** stop waiting for TokenLaunched after this long */
@@ -150,6 +156,14 @@ export const ConfigSchema = z
         ctx.addIssue({ code: 'custom', path: ['SEND_ENDPOINTS'], message: 'live mode needs at least one send endpoint' });
       if (!c.DATABASE_URL)
         ctx.addIssue({ code: 'custom', path: ['DATABASE_URL'], message: 'live mode records every snipe; DATABASE_URL required' });
+    }
+    if (c.EXECUTION_MODE === 'probe') {
+      // probe: gas-only keys (no contract, no operator role); one key is enough
+      const keys = c.EXECUTOR_PRIVATE_KEYS.length ? c.EXECUTOR_PRIVATE_KEYS : c.EXECUTOR_PRIVATE_KEY ? [c.EXECUTOR_PRIVATE_KEY] : [];
+      if (keys.length === 0 || keys.some((k) => !KEY_RE.test(k)))
+        ctx.addIssue({ code: 'custom', path: ['EXECUTOR_PRIVATE_KEYS'], message: 'probe mode needs at least one 0x-prefixed 32-byte key with gas (EXECUTOR_PRIVATE_KEYS; hoodctl keygen 1)' });
+      if (new Set(keys.map((k) => k.toLowerCase())).size !== keys.length)
+        ctx.addIssue({ code: 'custom', path: ['EXECUTOR_PRIVATE_KEYS'], message: 'duplicate executor key' });
     }
     for (const a of c.LAUNCHERS) if (!ADDR_RE.test(a)) ctx.addIssue({ code: 'custom', path: ['LAUNCHERS'], message: `not an address: ${a}` });
   });

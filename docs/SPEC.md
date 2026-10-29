@@ -105,7 +105,8 @@ graph helpers (`fundingPath(wallet, depth)`).
 ### sniper (hot path)
 Env: `FEED_URL`, `FEED_URL_SECONDARY`, `NODE_WS`, `SEND_ENDPOINTS` (comma list,
 first = primary), `DATABASE_URL`, `EXECUTOR_PRIVATE_KEYS`, `SNIPER_CONTRACT`,
-`EXECUTION_MODE=live|paper`, `MAX_GAS_PRICE_GWEI`, `DAILY_LOSS_LIMIT_ETH`.
+`EXECUTION_MODE=live|paper|probe` (probe = paper + one 0-value self-transfer per planned burst,
+race measurement), `MAX_GAS_PRICE_GWEI`, `DAILY_LOSS_LIMIT_ETH`.
 Loop: feed frame → decode → for each tx: if launch call → build `LaunchEvent`
 (+ predicted addresses) → `rules.evaluate(event)` → if match and risk checks
 pass → `executor.burst(plan)`; on `TokenLaunched` log from node (ws) confirm

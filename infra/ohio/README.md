@@ -160,7 +160,8 @@ extrapolate.
 
 | Task | Command |
 |---|---|
-| Stop new paper entries / resume | `hoodctl kill "reason"` / `hoodctl resume` |
+| Stop new paper entries / resume | `hoodctl kill "reason"` / `hoodctl resume` (also stops probes) |
+| Race measurements (probe / live) | `hoodctl race 1` |
 | Enable / disable a play | `hoodctl plays`, `hoodctl play on 3`, `hoodctl play off 3` |
 | Run the nightly job or a scout pass now | `hoodctl nightly` / `hoodctl scout` |
 | Start Telegram | Fill `TELEGRAM_*` in `.env.ohio`, then `hoodctl telegram`. To start it with the stack every time, uncomment `COMPOSE_PROFILES=telegram` |
@@ -170,12 +171,73 @@ extrapolate.
 | Stop everything (data kept) | `hoodctl down`. Containers restart on reboot (`restart: unless-stopped`) unless you do this |
 | Back up the DB | `hoodctl compose exec -T postgres pg_dump -U hood -Fc hood > hood-$(date +%F).dump` |
 
+## Measure the race before going live
+
+Paper mode cannot tell whether a burst would land **first** in the first block of second `T+1`,
+and the strategy's profit depends on that. `EXECUTION_MODE=probe` measures it without buying
+anything: the sniper runs exactly as in paper mode (paper fills, paper PnL), and for every run whose
+burst is planned it also sends **one** real transaction at the burst's first slot
+(`boundary(T+1) − rtt − 120 ms`, the same timing and send path as live). That transaction is a
+0-value transfer from the probe key to itself (21 000 gas, live gas settings capped by
+`MAX_GAS_PRICE_GWEI`). It never calls a contract. The sniper then reads its receipt and records
+where it landed (`decision.race` of the snipe row, `race_*` counters on `/healthz`).
+
+1. **Make a probe key.** It only pays gas. Never make it a PonsSniper operator, and never reuse a
+   live key here.
+   ```bash
+   hoodctl keygen 1     # prints the address and an EXECUTOR_PRIVATE_KEYS=0x… line, writes nothing
+   ```
+2. **Fund it** with 0.002 ETH on Robinhood Chain (send it from your wallet to the printed address).
+   A probe costs well under 0.00001 ETH, so 0.002 ETH lasts weeks. The sniper skips probes (and
+   raises `probe_gate_failed` / `low_balance`) while the key holds less than `MIN_GAS_BALANCE_ETH`
+   (0.001).
+3. **Switch the sniper to probe mode.** Edit the env file (`sudo nano /opt/hood/hoodsniper/.env.ohio`)
+   and set the two lines below (add them if your file predates them). The file stays 0600.
+   ```bash
+   EXECUTION_MODE=probe
+   EXECUTOR_PRIVATE_KEYS=0x…      # the line hoodctl keygen printed
+   ```
+4. **Restart only the sniper**, then check it:
+   ```bash
+   hoodctl compose up -d sniper      # recreates the sniper with the new env (the rest keeps running)
+   hoodctl health                    # sniper: "mode":"probe", raceSent / raceWon counters
+   hoodctl logs -f sniper | grep -iE 'probe|race'   # "probe gate passed", then "probe landed" per run
+   ```
+5. **Read the numbers** after a day of launches:
+   ```bash
+   hoodctl race 1      # rows: decided_at, launch tx, status, offset, txIdx, ahead, inBlock; then the summary
+   ```
+
+How to read `hoodctl race`:
+
+| Column / line | Meaning |
+|---|---|
+| `offset` | landed block − first `T+1` block as the feed showed it. `+0` = the target block. Negative = landed in second `T` (a real buy pays the 99 % snipe tax there; the contract's `maxTaxBps` makes it revert). Positive = late. |
+| `txIdx`, `ahead` | our position in the landed block, and how many `CurveBuy`s of that launch's curve came before us. |
+| `inBlock` | `CurveBuy`s of the curve in the whole first `T+1` block (the competition). |
+| `sent-vs-boundary` | send time − predicted boundary. It should sit near `−(rtt + 120)` ms. |
+| `first in block (race won)` | offset 0 and 0 buys ahead, over the probes sent: **the measured race win rate**. `PAPER_FILL=first` assumes 100 %. |
+| `in target block` | landed in the right block, but maybe behind other buyers (then `PAPER_FILL=last` is closer to the truth). |
+| `early` / `late` | the slot is too early / too late. A late first slot is a real loss: the other nine burst members go out after it. An early first slot is cheaper, because the later members (15 ms apart) can still land in the target block. Tune `burst.startMs` with `/preset` and re-measure. |
+| `median buysAhead` | how many buyers usually beat us. |
+
+Go live only when the win rate is good enough for the plays' expectancy. As a rule of thumb, look
+for at least 20 probes, most of them `+0`, and a win rate that makes paper PnL between
+`PAPER_FILL=first` and `PAPER_FILL=last` positive. Probes leave from this Docker container. A live
+sniper on the bare host (below) is about a millisecond faster, so the numbers are slightly
+pessimistic. Once live, every live burst records the same measurement (`source live`, the buying
+member, or the first landed member with its revert reason), and `hoodctl race` prints both.
+
+Back to plain paper: set `EXECUTION_MODE=paper` and run `hoodctl compose up -d sniper`. Then move
+the probe key's leftover gas and delete the key from the env file.
+
 ## Going live later
 
 Paper on this box proves the decision path. It does not prove that a burst lands first in the
-+1 s block. For live trading (RUNBOOK §6-8):
++1 s block: measure that first (above, "Measure the race before going live"). For live trading
+(RUNBOOK §6-8):
 
-1. Pass the paper gate (RUNBOOK §7).
+1. Pass the paper gate (RUNBOOK §7) and the race measurement (RUNBOOK §7a).
 2. Run the **live sniper on the host**, not in this compose file: `sudo HOOD_REPO_URL=…
    bash infra/executor/install-executor.sh` (optionally `HOOD_PIN_CPU=1`). It installs
    `hood-sniper.service` with low-latency sysctls, CPU pinning and `/opt/hood/hoodsniper/.env.executor`
@@ -188,7 +250,8 @@ Paper on this box proves the decision path. It does not prove that a burst lands
 4. Generate the executor keys **on the box** (1 exit + 1 burst key per `MAX_CONCURRENT`), deploy
    `PonsSniper` with the cold wallet as owner, `setOperator` every key, and fund each key with gas
    and the contract with a few × buyEth (RUNBOOK §6.2-6.4). Put `SNIPER_CONTRACT` and
-   `EXECUTOR_PRIVATE_KEYS` in `.env.executor`. Keys never go into `.env.ohio`.
+   `EXECUTOR_PRIVATE_KEYS` in `.env.executor`. Live keys never go into `.env.ohio` (only the
+   gas-only probe key does, while you measure the race).
 5. Stop the paper sniper so two snipers do not share the DB: set `PAPER_SNIPER=0` in `.env.ohio`
    and run `hoodctl up`. Then set `EXECUTION_MODE=live` in `.env.executor` and run
    `sudo systemctl restart hood-sniper` (RUNBOOK §8: start at `buyEth=0.01`, `MAX_CONCURRENT=1`).

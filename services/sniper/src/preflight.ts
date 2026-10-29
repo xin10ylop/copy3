@@ -177,7 +177,31 @@ export async function liveStartupChecks(i: StartupCheckInput): Promise<StartupCh
   return { ok: errors.length === 0, errors, warnings, gasEstimate, exitGasEstimate, maxQuoteIn, spend, estimatedOn };
 }
 
+/**
+ * EXECUTION_MODE=probe gate: no contract is involved (SNIPER_CONTRACT is not needed), but every
+ * probe key must have gas (≥ `minBalanceWei`, MIN_GAS_BALANCE_ETH) and a readable balance. While it
+ * fails no probe is sent (the paper runs go on); LiveGate retries it every GATE_RETRY_MS.
+ */
+export async function probeStartupChecks(i: { chain: ChainClient; keys: readonly Address[]; minBalanceWei: bigint }): Promise<StartupCheckResult> {
+  const errors: string[] = [];
+  if (i.keys.length === 0) errors.push('probe mode needs an executor key (EXECUTOR_PRIVATE_KEYS)');
+  for (const k of i.keys) {
+    try {
+      const b = await i.chain.getBalance(k);
+      if (b < i.minBalanceWei)
+        errors.push(`probe key ${k} has ${formatEther(b)} ETH < MIN_GAS_BALANCE_ETH ${formatEther(i.minBalanceWei)} ETH (fund it: ~0.000005 ETH per probe, 0.002 ETH lasts weeks)`);
+    } catch (e) {
+      errors.push(`probe key ${k}: balance not readable (${(e as Error).message.split('\n')[0]})`);
+    }
+  }
+  return { ok: errors.length === 0, errors, warnings: [], gasEstimate: null, exitGasEstimate: null, maxQuoteIn: null, estimatedOn: null };
+}
+
 export interface LiveGateOptions {
+  /** log label. Default 'live gate'. */
+  label?: string;
+  /** what a failing gate means, for the log. Default 'new entries blocked'. */
+  failing?: string;
   check: () => Promise<StartupCheckResult>;
   /**
    * NEW-8: the light re-check run every `refreshMs` while the gate passes — the contract config
@@ -215,8 +239,9 @@ export class LiveGate {
     }
     this.last = r;
     for (const w of r.warnings) this.o.logger.warn(w);
-    if (!r.ok) this.o.logger.error({ errors: r.errors }, 'live gate failed: new entries blocked, retrying');
-    else this.o.logger.info({ gasEstimate: r.gasEstimate?.toString(), exitGasEstimate: r.exitGasEstimate?.toString() }, 'live gate passed');
+    const label = this.o.label ?? 'live gate';
+    if (!r.ok) this.o.logger.error({ errors: r.errors }, `${label} failed: ${this.o.failing ?? 'new entries blocked'}, retrying`);
+    else this.o.logger.info({ gasEstimate: r.gasEstimate?.toString(), exitGasEstimate: r.exitGasEstimate?.toString() }, `${label} passed`);
     this.o.onResult(r);
     this.schedule(r.ok);
     return r;

@@ -16,7 +16,9 @@ import {
   type RpcTxLike,
 } from '@hood/core';
 import {
+  BaseError,
   createPublicClient,
+  decodeErrorResult,
   getAbiItem,
   http,
   keccak256,
@@ -36,6 +38,16 @@ export interface ReceiptLite {
   blockNumber: number;
   gasUsed: bigint;
   logs: RawLog[];
+  /** position of the tx in its block (probe mode: race position); absent when the client does not report it */
+  transactionIndex?: number;
+}
+
+/** A CurveBuy log located in its block (probe mode: who bought before / after our probe tx). */
+export interface CurveBuyRef {
+  block: number;
+  txIndex: number;
+  logIndex: number;
+  txHash: Hex;
 }
 
 /** What the PonsSniper contract holds for a token (chain truth for reconciliation). */
@@ -172,6 +184,10 @@ export interface ChainClient {
   tokenMeta?(token: Address, curve: Address): Promise<{ name: string; symbol: string; creatorTaxBps: number }>;
   /** TokenLaunched logs from the factory (ws). Optional: without ws we poll receipts. */
   watchLaunches?(cb: (log: RawLog) => void): () => void;
+  /** CurveBuy logs of `curve` in [fromBlock, toBlock] (one eth_getLogs; race measurement). Optional. */
+  curveBuyLogs?(curve: Address, fromBlock: number, toBlock: number): Promise<CurveBuyRef[]>;
+  /** why a mined tx reverted: eth_call replay of it at its block, decoded against the PonsSniper errors (best effort). Optional. */
+  revertReason?(hash: Hex, block: number): Promise<string | null>;
   /** CurveBuy/CurveSell/CurveCompleted/SnipeTaxExempted on `curve` and Transfer on `token` (ws). */
   watchToken?(token: Address, curve: Address, cb: (log: RawLog) => void): () => void;
 }
@@ -334,6 +350,7 @@ export class ViemChain implements ChainClient {
         blockNumber: Number(r.blockNumber),
         gasUsed: r.gasUsed,
         logs: live(r.logs).map((l) => toRaw(l as Log)),
+        transactionIndex: Number(r.transactionIndex),
       };
     } catch (e) {
       if ((e as { name?: string }).name === 'TransactionReceiptNotFoundError') return null;
@@ -343,6 +360,34 @@ export class ViemChain implements ChainClient {
 
   getGasPrice(): Promise<bigint> {
     return this.http.getGasPrice();
+  }
+
+  async revertReason(hash: Hex, block: number): Promise<string | null> {
+    const tx = await this.http.getTransaction({ hash });
+    try {
+      await this.http.call({ account: tx.from, to: tx.to ?? undefined, data: tx.input, value: tx.value, gas: tx.gas, blockNumber: BigInt(block) });
+      return 'no revert on replay (state at the end of the block differs)';
+    } catch (e) {
+      let data: Hex | undefined;
+      if (e instanceof BaseError) {
+        const raw = e.walk((x) => typeof (x as { data?: unknown }).data === 'string') as { data?: Hex } | null;
+        data = raw?.data;
+      }
+      if (data && data.length >= 10) {
+        try {
+          const d = decodeErrorResult({ abi: sniperAbi, data });
+          return d.args && d.args.length ? `${d.errorName}(${d.args.map(String).join(', ')})` : d.errorName;
+        } catch {
+          return `revert ${data.slice(0, 10)}`;
+        }
+      }
+      return (e as Error).message.split('\n')[0] ?? 'reverted';
+    }
+  }
+
+  async curveBuyLogs(curve: Address, fromBlock: number, toBlock: number): Promise<CurveBuyRef[]> {
+    const logs = await this.http.getLogs({ address: curve, event: getAbiItem({ abi: curveAbi, name: 'CurveBuy' }), fromBlock: BigInt(fromBlock), toBlock: BigInt(toBlock) });
+    return live(logs).map((l) => ({ block: Number(l.blockNumber), txIndex: Number(l.transactionIndex), logIndex: Number(l.logIndex), txHash: l.transactionHash as Hex }));
   }
 
   getBalance(address: Address): Promise<bigint> {

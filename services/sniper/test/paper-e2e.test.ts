@@ -1,4 +1,4 @@
-import { CURVE_FEE_BPS, SequencerClock, quoteBuy, snipeTaxWeiFor, type FeedBlock, type Reserves } from '@hood/core';
+import { CURVE_FEE_BPS, SequencerClock, quoteBuy, quoteSell, snipeTaxWeiFor, type FeedBlock, type Reserves } from '@hood/core';
 import { parseEther } from 'viem';
 import { afterEach, describe, expect, it } from 'vitest';
 import { LaunchDetector } from '../src/detector.js';
@@ -46,14 +46,15 @@ function harness(presetOver: Record<string, unknown>, opts: { receipt?: boolean 
   const store = new MemoryStore({ plays: [play({ id: 9, name: 'shib-dev', trigger: { deployerIn: [LAUNCH.deployer] }, preset: presetOver })] });
   const chain = new FakeChain();
   chain.latest.set(LAUNCH.curve, INITIAL);
-  chain.atBlock = (_c, b) => (b >= LAUNCH.block + 5 ? afterTeam() : INITIAL);
+  chain.atBlock = (_c, b) => (b > LAUNCH.block + 8 ? undefined : b >= LAUNCH.block + 5 ? afterTeam() : INITIAL); // post-fill blocks: unknown → exits price on the book
+  chain.strictBlocks = true;
   if (opts.receipt !== false) {
     chain.receipts.set(LAUNCH.txHash, launchReceipt());
   }
   const sched = new ManualScheduler((T - 31) * 1000);
   // eslint-disable-next-line prefer-const
   let sniper: Sniper;
-  const backend = new PaperExecutor({ chain, logger: silentLogger, book: (c) => sniper.positions.book(c), creatorTaxBps: (c) => sniper.creatorTaxBps(c) });
+  const backend = new PaperExecutor({ chain, logger: silentLogger, book: (c) => sniper.positions.book(c), creatorTaxBps: (c) => sniper.creatorTaxBps(c), exitRetryMs: 1 });
   sniper = new Sniper({
     mode: 'paper',
     store,
@@ -220,5 +221,26 @@ describe('paper mode end-to-end (AMLIL timeline on the SHIBA launch fixture)', (
     expect(run.launch.source).toBe('log');
     expect(run.launch.addressSource).toBe('fallback');
     expect(h.sniper.counters.fallback_launches).toBe(1);
+  });
+});
+
+describe('paper exit pricing (post-dump reserves)', () => {
+  it('prices the exit on the post-state of the trigger block, not on the pre-dump book', async () => {
+    const chain = new FakeChain();
+    const preDump: Reserves = { quote: 2_000_000_000_000_000_000n, token: 9n * 10n ** 26n };
+    const postDump: Reserves = { quote: 1_500_000_000_000_000_000n, token: 12n * 10n ** 26n };
+    chain.latest.set(LAUNCH.curve, preDump);
+    chain.atBlock = (_c, b) => (b === 777 ? postDump : undefined);
+    const paper = new PaperExecutor({ chain, logger: silentLogger, book: () => preDump, creatorTaxBps: () => 0 });
+    const tokensIn = 10n ** 24n;
+    const order = { key: 'k', curve: LAUNCH.curve, token: LAUNCH.token, tokensIn, all: false, minQuoteOut: 0n, reason: 'exempt_dump', gasLimit: 1, maxFeeGwei: 1 };
+    const atTrigger = await paper.exit({ ...order, atBlock: 777 });
+    expect(atTrigger.ok).toBe(true);
+    expect(atTrigger.quoteOut).toBe(quoteSell(postDump, tokensIn, CURVE_FEE_BPS, 0));
+    expect(atTrigger.quoteOut).toBeLessThan(quoteSell(preDump, tokensIn, CURVE_FEE_BPS, 0));
+    expect(chain.calls).toContain(`getReserves:${LAUNCH.curve}:777`);
+    // no trigger block known (startup rebuild): the book is the fallback, as before
+    const fallback = await paper.exit(order);
+    expect(fallback.quoteOut).toBe(quoteSell(preDump, tokensIn, CURVE_FEE_BPS, 0));
   });
 });

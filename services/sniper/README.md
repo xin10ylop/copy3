@@ -453,7 +453,8 @@ From the 3-day walk-forward (`docs/BACKTEST.md`, Backtest #2):
 
 | Var | Default | Meaning |
 |---|---|---|
-| `EXECUTION_MODE` | `paper` | `live` signs and sends; `paper` simulates |
+| `EXECUTION_MODE` | `paper` | `live` signs and sends; `paper` simulates; `probe` = paper + one real 0-value self-transfer per planned burst at its first slot (race measurement, see "Probe mode") |
+| `PROBE_RECEIPT_TIMEOUT_MS` | `5000` | probe mode: give up on the probe tx's receipt after this long (`not_mined`) |
 | `FEED_URL` | `wss://feed.mainnet.chain.robinhood.com` | primary sequencer feed (the server **requires permessage-deflate**) |
 | `FEED_URL_SECONDARY` | – | comma list of fallback feeds (e.g. own node relay, `wss://delayed-feed.mainnet.chain.robinhood.com`); duplicates are dropped by sequence number, reconnects request replay from the next block; liveness only counts new in-order blocks, frames far from the head are dropped until 3 consistent frames confirm a reset |
 | `NODE_HTTP` | – | node for reads: receipts, `getReserves`, nonces, balances (falls back to `PUBLIC_RPC`). Use the lowest-latency endpoint from the executor host |
@@ -462,7 +463,7 @@ From the 3-day walk-forward (`docs/BACKTEST.md`, Backtest #2):
 | `SEND_ENDPOINTS` | `NODE_HTTP` or `PUBLIC_RPC` | comma list; every raw tx goes to all of them; the first is used for RTT |
 | `DATABASE_URL` | – | Postgres (`@hood/db`). Required in live mode; without it paper mode uses an in-memory store |
 | `PLAYS_FILE` | – | JSON array of plays (SPEC §4 shape) for DB-less paper runs |
-| `EXECUTOR_PRIVATE_KEYS` | – | live only; comma list of operator keys: **first = exit key**, the rest = one burst slot each (≥ 2 keys in live mode). Fund each with gas. chmod 600 env file on the executor host |
+| `EXECUTOR_PRIVATE_KEYS` | – | probe: gas-only key(s) for the probe tx (≥ 1, `hoodctl keygen 1`; never an operator). Live: comma list of operator keys: **first = exit key**, the rest = one burst slot each (≥ 2 keys in live mode). Fund each with gas. chmod 600 env file on the executor host |
 | `EXECUTOR_PRIVATE_KEY` | – | legacy single key (shared exit/burst sequence); live mode refuses it unless `ALLOW_SINGLE_KEY=1` (N5) |
 | `SNIPER_CONTRACT` | – | live only; deployed PonsSniper address |
 | `LAUNCHERS` | `0x6319141dcc29e7dceaab6c4563cca1fb58e8cce2,0x9dcceb091218cdedbc2875514386615a8ce63961` (always included) | third-party launcher contracts: their txs start the early log path (receipt polled from the feed block); the launch is built from the factory's TokenLaunched log. The env value adds to the defaults |
@@ -556,6 +557,36 @@ follows:
 The paper e2e test replays the real AMLIL trade sequence. Entry is 2.777e-9 ETH/token (the real
 first taxed buyer averaged 2.79e-9), TP1 (+150 %) fires at +6.5 s, and 0.07 ETH realises
 +0.107 ETH.
+
+## Probe mode (race measurement)
+
+`EXECUTION_MODE=probe` is paper mode (`src/paper.ts` fills, paper PnL, paper rows) with one
+addition (`src/probe.ts`). For every run whose burst is planned, one real tx leaves at the burst's
+first slot `times[0] = boundary(T+1) − rtt + burst.startMs`. These are the same `clock.planBurst`
+times, the same `SEND_ENDPOINTS` fan-out with one re-send, and the same per-key nonce sequence as
+live. The tx is a 0-value self-transfer (21 000 gas). Its fee is the preset's `maxFeeGwei` clamped
+to `MAX_GAS_PRICE_GWEI`, plus the preset's priority fee. It is pre-signed when the burst is armed.
+Right before it leaves, `order.guard` runs (kill switch, daily loss, the launch-second re-check). A
+blocked guard sends nothing, and the paper fill keeps its own guard check at the `T+1` block. A run
+aborted before the slot cancels the probe.
+
+The sniper polls the receipt for up to `PROBE_RECEIPT_TIMEOUT_MS` (otherwise `not_mined`), then
+`RaceTracker.measure` (`src/race.ts`) records the following:
+
+- `blockOffset`: landed block − the first block of second `T+1` as the feed showed it;
+- `txIndex`;
+- `buysAhead` / `buysAfter`: `CurveBuy` logs of the curve in the landed block before and after our
+  index (one `eth_getLogs` on the curve);
+- `buysInBlock`: buys in the whole first `T+1` block;
+- `sendVsBoundaryMs` and the feed arrival of the landed block.
+
+The record is stored as `decision.race` plus a note. `/healthz` counts it as `race_*`. `hoodctl
+race [days]` prints it with the summary. Live mode records the same `race` for every burst (the
+buying member, or the first landed member and its revert reason).
+
+The probe gate (`probeStartupChecks`) needs no `SNIPER_CONTRACT`, but every key must hold at least
+`MIN_GAS_BALANCE_ETH`. While the gate fails, probes are skipped (`probe_gate_failed`) and paper
+runs continue. It is retried every `GATE_RETRY_MS`.
 
 ## Tuning `burst` from `feed_blocks` and results
 

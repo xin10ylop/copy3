@@ -5,6 +5,8 @@
 #
 #   hoodctl up | down | restart [svc] | ps | logs [-f] [svc...] | build
 #   hoodctl status | pnl [days] | kill [reason] | resume | plays | play on|off <id> | events [n]
+#           race [days]             probe / live race measurements (where we landed vs the first T+1 block)
+#           keygen [n]              print n new private keys + addresses (written nowhere)
 #                                   (= pnpm --filter @hood/db ctl ..., run inside an app container)
 #   hoodctl health                  /healthz of indexer, tracker, agent, sniper (127.0.0.1:8081-8084)
 #   hoodctl backfill [--force]      (re)start the one-shot backfill job (profile "backfill")
@@ -49,14 +51,14 @@ case "$cmd" in
   build)    compose build "$@" ;;
   ps)       compose ps -a "$@" ;;
   logs)     compose logs --tail "${HOOD_LOG_TAIL:-200}" "$@" ;;
-  status|pnl|kill|resume|plays|play|events)
+  status|pnl|kill|resume|plays|play|events|race|keygen)
             ctl "$cmd" "$@" ;;
   health)
     rc=0
     for pair in indexer:8081 tracker:8082 agent:8083 sniper:8084; do
       name="${pair%%:*}" port="${pair##*:}"
       code="$(curl -sS -m 5 -o /tmp/hoodctl-health.$$ -w '%{http_code}' "http://127.0.0.1:$port/healthz" 2>/dev/null || true)"
-      summary="$(jq -c '{ok, mode, lagBlocks, head, lastBlock, feedBlocks: .feed.blocks?, lastScout, lastError}
+      summary="$(jq -c '{ok, mode, lagBlocks, head, lastBlock, feedBlocks: .feed.blocks?, raceSent: .counters.race_sent?, raceWon: .counters.race_first_in_block?, lastScout, lastError}
                         | with_entries(select(.value != null))' /tmp/hoodctl-health.$$ 2>/dev/null || true)"
       rm -f /tmp/hoodctl-health.$$
       if [[ "$code" == 200 ]]; then lvl=OK; else lvl=FAIL; rc=1; fi
@@ -79,6 +81,6 @@ case "$cmd" in
     # shellcheck disable=SC2012  # human-readable listing of our own report files
     ls -lt "${dir:-/opt/hood/reports}" | head -n "${1:-20}" ;;
   compose)  compose "$@" ;;
-  help|-h|--help) sed -n '2,17p' "$0" ;;
+  help|-h|--help) sed -n '2,19p' "$0" ;;
   *) echo "hoodctl: unknown command '$cmd' (hoodctl help)" >&2; exit 64 ;;
 esac

@@ -65,6 +65,11 @@ export class Chain {
     return (await this.vm.stateManager.getAccount(new Address(hexToBytes(address))))?.balance ?? 0n;
   }
 
+  /** Nonce the next `send` from `from` will use (for CREATE address prediction). */
+  nextNonce(from: Signer): bigint {
+    return this.nonces.get(from.address) ?? 0n;
+  }
+
   setBlock(number: bigint, timestamp: bigint): void {
     this.number = number;
     this.timestamp = timestamp;

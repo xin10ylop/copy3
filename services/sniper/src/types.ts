@@ -2,6 +2,7 @@
 import type { LaunchEvent, Play, Preset, Reserves } from '@hood/core';
 import type { Address, Hex } from 'viem';
 import type { LaunchSecondLedger } from './ledger.js';
+import type { RaceRecord } from './race.js';
 import type { ExitReason } from './position-logic.js';
 import type { SizeDecision } from './sizing.js';
 
@@ -150,4 +151,6 @@ export interface SnipeRun {
   ledger?: LaunchSecondLedger;
   /** how `quoteIn` was sized (Preset.sizing) */
   sizing?: SizeDecision;
+  /** where our tx landed vs the first T+1 block (probe tx, or the live buy / first landed member) — race.ts */
+  race?: RaceRecord;
 }

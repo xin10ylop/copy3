@@ -283,47 +283,64 @@ First close the open items in RESEARCH §7 (`buy`/`sell` argument order, contrac
    Delete the empty `EXECUTOR_PRIVATE_KEYS=` line from the template, so the generated line is
    the only one. Note the printed addresses: they are the operators in step 3 and the gas
    accounts in step 4.
-3. **Deploy.** The owner is the cold wallet. Every key in `EXECUTOR_PRIVATE_KEYS` becomes an
-   operator: the script deploys from the first key (the exit key; set `EXECUTOR_PRIVATE_KEY` to use
-   another deployer), and the constructor makes it the first operator. Every `exit` forwards its
-   sale proceeds straight to the owner (the treasury), so profits never sit on a hot key.
+3. **Deploy.** The owner is the cold wallet, and it may be a wallet that cannot send custom
+   calldata (Phantom): **the owner never has to send calldata** to set the contract up. The
+   constructor takes everything. The script deploys from the first key (the exit key; set
+   `EXECUTOR_PRIVATE_KEY` to use another deployer). It passes **every** key of
+   `EXECUTOR_PRIVATE_KEYS` as an operator (or the addresses in `OPERATORS`), and it passes the
+   treasury, which receives exit proceeds:
+   - `TREASURY=self` (the default): the contract itself. Exit proceeds stay in the contract and
+     compound. This is the small-bankroll setup in step 4. The script predicts the address from
+     the deployer's nonce and deploys with exactly that nonce.
+   - `TREASURY=owner`: every `exit` forwards its proceeds to the owner, so profits never sit in
+     the contract. The contract balance then shrinks with every buy.
+   - `TREASURY=0x…`: any other receiver.
+
    `MAX_QUOTE_IN_ETH` caps one snipe. `MAX_SPEND_PER_WINDOW_ETH` (default 4 × `MAX_QUOTE_IN_ETH`) per
    `SPEND_WINDOW_SEC` (default 3600) is a decaying budget: at most that much at once, refilling
    continuously at `MAX_SPEND_PER_WINDOW_ETH / SPEND_WINDOW_SEC` per second (`SpendLimitExceeded`). Both
    bound what a stolen operator key can lose by buying its own launches with the contract's ETH.
-   The owner can change them later with `setMaxQuoteIn` and `setSpendLimit` (a window of 0 is
-   refused; turning the budget off is the separate `disableSpendLimit()`).
+   Choose them at deploy time: changing them later (`setMaxQuoteIn`, `setSpendLimit`,
+   `disableSpendLimit`) needs calldata from the owner, which Phantom cannot send.
    ```bash
    deploy() { sudo -u hood -H bash -c "cd /opt/hood/hoodsniper && set -a && . ./.env.executor && set +a && $*"; }
-   deploy OWNER=<cold wallet> MAX_QUOTE_IN_ETH=0.1 DRY_RUN=1 pnpm --filter @hood/contracts run deploy   # predicted address
+   deploy OWNER=<cold wallet> MAX_QUOTE_IN_ETH=0.1 DRY_RUN=1 pnpm --filter @hood/contracts run deploy   # predicted address, operators, treasury
    deploy OWNER=<cold wallet> MAX_QUOTE_IN_ETH=0.1 pnpm --filter @hood/contracts run deploy             # prints SNIPER_CONTRACT=0x…
    ```
-   The script prints `setOperator(<key>, true)` calldata for every other key (and `setTreasury`
-   calldata if `TREASURY` is set). Send each one **from the cold owner**: a burst key that is not
-   an operator reverts every snipe. Use `pnpm … run deploy`. Plain `pnpm deploy` is a pnpm built-in.
-   The deploy script refuses any chain id other than 4663, and checks owner, operator and
-   `arbBlockNumbers` after deploying. The
-   compiled bytecode lives in `contracts/src/generated/`; run `pnpm --filter @hood/contracts build`
-   first if it is missing.
+   Use `pnpm … run deploy`. Plain `pnpm deploy` is a pnpm built-in. The deploy script refuses any
+   chain id other than 4663. After deploying it reads back the owner, `operators(key)` for
+   **every** key, `treasury()`, the factory, `arbBlockNumbers` and the caps, and fails if any differs.
+   The compiled bytecode lives in `contracts/src/generated/`; run
+   `pnpm --filter @hood/contracts build` first if it is missing.
 4. **Fund.** Bridge ETH to Robinhood Chain with the official bridge (an L1 deposit takes about
    10-15 minutes).
    - **Each executor key** (the exit key and every burst key) pays its own gas. Fund each one
      with about 0.01 ETH. 0.01 ETH covers about 2,500 burst transactions at 0.02 gwei. A key below the
      gas floor (`MIN_GAS_BALANCE_ETH`) raises `low_balance`. A burst is refused if its burst key or
      the exit key is that low, so positions can always be exited.
-   - The **PonsSniper contract** holds the buy capital. Keep its working balance at **a few ×
-     buyEth**, roughly buyEth × MAX_CONCURRENT × 2 (0.5 ETH at most for the default play). The
-     on-chain caps bound each snipe and each window. The balance bounds everything else a stolen
-     operator key could reach, so do not park the bankroll there. Send it from the cold wallet, or
-     with `FUND_ETH=0.5` during deploy.
-   - Because proceeds go to the owner, the contract balance shrinks with every buy. Top it up from
-     the cold wallet. Daily ops (§9) shows how.
-   - **Small bankroll, compounding.** Start at 0.01 ETH with ~0.1 ETH in the contract; the size
-     follows the balance. Set `sizing` on the play (`/preset <id> sizing.mode=bankroll`, or edit the
-     preset: `{"mode":"bankroll","fraction":0.25,"minEth":0.01,"maxEth":0.3}`): each buy is
+   - The **PonsSniper contract** holds the buy capital. **Fund it with a plain ETH transfer** from
+     the cold wallet to the contract address (Phantom: Send, amount > 0, recipient = the contract),
+     or with `FUND_ETH=0.5` during deploy. Keep its working balance at **a few × buyEth**, roughly
+     buyEth × MAX_CONCURRENT × 2 (0.5 ETH at most for the default play). The on-chain caps bound
+     each snipe and each window. The balance bounds everything else a stolen operator key could
+     reach, so do not park the bankroll there.
+   - **Withdraw = send 0 ETH from the owner wallet to the contract.** A plain transfer of 0 ETH
+     from the owner sweeps the contract's **whole ETH balance** to the owner (`Swept` event). It
+     reverts with `NothingToSweep` when the balance is 0, and with `NotOwner` from any other
+     wallet. Some wallets refuse to send 0 ETH. In that case use a calldata-capable wallet for
+     the owner and call `sweepEth(to, amount)` (amount 0 = all), which also allows a partial
+     amount or another receiver. Tokens are **not** swept by the 0-ETH transfer. Recovering ERC-20
+     positions (`sweepToken`, `rescue`) needs calldata from the owner. Normally the sniper sells
+     every position with `exit`, so there is nothing to recover.
+   - With `TREASURY=owner` the contract balance shrinks with every buy. Top it up from the cold
+     wallet. Daily ops (§9) shows how.
+   - **Small bankroll, compounding** (the default `TREASURY=self`). Start at 0.01 ETH with ~0.1 ETH
+     in the contract; the size follows the balance. Set `sizing` on the play
+     (`/preset <id> sizing.mode=bankroll`, or edit the preset:
+     `{"mode":"bankroll","fraction":0.25,"minEth":0.01,"maxEth":0.3}`): each buy is
      `contract balance × 0.25 / MAX_CONCURRENT`, clamped to 0.01–0.3 ETH, rounded down to 0.001 ETH.
-     Have the owner call `setTreasury(<PonsSniper address>)` so exit proceeds stay in the contract
-     and compound (otherwise they go to the owner and the bankroll only shrinks). Leave
+     Exit proceeds stay in the contract and compound; no owner call is needed. Take profits with the
+     0-ETH withdrawal above, then send back the working balance. Leave
      `DAILY_LOSS_LIMIT_ETH` unset: the daily loss limit is then `DAILY_LOSS_LIMIT_PCT` (15 %) of the
      balance at the start of the UTC day. 0.01 ETH is the floor: gas (~0.00004 ETH per burst plus the
      exit) is ~6 % of the expected +0.0008 ETH there; the tax and fees scale with size, so the edge
@@ -345,8 +362,56 @@ first `T+1` block's pre-trade reserves with the real 618 bps tax and 1 % fee. No
   3. No unexplained `aborted`/`failed` snipes and no error events.
   4. `/status` shows the feed fresh (last frame under 1 s ago) the whole time, and the clock offset
      stays under 1 ms (`infra/healthcheck.sh --role executor`).
-- Paper mode cannot prove that the burst lands in the first `T+1` block. Step 8 checks that with
-  real money at the smallest size.
+- Paper mode cannot prove that the burst lands in the first `T+1` block. Measure that with
+  probe mode (§7a) first. Step 8 then checks it with real money at the smallest size.
+
+## 7a. Measure the race before going live
+
+Paper mode cannot measure the race, and the strategy's profit depends on winning it: our buy must
+be the first buy in the first block of second `T+1`. `EXECUTION_MODE=probe` measures it with no
+money at risk. Everything runs as in paper mode (paper fills, paper PnL). For every run whose burst
+is planned, the sniper also sends **one** 0-value self-transfer (21 000 gas) from a gas-only key at
+the burst's first slot (`boundary − rtt − 120 ms`, the live timing, `SEND_ENDPOINTS` and nonce
+handling). It reads the receipt and records `decision.race` with `blockOffset` (landed block − first
+`T+1` block), `txIndex`, `buysAhead` / `buysAfter` (`CurveBuy`s of the curve in that block before
+and after us), `buysInBlock` (in the whole first `T+1` block), `sendVsBoundaryMs` and the feed
+arrival of the landed block. `/healthz` counts `race_sent`, `race_mined`, `race_not_mined`,
+`race_target_block`, `race_first_in_block`, `race_early` and `race_late`. The probe never calls a
+contract. No `SNIPER_CONTRACT` is needed, but the probe gate requires a key with at least
+`MIN_GAS_BALANCE_ETH`. The kill switch and the daily-loss limit stop probes like they stop paper
+runs.
+
+On the Ohio box (Path A):
+
+1. `hoodctl keygen 1`. It prints one private key, its address and an `EXECUTOR_PRIVATE_KEYS=…` line,
+   and writes them nowhere. This is a **gas-only** key. Never make it an operator.
+2. Fund that address with **0.002 ETH** on Robinhood Chain. One probe costs well under
+   0.00001 ETH, so this lasts weeks.
+3. In `/opt/hood/hoodsniper/.env.ohio`, set `EXECUTION_MODE=probe` and paste the
+   `EXECUTOR_PRIVATE_KEYS=0x…` line.
+4. `hoodctl compose up -d sniper`. Then run `hoodctl health`, which should show `"mode":"probe"`, and
+   `hoodctl logs -f sniper`, which should show `probe gate passed` and then `probe landed` per run.
+5. After a day of launches, run `hoodctl race 1`.
+
+How to read it (details in `infra/ohio/README.md`):
+
+- **`first in block (race won)`** = offset 0 and no buy ahead, over the probes sent. This is the
+  measured race win rate. `PAPER_FILL=first` assumes it is 100 %.
+- **`in target block`** with buys ahead means we land in the right block but behind other buyers.
+  `PAPER_FILL=last` is the realistic paper model then.
+- **`early`** (offset < 0) means the first slot lands in second `T`. A real buy there hits the 99 %
+  tax and reverts on `maxTaxBps`. The later members (15 ms apart) can still win, so this is
+  wasteful but not fatal.
+- **`late`** (offset > 0) means even the first slot is too late. Every live member would be late.
+  Tune `burst.startMs` (more negative) or check `RTT_MS`, then re-measure.
+- **`median buysAhead`** shows how many buyers usually beat us.
+
+Go live (§8) only with at least 20 probes and a win rate that keeps the plays' paper expectancy
+positive between the `first` and `last` fill models. Back to plain paper: `EXECUTION_MODE=paper`,
+then `hoodctl compose up -d sniper`. Once live, every burst records the same measurement
+(`source live`: the buying member, or the first landed member with its revert reason, such as
+`AlreadyBought` or `TaxTooHigh`). Read it with `pnpm --filter @hood/db ctl race 1` (or
+`hoodctl race 1`) to keep watching the win rate.
 
 ## 8. Go live with a small buyEth
 

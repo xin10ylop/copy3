@@ -8,10 +8,13 @@
  *   pnpm --filter @hood/db ctl plays             list plays
  *   pnpm --filter @hood/db ctl play on|off <id>  enable / disable a play
  *   pnpm --filter @hood/db ctl events [n]        last n events (default 30)
+ *   pnpm --filter @hood/db ctl race [days]       race measurements (probe txs, live buys): where we landed vs the first T+1 block
+ *   pnpm --filter @hood/db ctl keygen [n]        print n new executor keys + addresses (written nowhere; no DATABASE_URL needed)
  *
- * Reads DATABASE_URL. Every write goes through the same settings/plays rows the services LISTEN on.
+ * Reads DATABASE_URL (except keygen). Every write goes through the same settings/plays rows the services LISTEN on.
  */
 import { fileURLToPath } from 'node:url';
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { getSetting, setSetting, insertEvent } from './helpers.js';
 import type { Sql } from './sql.js';
 
@@ -75,6 +78,100 @@ async function pnl(sql: Sql, days: number): Promise<void> {
   for (const r of perPlay) console.log(`${String(r.play_id).padStart(3)} ${r.name.slice(0, 24).padEnd(24)}  ${r.mode.padEnd(5)}  ${String(r.n).padStart(3)}  ${Number(r.pnl ?? 0).toFixed(4)}`);
 }
 
+/** The `decision.race` fields `hoodctl race` reads (services/sniper/src/race.ts RaceRecord). */
+export interface RaceRow {
+  decidedAt: Date;
+  launchTx: string | null;
+  race: {
+    source?: string;
+    status?: string;
+    reason?: string;
+    blockOffset?: number | null;
+    txIndex?: number | null;
+    buysAhead?: number | null;
+    buysInBlock?: number | null;
+    sendVsBoundaryMs?: number;
+    revertReason?: string | null;
+  };
+}
+
+const short = (h: string | null): string => (h && h.length > 14 ? `${h.slice(0, 6)}…${h.slice(-4)}` : (h ?? '-'));
+const cell = (v: number | null | undefined, signed = false): string => (v === null || v === undefined ? '-' : signed && v >= 0 ? `+${v}` : String(v));
+const pct = (a: number, b: number): string => (b === 0 ? '   - ' : `${((100 * a) / b).toFixed(1).padStart(5)} %`);
+function median(xs: number[]): number | null {
+  if (xs.length === 0) return null;
+  const s = [...xs].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m]! : (s[m - 1]! + s[m]!) / 2;
+}
+/** a tx left and landed (or should have): the denominator of the race rates */
+const SENT = new Set(['mined', 'reverted', 'not_mined']);
+const LANDED = new Set(['mined', 'reverted']);
+
+/** `hoodctl race` output: one row per measurement, then the summary per source (exported for tests). */
+export function formatRace(rows: RaceRow[]): string[] {
+  const out: string[] = [];
+  out.push('decided_at (UTC)     source launch tx      status      offset txIdx ahead inBlock  sent-vs-boundary');
+  for (const r of rows) {
+    const x = r.race;
+    const status = x.status ?? '?';
+    const sent = x.sendVsBoundaryMs === undefined ? '' : `${x.sendVsBoundaryMs >= 0 ? '+' : ''}${x.sendVsBoundaryMs} ms`;
+    const why = status === 'reverted' && x.revertReason ? `  ${x.revertReason}` : !SENT.has(status) && x.reason ? `  ${x.reason}` : '';
+    out.push(
+      `${r.decidedAt.toISOString().slice(0, 19).replace('T', ' ')}  ${(x.source ?? '?').padEnd(6)} ${short(r.launchTx).padEnd(13)} ${status.padEnd(11)} ${cell(x.blockOffset, true).padStart(6)} ${cell(x.txIndex).padStart(5)} ${cell(x.buysAhead).padStart(5)} ${cell(x.buysInBlock).padStart(7)}  ${sent.padStart(16)}${why}`,
+    );
+  }
+  const sources = [...new Set(rows.map((r) => r.race.source ?? '?'))].sort();
+  const groups: [string, RaceRow[]][] = sources.map((s) => [s, rows.filter((r) => (r.race.source ?? '?') === s)]);
+  if (groups.length > 1) groups.push(['all', rows]);
+  for (const [name, g] of groups) {
+    const sent = g.filter((r) => SENT.has(r.race.status ?? ''));
+    const landed = sent.filter((r) => LANDED.has(r.race.status ?? ''));
+    const off = (r: RaceRow): number | null | undefined => r.race.blockOffset;
+    const target = landed.filter((r) => off(r) === 0);
+    const first = target.filter((r) => r.race.buysAhead === 0);
+    const early = landed.filter((r) => typeof off(r) === 'number' && off(r)! < 0);
+    const late = landed.filter((r) => typeof off(r) === 'number' && off(r)! > 0);
+    const ahead = landed.map((r) => r.race.buysAhead).filter((v): v is number => typeof v === 'number');
+    const med = median(ahead);
+    out.push('');
+    out.push(`${name}: ${g.length} run(s), ${sent.length} sent, ${landed.length} landed, ${sent.length - landed.length} not mined, ${g.length - sent.length} not sent (gate / kill switch / aborted / send failed)`);
+    out.push(`  in target block (offset 0)   : ${pct(target.length, sent.length)}  (${target.length}/${sent.length})`);
+    out.push(`  first in block (race won)    : ${pct(first.length, sent.length)}  (${first.length}/${sent.length})  <- the measured race win rate`);
+    out.push(`  early (second T, 99 % tax)   : ${pct(early.length, sent.length)}  (${early.length}/${sent.length})`);
+    out.push(`  late (after the target block): ${pct(late.length, sent.length)}  (${late.length}/${sent.length})`);
+    out.push(`  median buysAhead             : ${med === null ? '-' : med}${ahead.length ? `  (over ${ahead.length} landed)` : ''}`);
+  }
+  if (rows.length === 0) out.push('', 'no race measurements yet (EXECUTION_MODE=probe or live records one per planned burst)');
+  return out;
+}
+
+/** `hoodctl race [days]`: every snipe row with a `decision.race` record in the last `days` days. */
+export async function race(sql: Sql, days: number, out: (line: string) => void = console.log): Promise<void> {
+  const rows = await sql.query<{ decided_at: Date; launch_tx: string | null; race: unknown }>(
+    `select decided_at, decision->'launch'->>'txHash' as launch_tx, decision->'race' as race
+       from snipes where decision->'race' is not null and decided_at >= now() - ($1 || ' days')::interval
+      order by decided_at, id`,
+    [String(days)],
+  );
+  const parsed: RaceRow[] = rows.map((r) => ({
+    decidedAt: new Date(r.decided_at),
+    launchTx: r.launch_tx,
+    race: (typeof r.race === 'string' ? JSON.parse(r.race) : (r.race ?? {})) as RaceRow['race'],
+  }));
+  for (const l of formatRace(parsed)) out(l);
+}
+
+/** `hoodctl keygen [n]`: n fresh keys printed once, written nowhere (exported for tests). */
+export function keygen(n: number, out: (line: string) => void = console.log): void {
+  const count = Math.max(1, Math.min(20, Math.floor(n)));
+  const keys = Array.from({ length: count }, () => generatePrivateKey());
+  out(`# ${count} new executor key(s). Shown ONCE and written nowhere: copy what you need now.`);
+  keys.forEach((k, i) => out(`# key ${i + 1}: address ${privateKeyToAccount(k).address}`));
+  out(`EXECUTOR_PRIVATE_KEYS=${keys.join(',')}`);
+  out(`# put the EXECUTOR_PRIVATE_KEYS line into the env file (Ohio: sudo nano /opt/hood/hoodsniper/.env.ohio, it stays 0600), fund the address(es) with gas, never paste the keys anywhere else.`);
+}
+
 async function main(sql: Sql, cmd: string, rest: string[]): Promise<void> {
   const q = <T extends Row = Row>(text: string, params: unknown[] = []): Promise<T[]> => sql.query<T>(text, params);
   switch (cmd) {
@@ -94,6 +191,8 @@ async function main(sql: Sql, cmd: string, rest: string[]): Promise<void> {
     }
     case 'pnl':
       return pnl(sql, n(rest[0], 7));
+    case 'race':
+      return race(sql, n(rest[0], 1));
     case 'plays': {
       const rows = await q<{ id: number; name: string; enabled: boolean; operator: string | null; stats: unknown }>(
         `select p.id, p.name, p.enabled, o.name as operator, p.stats from plays p left join operators o on o.id = p.operator_id order by p.id`,
@@ -122,6 +221,8 @@ async function main(sql: Sql, cmd: string, rest: string[]): Promise<void> {
 
 /** CLI entry (only when run as a script: importing this module has no side effects). */
 async function cli(): Promise<void> {
+  const [cmd = 'status', ...rest] = process.argv.slice(2);
+  if (cmd === 'keygen') return keygen(n(rest[0], 1));
   const url = process.env['DATABASE_URL'];
   if (!url) {
     console.error('DATABASE_URL is required');
@@ -129,7 +230,6 @@ async function cli(): Promise<void> {
   }
   const { createDb } = await import('./index.js');
   const sql = createDb(url);
-  const [cmd = 'status', ...rest] = process.argv.slice(2);
   try {
     await main(sql, cmd, rest);
   } catch (err) {

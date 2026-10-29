@@ -1,4 +1,4 @@
-/** Sniper entry point: env → store, chain, clock, backend (live|paper) → feed loop + /healthz. */
+/** Sniper entry point: env → store, chain, clock, backend (live|paper|probe) → feed loop + /healthz. */
 import { readFileSync } from 'node:fs';
 import { CHAIN_ID, FeedClient, SequencerClock, parsePlay, type Play } from '@hood/core';
 import { parseEther, type Address } from 'viem';
@@ -11,7 +11,9 @@ import { installCrashGuards } from './guards.js';
 import { startHealthServer } from './health.js';
 import { createLogger } from './log.js';
 import { PaperExecutor } from './paper.js';
-import { LiveGate, liveStartupChecks } from './preflight.js';
+import { LiveGate, liveStartupChecks, probeStartupChecks } from './preflight.js';
+import { ProbeExecutor } from './probe.js';
+import { RaceTracker } from './race.js';
 import { JsonRpcHttp } from './rpc.js';
 import { PreciseScheduler } from './scheduler.js';
 import { Sniper } from './sniper.js';
@@ -45,7 +47,9 @@ async function main(): Promise<void> {
   const rttMs = (): number => (cfg.RTT_MS > 0 ? cfg.RTT_MS : (senders[0]?.rttMs ?? 30));
   const sniperContract = cfg.SNIPER_CONTRACT ? (cfg.SNIPER_CONTRACT.toLowerCase() as Address) : undefined;
 
+  const race = new RaceTracker({ chain, logger });
   let live: LiveExecutor | null = null;
+  let probe: ProbeExecutor | null = null;
   let backend: ExecutionBackend;
   if (cfg.EXECUTION_MODE === 'live') {
     const accounts = executorKeys(cfg).map((k) => privateKeyToAccount(k));
@@ -74,17 +78,41 @@ async function main(): Promise<void> {
     await live.init();
     backend = live;
   } else {
-    backend = new PaperExecutor({
+    const paper = new PaperExecutor({
       chain,
       logger,
       book: (c) => sniper?.positions.book(c) ?? null,
       creatorTaxBps: (c) => sniper?.creatorTaxBps(c) ?? 0,
       fill: cfg.PAPER_FILL,
     });
+    backend = paper;
+    if (cfg.EXECUTION_MODE === 'probe') {
+      // paper fills + one 0-value self-transfer per planned burst (never a contract call)
+      probe = new ProbeExecutor({
+        paper,
+        accounts: executorKeys(cfg).map((k) => privateKeyToAccount(k)),
+        chainId: CHAIN_ID,
+        senders,
+        chain,
+        scheduler,
+        logger,
+        race,
+        receiptPollMs: cfg.BURST_RECEIPT_POLL_MS,
+        receiptTimeoutMs: cfg.PROBE_RECEIPT_TIMEOUT_MS,
+        minGasBalanceWei: parseEther(String(cfg.MIN_GAS_BALANCE_ETH)),
+        onProbe: (run) => sniper?.recorder.update(run, sniper.positions.get(run.key), 'probe_final'),
+        onAlert: (type, payload) => sniper?.alert(type, payload, 'error'),
+      });
+      probe.setGate('probe startup checks have not passed yet');
+      await probe.init();
+      backend = probe;
+    }
   }
 
   sniper = new Sniper({
-    mode: cfg.EXECUTION_MODE,
+    // probe mode is paper mode for the orchestrator (paper rows, paper risk, paper bankroll)
+    mode: cfg.EXECUTION_MODE === 'live' ? 'live' : 'paper',
+    race,
     store,
     chain,
     backend,
@@ -166,6 +194,23 @@ async function main(): Promise<void> {
     void gate.run(); // never rejects; the feed starts right away (positions need it)
   }
 
+  if (probe) {
+    // probe gate: every probe key funded (no contract involved); failing → probes skipped, paper goes on
+    const p = probe;
+    gate = new LiveGate({
+      logger,
+      label: 'probe gate',
+      failing: 'probes skipped',
+      retryMs: cfg.GATE_RETRY_MS,
+      check: () => probeStartupChecks({ chain, keys: p.keys.map((k) => k.address), minBalanceWei: parseEther(String(cfg.MIN_GAS_BALANCE_ETH)) }),
+      onResult: (r) => {
+        p.setGate(r.ok ? null : r.errors.join('; '));
+        if (!r.ok) s.alert('probe_gate_failed', { errors: r.errors }, 'error');
+      },
+    });
+    void gate.run();
+  }
+
   const feed = new FeedClient({ urls: [cfg.FEED_URL, ...cfg.FEED_URL_SECONDARY] });
   feed.on('block', (b) => s.onFeedBlock(b));
   feed.on('gap', (g) => logger.warn(g, 'feed gap'));
@@ -179,13 +224,17 @@ async function main(): Promise<void> {
     for (const x of senders) x.ping().catch(() => undefined);
   }, 5000);
   for (const x of senders) x.ping().catch(() => undefined);
-  const balances = live
+  const balanced = live ?? probe;
+  const balances = balanced
     ? setInterval(() => {
-        live!.refreshBalances().catch((e: unknown) => logger.warn({ err: e }, 'balance refresh failed'));
+        balanced.refreshBalances().catch((e: unknown) => logger.warn({ err: e }, 'balance refresh failed'));
       }, cfg.BALANCE_POLL_MS)
     : null;
   const health = startHealthServer(cfg.HEALTH_PORT, () => s.health(feed.stats.snapshot()));
-  logger.info({ mode: cfg.EXECUTION_MODE, port: cfg.HEALTH_PORT, exitKey: live?.exitKey.address, burstKeys: live?.burstKeys.map((k) => k.address) }, 'sniper running');
+  logger.info(
+    { mode: cfg.EXECUTION_MODE, port: cfg.HEALTH_PORT, exitKey: live?.exitKey.address, burstKeys: live?.burstKeys.map((k) => k.address), probeKeys: probe?.keys.map((k) => k.address) },
+    'sniper running',
+  );
 
   const shutdown = async (sig: string): Promise<void> => {
     logger.info({ sig }, 'shutting down');

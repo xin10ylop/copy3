@@ -209,7 +209,7 @@ $(printf '\033[1m')[ohio] STOP: fill in ${missing[*]} in $ENV_FILE, then re-run 
      ANTHROPIC_API_KEY=sk-ant-...
   sudo bash $HOOD_DIR/infra/ohio/bootstrap.sh
 
-Everything else in the file has working defaults (EXECUTION_MODE is always paper in this stack).
+Everything else in the file has working defaults (EXECUTION_MODE=paper; probe is opt-in, see README).
 MSG
   exit 2
 fi

@@ -4,6 +4,7 @@ import {
   decodeFunctionResult,
   encodeDeployData,
   encodeFunctionData,
+  getContractAddress,
   parseEther,
   type Abi,
   type Hex,
@@ -35,6 +36,7 @@ const MAX_SPEND = parseEther('2');
 /** wall-clock deadline far beyond every block timestamp a test sets (NEW-3 tests use their own) */
 const FAR_TS = LAUNCH_TS + 1_000_000n;
 const gas: Record<string, bigint> = {};
+const ZERO = '0x0000000000000000000000000000000000000000' as Hex;
 
 beforeAll(() => {
   const out = compileFiles(['test/mocks/MockPonsCurve.sol', 'test/mocks/Drainer.sol', 'test/mocks/Receivers.sol', 'src/PonsSniper.sol']) as Record<
@@ -110,7 +112,7 @@ describe('PonsSniper (in-process EVM, Cancun)', () => {
     factory = f.createdAddress!;
     expect((await chain.send(owner, { to: factory, data: encodeFunctionData({ abi: factoryArt.abi, functionName: 'register', args: [token, curve] }) })).ok).toBe(true);
     const s = await chain.send(owner, {
-      data: encodeDeployData({ abi: sniperAbi, bytecode: sniperBytecode, args: [owner.address, operator.address, factory, MAX_QUOTE_IN, MAX_SPEND, 3600] }),
+      data: encodeDeployData({ abi: sniperAbi, bytecode: sniperBytecode, args: [owner.address, [operator.address], ZERO, factory, MAX_QUOTE_IN, MAX_SPEND, 3600] }),
     });
     expect(s.ok).toBe(true);
     sniper = s.createdAddress!;
@@ -366,7 +368,7 @@ describe('PonsSniper (in-process EVM, Cancun)', () => {
     expect((await chain.send(owner, { to: sniper, data: d('setSpendLimit', [B, 3600]) })).ok).toBe(true);
     expect(await available()).toBe(B);
     // the constructor refuses window 0 too
-    const bad = await chain.send(owner, { data: encodeDeployData({ abi: sniperAbi, bytecode: sniperBytecode, args: [owner.address, operator.address, factory, MAX_QUOTE_IN, MAX_SPEND, 0] }) });
+    const bad = await chain.send(owner, { data: encodeDeployData({ abi: sniperAbi, bytecode: sniperBytecode, args: [owner.address, [operator.address], ZERO, factory, MAX_QUOTE_IN, MAX_SPEND, 0] }) });
     expect(revertName(bad)).toBe('InvalidSpendWindow()');
   });
 
@@ -452,8 +454,10 @@ describe('PonsSniper (in-process EVM, Cancun)', () => {
 
     const cold = chain.signer(99).address;
     const bal = await chain.balance(sniper);
-    expect((await chain.send(owner, { to: sniper, data: d('sweepEth', [cold, 0n]) })).ok).toBe(true);
+    const sw = await chain.send(owner, { to: sniper, data: d('sweepEth', [cold, 0n]) });
+    expect(sw.ok).toBe(true);
     expect(await chain.balance(cold)).toBe(bal);
+    expect(events(sw).find((e) => e.eventName === 'Swept')!.args).toMatchObject({ amount: bal });
     const held = (await read(token, ALL_ABI, 'balanceOf', [sniper])) as bigint;
     expect((await chain.send(owner, { to: sniper, data: d('sweepToken', [token, cold, 0n]) })).ok).toBe(true);
     expect(await read(token, ALL_ABI, 'balanceOf', [cold])).toBe(held);
@@ -462,6 +466,118 @@ describe('PonsSniper (in-process EVM, Cancun)', () => {
     const r = await chain.send(owner, { to: sniper, data: d('rescue', [token, 0n, approveZero]) });
     expect(r.ok).toBe(true);
     expect(await read(token, ALL_ABI, 'allowance', [sniper, curve])).toBe(0n);
+  });
+
+  describe('C-1 owner from Phantom (no custom calldata)', () => {
+    const deploy = (operators: Hex[], treasury: Hex): Hex =>
+      encodeDeployData({ abi: sniperAbi, bytecode: sniperBytecode, args: [owner.address, operators, treasury, factory, MAX_QUOTE_IN, MAX_SPEND, 3600] });
+
+    it('C-1: the constructor sets every operator and the treasury (predicted self = compound) and emits OperatorSet/TreasurySet', async () => {
+      const burst1 = chain.signer(11);
+      const burst2 = chain.signer(12);
+      for (const s of [burst1, burst2]) await chain.fund(s.address, parseEther('1'));
+      const self = getContractAddress({ from: owner.address, nonce: chain.nextNonce(owner) });
+      const r = await chain.send(owner, { data: deploy([operator.address, burst1.address, burst2.address], self) });
+      expect(r.ok).toBe(true);
+      const sn = r.createdAddress!;
+      expect(sn.toLowerCase()).toBe(self.toLowerCase());
+      for (const s of [operator, burst1, burst2]) expect(await read(sn, sniperAbi as Abi, 'operators', [s.address])).toBe(true);
+      expect(await read(sn, sniperAbi as Abi, 'operators', [stranger.address])).toBe(false);
+      expect(String(await read(sn, sniperAbi as Abi, 'treasury')).toLowerCase()).toBe(self.toLowerCase());
+      const ev = events(r);
+      expect(ev.filter((e) => e.eventName === 'OperatorSet').map((e) => String(e.args.operator).toLowerCase())).toEqual(
+        [operator, burst1, burst2].map((s) => s.address.toLowerCase()),
+      );
+      expect(String(ev.find((e) => e.eventName === 'TreasurySet')!.args.treasury).toLowerCase()).toBe(self.toLowerCase());
+      // any listed key snipes; exit proceeds compound in place (no transfer out, no owner call needed)
+      expect((await chain.send(owner, { to: sn, value: parseEther('1') })).ok).toBe(true);
+      chain.setBlock(101n, LAUNCH_TS + 1n);
+      expect((await chain.send(burst2, { to: sn, data: snipeData() })).ok).toBe(true);
+      const before = await chain.balance(sn);
+      chain.setBlock(130n, LAUNCH_TS + 4n);
+      const x = await chain.send(burst1, { to: sn, data: encodeFunctionData({ abi: sniperAbi, functionName: 'exitAll', args: [curve, token, 0n] }) });
+      expect(x.ok).toBe(true);
+      const quoteOut = events(x).find((e) => e.eventName === 'Exited')!.args.quoteOut as bigint;
+      expect(events(x).some((e) => e.eventName === 'ProceedsSent' || e.eventName === 'ProceedsHeld')).toBe(false);
+      expect(await chain.balance(sn)).toBe(before + quoteOut);
+    });
+
+    it('C-1: treasury 0 = the owner (emitted as TreasurySet(0)); no operators or a zero operator is refused', async () => {
+      const r = await chain.send(owner, { data: deploy([operator.address], ZERO) });
+      expect(r.ok).toBe(true);
+      expect(String(await read(r.createdAddress!, sniperAbi as Abi, 'treasury'))).toMatch(/^0x0{40}$/);
+      expect(events(r).find((e) => e.eventName === 'TreasurySet')!.args.treasury).toMatch(/^0x0{40}$/);
+      expect(revertName(await chain.send(owner, { data: deploy([], ZERO) }))).toBe('NoOperators()');
+      expect(revertName(await chain.send(owner, { data: deploy([operator.address, ZERO], ZERO) }))).toBe('ZeroAddress()');
+    });
+
+    it('C-1: a 0-ETH transfer from the owner sweeps the whole ETH balance to the owner and emits Swept; tokens stay', async () => {
+      chain.setBlock(101n, LAUNCH_TS + 1n);
+      expect((await chain.send(operator, { to: sniper, data: snipeData() })).ok).toBe(true);
+      const tokens = (await read(token, ALL_ABI, 'balanceOf', [sniper])) as bigint;
+      const bal = await chain.balance(sniper);
+      expect(bal).toBeGreaterThan(0n);
+      const ownerBefore = await chain.balance(owner.address);
+      const r = await chain.send(owner, { to: sniper, value: 0n });
+      expect(r.ok).toBe(true);
+      gas.ownerSweep = r.gasUsed;
+      expect(r.gasUsed).toBeLessThan(40_000n);
+      expect(events(r).map((e) => e.eventName)).toEqual(['Swept']);
+      expect(events(r)[0]!.args).toMatchObject({ amount: bal });
+      expect(String(events(r)[0]!.args.to).toLowerCase()).toBe(owner.address.toLowerCase());
+      expect(await chain.balance(sniper)).toBe(0n);
+      expect(await chain.balance(owner.address)).toBe(ownerBefore + bal - r.gasUsed); // effective gas price 1 wei
+      // ERC-20 positions are not swept by the 0-ETH transfer (sweepToken remains for those)
+      expect(await read(token, ALL_ABI, 'balanceOf', [sniper])).toBe(tokens);
+    });
+
+    it('C-1: a 0-ETH owner transfer with an empty balance reverts NothingToSweep', async () => {
+      expect((await chain.send(owner, { to: sniper, value: 0n })).ok).toBe(true);
+      expect(await chain.balance(sniper)).toBe(0n);
+      const r = await chain.send(owner, { to: sniper, value: 0n });
+      expect(revertName(r)).toBe('NothingToSweep()');
+      expect(r.logs).toEqual([]);
+    });
+
+    it('C-1: a 0-ETH transfer from a non-owner (stranger, operator, pending or former owner) reverts NotOwner and changes nothing', async () => {
+      const bal = await chain.balance(sniper);
+      for (const s of [stranger, operator]) {
+        const r = await chain.send(s, { to: sniper, value: 0n });
+        expect(revertName(r)).toBe('NotOwner()');
+        expect(r.logs).toEqual([]);
+        expect(r.gasUsed).toBeLessThan(25_000n);
+      }
+      expect(await chain.balance(sniper)).toBe(bal);
+      // ownership moves with the two-step transfer: only the CURRENT owner's 0-ETH transfer sweeps
+      const next = chain.signer(8);
+      await chain.fund(next.address, parseEther('1'));
+      const d = (functionName: string, args: unknown[] = []): Hex => encodeFunctionData({ abi: sniperAbi as Abi, functionName, args });
+      expect((await chain.send(owner, { to: sniper, data: d('transferOwnership', [next.address]) })).ok).toBe(true);
+      expect(revertName(await chain.send(next, { to: sniper, value: 0n }))).toBe('NotOwner()'); // pending, not yet owner
+      expect((await chain.send(next, { to: sniper, data: d('acceptOwnership') })).ok).toBe(true);
+      expect(revertName(await chain.send(owner, { to: sniper, value: 0n }))).toBe('NotOwner()'); // former owner
+      expect(await chain.balance(sniper)).toBe(bal);
+      const r = await chain.send(next, { to: sniper, value: 0n });
+      expect(r.ok).toBe(true);
+      expect(events(r).find((e) => e.eventName === 'Swept')!.args).toMatchObject({ amount: bal });
+    });
+
+    it('C-1: non-zero plain transfers from anyone still fund the contract (no sweep)', async () => {
+      let bal = await chain.balance(sniper);
+      for (const s of [owner, operator, stranger]) {
+        const r = await chain.send(s, { to: sniper, value: parseEther('0.25') });
+        expect(r.ok).toBe(true);
+        expect(r.logs).toEqual([]);
+        bal += parseEther('0.25');
+        expect(await chain.balance(sniper)).toBe(bal);
+      }
+      // the explicit calldata sweep remains (partial amount, other receiver)
+      const cold = chain.signer(97).address;
+      const r = await chain.send(owner, { to: sniper, data: encodeFunctionData({ abi: sniperAbi, functionName: 'sweepEth', args: [cold, parseEther('0.1')] }) });
+      expect(r.ok).toBe(true);
+      expect(await chain.balance(cold)).toBe(parseEther('0.1'));
+      expect(await chain.balance(sniper)).toBe(bal - parseEther('0.1'));
+    });
   });
 
   it('report gas', () => {
@@ -484,7 +600,7 @@ describe('PonsSniper deadline on Robinhood Chain (chainId 4663 → ArbSys L2 blo
     const token = `0x${tokenWord.slice(26)}` as Hex;
     const f = await chain.send(owner, { data: factoryArt.bytecode });
     await chain.send(owner, { to: f.createdAddress!, data: encodeFunctionData({ abi: factoryArt.abi, functionName: 'register', args: [token, curve] }) });
-    const s = await chain.send(owner, { data: encodeDeployData({ abi: sniperAbi, bytecode: sniperBytecode, args: [owner.address, owner.address, f.createdAddress!, MAX_QUOTE_IN, MAX_SPEND, 3600] }) });
+    const s = await chain.send(owner, { data: encodeDeployData({ abi: sniperAbi, bytecode: sniperBytecode, args: [owner.address, [owner.address], ZERO, f.createdAddress!, MAX_QUOTE_IN, MAX_SPEND, 3600] }) });
     const sniper = s.createdAddress!;
     expect(decodeFunctionResult({ abi: sniperAbi, functionName: 'arbBlockNumbers', data: await chain.call(sniper, encodeFunctionData({ abi: sniperAbi, functionName: 'arbBlockNumbers' })) })).toBe(true);
     await chain.send(owner, { to: sniper, value: parseEther('1') });

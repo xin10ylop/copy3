@@ -1,7 +1,7 @@
 import { TOPICS, type RawLog, type Reserves, type RpcTxLike } from '@hood/core';
 import type { Address, Hex } from 'viem';
 import type { StateOverride } from 'viem';
-import type { ChainClient, ReceiptLite, RecentLaunch, SnipedLog, SniperConfigState, SniperHolding } from '../../src/chain.js';
+import type { ChainClient, CurveBuyRef, ReceiptLite, RecentLaunch, SnipedLog, SniperConfigState, SniperHolding } from '../../src/chain.js';
 import type { RawSender, SendResult } from '../../src/rpc.js';
 
 export class FakeChain implements ChainClient {
@@ -35,9 +35,14 @@ export class FakeChain implements ChainClient {
   recents: RecentLaunch[] = [];
   sniperConfig: SniperConfigState | null = null;
 
+  /** true: a block `atBlock` does not know is an error (like a node that has not seen it), not `latest` */
+  strictBlocks = false;
+
   async getReserves(curve: Address, blockNumber?: number): Promise<Reserves> {
     this.calls.push(`getReserves:${curve}:${blockNumber ?? 'latest'}`);
-    const r = (blockNumber !== undefined ? this.atBlock(curve, blockNumber) : undefined) ?? this.latest.get(curve.toLowerCase());
+    const at = blockNumber !== undefined ? this.atBlock(curve, blockNumber) : undefined;
+    if (blockNumber !== undefined && !at && this.strictBlocks) throw new Error(`block ${blockNumber} not available`);
+    const r = at ?? this.latest.get(curve.toLowerCase());
     if (!r) throw new Error('no contract code');
     return r;
   }
@@ -109,6 +114,17 @@ export class FakeChain implements ChainClient {
   }
   async getGasPrice(): Promise<bigint> {
     return 20_600_000n;
+  }
+  /** CurveBuy logs by curve (race measurement) */
+  curveBuys = new Map<string, CurveBuyRef[]>();
+  async curveBuyLogs(curve: Address, fromBlock: number, toBlock: number): Promise<CurveBuyRef[]> {
+    this.calls.push(`curveBuyLogs:${curve}:${fromBlock}:${toBlock}`);
+    return (this.curveBuys.get(curve.toLowerCase()) ?? []).filter((l) => l.block >= fromBlock && l.block <= toBlock);
+  }
+  /** tx hash → decoded revert reason */
+  revertReasons = new Map<string, string>();
+  async revertReason(hash: Hex): Promise<string | null> {
+    return this.revertReasons.get(hash.toLowerCase()) ?? null;
   }
   async getBalance(address: Address): Promise<bigint> {
     return this.ethBalances.get(address.toLowerCase()) ?? 10n ** 18n;

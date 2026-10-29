@@ -129,7 +129,8 @@ function harness(o: { mode?: 'live' | 'paper'; plays?: Parameters<typeof play>[0
   const store = new MemoryStore({ plays: (o.plays ?? [TEAM_BUY_PLAY]).map((p) => play(p)) });
   const chain = new FakeChain();
   chain.latest.set(LAUNCH.curve, INITIAL);
-  chain.atBlock = () => INITIAL;
+  chain.atBlock = (_c, b) => (b > LAUNCH.block + 8 ? undefined : INITIAL); // post-fill blocks: unknown → exits price on the book
+  chain.strictBlocks = true;
   chain.receipts.set(LAUNCH.txHash, launchReceipt());
   const sched = new ManualScheduler((T - 31) * 1000);
   // eslint-disable-next-line prefer-const
@@ -137,7 +138,7 @@ function harness(o: { mode?: 'live' | 'paper'; plays?: Parameters<typeof play>[0
   const backend =
     mode === 'live'
       ? new ScriptedBackend()
-      : new PaperExecutor({ chain, logger: silentLogger, book: (c) => sniper.positions.book(c), creatorTaxBps: (c) => sniper.creatorTaxBps(c) });
+      : new PaperExecutor({ chain, logger: silentLogger, book: (c) => sniper.positions.book(c), creatorTaxBps: (c) => sniper.creatorTaxBps(c), exitRetryMs: 1 });
   sniper = new Sniper({
     mode,
     store,

@@ -22,6 +22,7 @@
   "dependencies": {
     "@hood/core": "workspace:*",
     "postgres": "^3.4.7",
+    "viem": "^2.45.0",
     "zod": "^4.1.12"
   },
   "devDependencies": {

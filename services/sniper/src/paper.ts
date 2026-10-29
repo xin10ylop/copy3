@@ -31,6 +31,8 @@ export interface PaperOptions {
   feeBps?: number;
   /** L4: fill model, default 'first' */
   fill?: 'first' | 'last';
+  /** exit pricing: wait this long between attempts to read the trigger block's reserves (default 250 ms, 6 attempts) */
+  exitRetryMs?: number;
 }
 
 export class PaperExecutor implements ExecutionBackend {
@@ -146,10 +148,26 @@ export class PaperExecutor implements ExecutionBackend {
     };
   }
 
+  /**
+   * Exit price = the post-state of the block that triggered the exit (`order.atBlock`, the latest
+   * feed block), never the position book: the book lags the feed by a poll, so on an operator dump
+   * it still holds the PRE-dump reserves and books a sale that was impossible — three Ohio paper
+   * exits (29 Oct 2026) booked +0.0013 ETH at the pre-dump price where the post-dump price was
+   * −0.0017 ETH. A live sell lands a block or more after the trigger, so this is still optimistic
+   * by the panic sells of that next block, like the backtest (which applies the exempt sells
+   * before liquidating). The RPC may lag the feed by a few hundred ms: retry briefly.
+   */
   async exit(order: ExitOrder): Promise<ExitResult> {
     this.stats.exits++;
     if (order.tokensIn <= 0n) return { ok: false, tokensIn: 0n, quoteOut: 0n, error: 'zero-size exit refused (L1)' };
-    let r = this.o.book?.(order.curve) ?? null;
+    let r: Reserves | null = null;
+    if (order.atBlock !== undefined) {
+      for (let i = 0; i < 6 && !r; i++) {
+        r = await this.o.chain.getReserves(order.curve, order.atBlock).catch(() => null);
+        if (!r) await new Promise((res) => setTimeout(res, this.o.exitRetryMs ?? 250));
+      }
+    }
+    if (!r) r = this.o.book?.(order.curve) ?? null;
     if (!r) r = await this.o.chain.getReserves(order.curve).catch(() => null);
     if (!r) return { ok: false, tokensIn: order.tokensIn, quoteOut: 0n, error: 'paper: no reserves' };
     const quoteOut = quoteSell(r, order.tokensIn, this.o.feeBps ?? CURVE_FEE_BPS, this.o.creatorTaxBps(order.curve));

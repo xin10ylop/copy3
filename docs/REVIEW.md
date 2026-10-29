@@ -291,3 +291,77 @@ three positions open → base 0.024 ETH on a 0.127 ETH bankroll → limit 0.0036
 losing streak trips. Now `Sniper.totalBankrollEth()` = free + cost basis of the open positions
 (paper: `PaperBankroll.totalWei()`). Tests: `sizing.test.ts` "totalWei", `paper-e2e.test.ts`
 (base stays 0.1 with 0.07 open).
+
+### C-1 owner-from-Phantom: constructor operators/treasury, 0-ETH owner sweep (fixed)
+
+The cold owner is a Phantom wallet, which can send ETH but no custom calldata. The old deploy
+made only the first operator in the constructor and printed `setOperator(key, true)` and
+`setTreasury(<contract>)` calldata for the owner to send, and a withdrawal needed
+`sweepEth(to, 0)`. None of that can be sent from Phantom: every burst key except the first
+would have reverted `NotOperator`, exit proceeds would have gone to the owner instead of
+compounding, and the bankroll could not be withdrawn.
+
+Fix (`contracts/src/PonsSniper.sol`, `contracts/script/deploy.ts`):
+
+- **Constructor** is now `constructor(address owner, address[] operators, address treasury,
+  address factory, uint96 maxQuoteIn, uint96 maxSpendPerWindow, uint32 spendWindowSec)`. Every
+  operator is set there and emits `OperatorSet(op, true)`. The list must not be empty
+  (`NoOperators`) and no entry may be zero (`ZeroAddress`). The owner may still be listed, as
+  before (the owner may snipe/exit anyway). Treasury `address(0)` = the current owner,
+  the contract's own (predicted) address = compound in place, emitted as `TreasurySet`. The
+  rules for the owner, the factory and the window are unchanged (`ZeroAddress`, `InvalidSpendWindow`).
+- **`receive()`**: `msg.value > 0` from anyone funds the contract (first branch, as cheap as
+  before, so curve sale proceeds and top-ups are unaffected). `msg.value == 0` from the
+  **current owner** sends the whole ETH balance to the owner and emits the new
+  `Swept(address to, uint256 amount)`, which `sweepEth` now emits too. With a zero balance it
+  reverts `NothingToSweep`, so a wallet sees a failure instead of a silent no-op. A 0-value
+  call from anyone else (operator, stranger, pending or former owner) reverts `NotOwner` with
+  no state change and no logs, so it cannot grief. The send uses all gas, like `sweepEth`. The
+  receiver is the owner, who can already do everything, so reentrancy gives nothing.
+- **Deploy script**: passes every `EXECUTOR_PRIVATE_KEYS` address (or `OPERATORS`) to the constructor.
+  `TREASURY` defaults to `self` (the predicted contract address, i.e. compounding). `owner` maps
+  to `address(0)`, or an explicit address can be given. The deploy tx is sent with the nonce
+  the address was predicted from, and the script fails if the contract lands elsewhere. It
+  checks `operators(x)` for every operator and `treasury()`. The "owner must send" calldata
+  output is gone.
+
+What still needs a calldata-capable owner wallet: ERC-20 recovery (`sweepToken`, `rescue`; the
+0-ETH sweep moves ETH only), partial or redirected ETH sweeps (`sweepEth`), changing the caps
+(`setMaxQuoteIn`, `setSpendLimit`, `disableSpendLimit`), operators (`setOperator`, so revoking a
+stolen key and monthly key rotation, which from Phantom means redeploy + 0-ETH sweep of the old
+contract), the treasury (`setTreasury`) and ownership (`transferOwnership`). The emergency
+response for a leaked key from Phantom is: stop the sniper, then send 0 ETH to the contract, which
+leaves a stolen operator key nothing to spend.
+
+Residual risk: a curve that paid a **zero** `quoteOut` with a 0-value call would now make that
+`exit` revert `NotOwner` (the measured Pons curve and the mock pay with `call{value: quoteOut}`).
+That only happens when a sale is worth 0 wei, i.e. the tokens are worthless.
+
+Tests (`contracts/test/sniper.test.ts`, describe "C-1 owner from Phantom (no custom calldata)"):
+- "C-1: the constructor sets every operator and the treasury (predicted self = compound) and
+  emits OperatorSet/TreasurySet": 3 operators, all `operators(x) == true`, treasury = the
+  predicted address, a later key snipes, `exitAll` compounds without a transfer event.
+- "C-1: treasury 0 = the owner (emitted as TreasurySet(0)); no operators or a zero operator is
+  refused" (`NoOperators()`, `ZeroAddress()`).
+- "C-1: a 0-ETH transfer from the owner sweeps the whole ETH balance to the owner and emits
+  Swept; tokens stay" (31.6k gas; the owner's balance is up by the full amount minus gas; the
+  token position is untouched).
+- "C-1: a 0-ETH owner transfer with an empty balance reverts NothingToSweep".
+- "C-1: a 0-ETH transfer from a non-owner (stranger, operator, pending or former owner) reverts
+  NotOwner and changes nothing" (< 25k gas, no logs; after `acceptOwnership` only the new owner
+  sweeps).
+- "C-1: non-zero plain transfers from anyone still fund the contract (no sweep)" (plus a partial
+  `sweepEth`).
+- The existing tests use the new constructor; "owner admin" also checks that `sweepEth` emits `Swept`.
+
+### X-1 — paper exits were priced on the pre-dump book (fixed)
+
+Three Ohio paper exits (29 Oct 2026, snipes 50–52, all `exempt_dump`) booked +0.0013 ETH at the
+reserves BEFORE the operator's sell; replayed on-chain, the post-dump reserves gave −0.0017 ETH. The
+paper exit used the position book, which lags the feed by a poll, so it still held the pre-dump
+state. Now `ExitOrder.atBlock` carries the latest block the position manager has seen (feed block,
+node log or reserves poll) and `PaperExecutor.exit` prices on that block's post-state (6 × 250 ms
+retries for an RPC behind the feed), falling back to the book only when no block is known. Still
+optimistic by the next block's panic sells, like the backtest (which applies the exempt sells before
+liquidating). Tests: `positions.test.ts` (order carries the trigger block), `paper-e2e.test.ts`
+"paper exit pricing (post-dump reserves)".

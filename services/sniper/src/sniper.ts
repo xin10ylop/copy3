@@ -46,6 +46,7 @@ import { LEDGER_SELECTORS, LaunchSecondLedger, SEL_SELL, SEL_TRANSFER, SEL_TRANS
 import type { Logger } from './log.js';
 import { Positions, type PositionEntry, type SaleRecord } from './positions.js';
 import { DEFAULT_LAUNCH_RESERVES, MAX_TAX_BPS, launchReserves, planMinOut, worstTaxBps } from './pricing.js';
+import { RaceTracker, raceNote, roundMs, type RaceRecord } from './race.js';
 import { Recorder } from './recorder.js';
 import { Risk } from './risk.js';
 import { Rules } from './rules.js';
@@ -109,6 +110,8 @@ export interface SniperOptions {
   sweepIntervalMs?: number;
   /** NEW-4/6 paper mode: the contract caps live would have (live reads them from the chain via the gate) */
   paperLimits?: { maxQuoteIn: bigint; maxSpend: bigint; spendWindow: number };
+  /** race measurement (feed blocks, `race_*` counters); shared with the probe backend. Default: own tracker. */
+  race?: RaceTracker;
 }
 
 /** NEW-4: alert at most this often for the same refusal type */
@@ -130,6 +133,8 @@ export class Sniper {
   readonly detector: LaunchDetector;
   readonly positions: Positions;
   readonly recorder: Recorder;
+  /** where our txs land vs the first T+1 block (probe txs, live buys) — race.ts */
+  readonly race: RaceTracker;
   readonly counters: Record<string, number> = {
     launches_seen: 0,
     decisions: 0,
@@ -213,6 +218,7 @@ export class Sniper {
         ? new ContractLimits({ maxQuoteIn: pl.maxQuoteIn, spend: { maxSpend: pl.maxSpend, window: pl.spendWindow, level: 0n, updatedAt: 0 } })
         : new ContractLimits();
     this.detector = o.detector ?? new LaunchDetector();
+    this.race = o.race ?? new RaceTracker({ chain: o.chain, logger: o.logger });
     this.recorder = new Recorder(o.store, o.logger, { recordFeedBlocks: o.recordFeedBlocks ?? true });
     this.positions = new Positions({
       backend: o.backend,
@@ -464,6 +470,7 @@ export class Sniper {
       this.blockTs.set(b.block, b.timestamp);
       if (this.blockTs.size > 4096) this.blockTs.delete(this.blockTs.keys().next().value!);
       this.recorder.feedBlock(b);
+      this.race.onFeedBlock(b);
       this.o.backend.onFeedBlock(b);
     } catch (e) {
       this.error('feed block bookkeeping', e);
@@ -1293,6 +1300,8 @@ export class Sniper {
       priorityFeeGwei: p.priorityFeeGwei,
       guard: () => this.sendGuard(run),
     });
+    if (this.o.mode === 'live' && run.burst.some((m) => m.status !== 'skipped' && m.status !== 'planned'))
+      this.measureLiveRace(run, curve, fill).catch((e: unknown) => this.error(`race measurement ${run.key}`, e));
     if (fill) {
       this.onFill(run, fill);
       return;
@@ -1303,6 +1312,48 @@ export class Sniper {
     }
     // (status is mutated by abortRun while we await: read it through a function, not narrowed)
     this.endRun(run, 'failed', statusOf(run) === 'aborted' ? 'no fill after the abort' : 'no burst member bought');
+  }
+
+  /**
+   * Race measurement of a live burst (off the decide path): the member that bought, or — no buy —
+   * the first member that landed, with its revert reason (AlreadyBought, TaxTooHigh, Expired …).
+   * Same record as a probe tx (`decision.race`, `race_*` counters, `hoodctl race`).
+   */
+  private async measureLiveRace(run: SnipeRun, curve: Address, fill: Fill | null): Promise<void> {
+    const buy = fill?.txHash ? run.burst.find((m) => m.hash.toLowerCase() === fill.txHash!.toLowerCase()) : undefined;
+    const landed = run.burst.filter((m) => m.status === 'mined' || m.status === 'reverted').sort((a, b) => a.index - b.index);
+    const sent = run.burst.filter((m) => m.sentAt !== undefined).sort((a, b) => a.index - b.index);
+    const m = buy ?? landed[0] ?? sent[0];
+    if (!m) return;
+    const boundaryMs = run.plan?.boundaryMs;
+    const rec: RaceRecord = {
+      source: 'live',
+      status: 'planned',
+      member: m.index,
+      bought: buy !== undefined,
+      hash: m.hash,
+      nonce: m.nonce,
+      ...(run.signer ? { key: run.signer } : {}),
+      scheduledAt: m.scheduledAt,
+      ...(m.sentAt !== undefined ? { sentAt: m.sentAt } : {}),
+      ...(boundaryMs !== undefined ? { boundaryMs, rttMs: run.plan!.rttMs } : {}),
+      ...(boundaryMs !== undefined && m.sentAt !== undefined ? { sendVsBoundaryMs: roundMs(m.sentAt - boundaryMs) } : {}),
+      sends: m.sends,
+    };
+    this.race.count('race_sent');
+    const r = buy || landed.length ? await this.o.chain.getReceipt(m.hash).catch(() => null) : null;
+    if (!r) {
+      rec.status = 'not_mined';
+      if (buy || landed.length) rec.reason = 'receipt not readable';
+      this.race.count('race_not_mined');
+    } else {
+      await this.race.measure(rec, { curve, launchBlock: run.launch.block, launchTs: run.launch.ts, receipt: r });
+      if (rec.status === 'reverted') rec.revertReason = (await this.o.chain.revertReason?.(m.hash, r.blockNumber).catch(() => null)) ?? null;
+    }
+    run.race = rec;
+    run.notes.push(raceNote(rec));
+    this.o.logger.info({ key: run.key, race: rec }, 'race measured');
+    this.recorder.update(run, this.positions.get(run.key), 'race');
   }
 
   /**
@@ -1849,7 +1900,7 @@ export class Sniper {
       phase: p.phase,
     }));
     return {
-      mode: this.o.mode,
+      mode: this.o.backend.label ?? this.o.mode,
       startedAt: this.startedAt,
       now: this.o.scheduler.now(),
       feed,
@@ -1860,6 +1911,7 @@ export class Sniper {
         decide_us_last: Math.round(this.lastDecideUs),
         rule_evaluations: this.rules.stats.evaluations,
         ledgers_open: this.ledgers.size,
+        ...this.race.counters,
         ...((): Record<string, number> => {
           const b = this.bankrollWei();
           return b === null ? {} : { bankroll_eth: Number(b) / 1e18, daily_loss_limit_eth: this.risk.dailyLossLimitEth };

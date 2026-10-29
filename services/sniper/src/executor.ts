@@ -54,6 +54,11 @@ export interface ExitOrder {
   reason: string;
   gasLimit: number;
   maxFeeGwei: number;
+  /**
+   * The latest feed block when the exit was decided (the block that carried the trigger, e.g. the
+   * operator's sell). A live sell lands AFTER that block; paper prices the exit on its post-state.
+   */
+  atBlock?: number;
 }
 
 export interface ExitResult {
@@ -104,6 +109,8 @@ export interface ExecutionBackend {
   preflight?(o: PreflightInput): string[];
   /** Bankroll for `sizing.mode = 'bankroll'` (live: the cached contract ETH balance). Memory-only. */
   bankrollWei?(): bigint | null;
+  /** /healthz mode label when it differs from `mode` (probe = paper fills + a real probe tx per burst) */
+  readonly label?: 'probe';
 }
 
 export class NonceManager {
@@ -255,6 +262,34 @@ export function snipeTaxFromLogs(logs: RawLog[], curve: Address): bigint {
     if (l.address.toLowerCase() === curve.toLowerCase() && l.topics[0] === TOPICS.SnipeTaxCharged) return BigInt(l.data);
   }
   return 0n;
+}
+
+/**
+ * Fan a raw tx out to every endpoint; if none accepted it (and no error is permanent), re-send
+ * once — same raw tx, same nonce. Shared by the live burst / exits and the probe tx.
+ */
+export async function broadcastRaw(
+  senders: readonly RawSender[],
+  raw: Hex,
+  log: BurstMember['sends'],
+  stats: { sends: number; sendErrors: number; resends: number },
+): Promise<boolean> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const res = await Promise.all(senders.map((s) => s.sendRaw(raw)));
+    let accepted = false;
+    let permanent = false;
+    for (const r of res) {
+      stats.sends++;
+      const known = !r.ok && r.error !== undefined && KNOWN_RE.test(r.error);
+      if (!r.ok && !known) stats.sendErrors++;
+      if (r.ok || known) accepted = true;
+      if (!r.ok && r.error !== undefined && PERMANENT_RE.test(r.error)) permanent = true;
+      log.push({ endpoint: r.endpoint, sentAt: r.sentAt, doneAt: r.doneAt, ok: r.ok || known, ...(r.error ? { error: attempt ? `resend: ${r.error}` : r.error } : {}) });
+    }
+    if (accepted || permanent) return accepted;
+    if (attempt === 0) stats.resends++;
+  }
+  return false;
 }
 
 export class LiveExecutor implements ExecutionBackend {
@@ -441,23 +476,8 @@ export class LiveExecutor implements ExecutionBackend {
    * permanent), re-send once — same raw tx, same nonce — so later members are not stranded
    * behind a nonce hole. Returns whether any endpoint accepted it.
    */
-  private async broadcast(raw: Hex, log: BurstMember['sends']): Promise<boolean> {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const res = await Promise.all(this.o.senders.map((s) => s.sendRaw(raw)));
-      let accepted = false;
-      let permanent = false;
-      for (const r of res) {
-        this.stats.sends++;
-        const known = !r.ok && r.error !== undefined && KNOWN_RE.test(r.error);
-        if (!r.ok && !known) this.stats.sendErrors++;
-        if (r.ok || known) accepted = true;
-        if (!r.ok && r.error !== undefined && PERMANENT_RE.test(r.error)) permanent = true;
-        log.push({ endpoint: r.endpoint, sentAt: r.sentAt, doneAt: r.doneAt, ok: r.ok || known, ...(r.error ? { error: attempt ? `resend: ${r.error}` : r.error } : {}) });
-      }
-      if (accepted || permanent) return accepted;
-      if (attempt === 0) this.stats.resends++;
-    }
-    return false;
+  private broadcast(raw: Hex, log: BurstMember['sends']): Promise<boolean> {
+    return broadcastRaw(this.o.senders, raw, log, this.stats);
   }
 
   /** Schedule one member; resolves when its fan-out completed (or it was cancelled / blocked). */

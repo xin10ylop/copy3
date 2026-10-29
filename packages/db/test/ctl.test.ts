@@ -1,7 +1,7 @@
 /** hoodctl (packages/db/src/ctl.ts): importing it has no side effects; `status` reads the kill switch like the sniper does. */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { killSwitchOn, status } from '../src/ctl.js';
-import { setSetting } from '../src/helpers.js';
+import { formatRace, keygen, killSwitchOn, race, status } from '../src/ctl.js';
+import { insertSnipe, setSetting } from '../src/helpers.js';
 import { makeTestDb, reset, type TestDb } from './pglite.js';
 
 let db: TestDb;
@@ -36,5 +36,71 @@ describe('hoodctl status: kill switch', () => {
     const lines: string[] = [];
     await status(db.sql, (l) => lines.push(l));
     expect(lines[0]).toBe('kill switch : off');
+  });
+});
+
+describe('hoodctl race: where probe txs / live buys landed vs the first T+1 block', () => {
+  const LTX = (c: string): string => `0x${c.repeat(64)}`;
+  const probe = (o: Record<string, unknown>): Record<string, unknown> => ({ source: 'probe', status: 'mined', sendVsBoundaryMs: -126, ...o });
+
+  it('prints one row per measurement and the summary (target block, first in block = race win rate, early, late, median buysAhead)', async () => {
+    const rows: [string, Record<string, unknown> | undefined][] = [
+      ['a', probe({ blockOffset: 0, txIndex: 1, buysAhead: 0, buysInBlock: 3 })], // won
+      ['b', probe({ blockOffset: 0, txIndex: 2, buysAhead: 1, buysInBlock: 2 })], // target block, 1 ahead
+      ['c', probe({ blockOffset: 1, txIndex: 0, buysAhead: 0, buysInBlock: 4 })], // late
+      ['d', probe({ blockOffset: -1, txIndex: 7, buysAhead: 2, buysInBlock: 1 })], // early
+      ['e', probe({ status: 'not_mined' })],
+      ['f', probe({ status: 'skipped', reason: 'probe gate: probe key unfunded', sendVsBoundaryMs: undefined })],
+      ['9', undefined], // a paper row without a race record is not listed
+    ];
+    for (const [c, r] of rows) {
+      await insertSnipe(db.sql, { token: '0xt', curve: '0xc', mode: 'paper', decision: { launch: { txHash: LTX(c) }, ...(r ? { race: r } : {}) } });
+    }
+    const lines: string[] = [];
+    await race(db.sql, 1, (l) => lines.push(l));
+    expect(lines[0]).toMatch(/^decided_at \(UTC\)\s+source launch tx\s+status\s+offset txIdx ahead inBlock\s+sent-vs-boundary$/);
+    const body = lines.slice(1, 7);
+    expect(body).toHaveLength(6);
+    expect(body[0]).toMatch(/^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d  probe  0xaaaa…aaaa\s+mined\s+\+0\s+1\s+0\s+3\s+-126 ms$/);
+    expect(body[2]).toMatch(/0xcccc…cccc\s+mined\s+\+1\s+0\s+0\s+4/);
+    expect(body[3]).toMatch(/0xdddd…dddd\s+mined\s+-1\s+7\s+2\s+1/);
+    expect(body[4]).toMatch(/not_mined\s+-\s+-\s+-\s+-/);
+    expect(body[5]).toMatch(/skipped .* probe gate: probe key unfunded$/);
+    const summary = lines.slice(7).join('\n');
+    expect(summary).toContain('probe: 6 run(s), 5 sent, 4 landed, 1 not mined, 1 not sent');
+    expect(summary).toMatch(/in target block \(offset 0\)\s+:\s+40\.0 %  \(2\/5\)/);
+    expect(summary).toMatch(/first in block \(race won\)\s+:\s+20\.0 %  \(1\/5\)  <- the measured race win rate/);
+    expect(summary).toMatch(/early \(second T, 99 % tax\)\s+:\s+20\.0 %  \(1\/5\)/);
+    expect(summary).toMatch(/late \(after the target block\):\s+20\.0 %  \(1\/5\)/);
+    expect(summary).toMatch(/median buysAhead\s+: 0\.5  \(over 4 landed\)/);
+  });
+
+  it('live rows get their own summary next to the probes, with the revert reason of a lost burst', () => {
+    const at = new Date('2026-10-29T12:00:00Z');
+    const lines = formatRace([
+      { decidedAt: at, launchTx: LTX('1'), race: { source: 'probe', status: 'mined', blockOffset: 0, txIndex: 0, buysAhead: 0, buysInBlock: 1 } },
+      { decidedAt: at, launchTx: LTX('2'), race: { source: 'live', status: 'reverted', blockOffset: 0, txIndex: 5, buysAhead: 3, buysInBlock: 4, revertReason: 'AlreadyBought' } },
+    ]);
+    expect(lines[1]).toBe('2026-10-29 12:00:00  probe  0x1111…1111   mined           +0     0     0       1                  ');
+    expect(lines[2]).toMatch(/live   0x2222…2222   reverted\s+\+0\s+5\s+3\s+4\s+AlreadyBought$/);
+    const text = lines.join('\n');
+    expect(text).toContain('live: 1 run(s), 1 sent, 1 landed');
+    expect(text).toContain('probe: 1 run(s), 1 sent, 1 landed');
+    expect(text).toContain('all: 2 run(s), 2 sent, 2 landed');
+    expect(formatRace([]).join('\n')).toMatch(/no race measurements yet/);
+  });
+});
+
+describe('hoodctl keygen', () => {
+  it('prints n fresh keys with their addresses and the env line, nothing else', () => {
+    const lines: string[] = [];
+    keygen(2, (l) => lines.push(l));
+    const env = lines.find((l) => l.startsWith('EXECUTOR_PRIVATE_KEYS='))!;
+    const keys = env.slice('EXECUTOR_PRIVATE_KEYS='.length).split(',');
+    expect(keys).toHaveLength(2);
+    for (const k of keys) expect(k).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(keys[0]).not.toBe(keys[1]);
+    expect(lines.filter((l) => /^# key \d: address 0x[0-9a-fA-F]{40}$/.test(l))).toHaveLength(2);
+    expect(lines.join('\n')).toMatch(/written nowhere/);
   });
 });

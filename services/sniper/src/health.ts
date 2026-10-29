@@ -3,7 +3,8 @@ import http from 'node:http';
 import type { ClockSnapshot, FeedStatsSnapshot } from '@hood/core';
 
 export interface HealthState {
-  mode: 'live' | 'paper';
+  /** probe = paper fills + one real probe tx per planned burst (race measurement) */
+  mode: 'live' | 'paper' | 'probe';
   startedAt: number;
   now: number;
   feed: FeedStatsSnapshot;
@@ -32,6 +33,7 @@ export function prometheus(s: HealthState): string {
   };
   g('sniper_up', healthy(s) ? 1 : 0, 'feed fresh within 5 s');
   g('sniper_live', s.mode === 'live' ? 1 : 0, '1 = live, 0 = paper');
+  g('sniper_probe', s.mode === 'probe' ? 1 : 0, '1 = probe mode (paper fills + one real probe tx per planned burst)');
   g('sniper_feed_blocks_total', s.feed.blocks, 'feed blocks received');
   g('sniper_feed_blocks_per_sec', s.feed.blocksPerSec, 'feed throughput (10 s window)');
   g('sniper_feed_gaps_total', s.feed.gaps, 'sequence gaps');

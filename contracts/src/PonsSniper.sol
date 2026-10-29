@@ -21,11 +21,17 @@ interface IArbSys {
 ///         a launch-second block revert cheaply on `TaxTooHigh`, members that land after a
 ///         successful sibling revert on `AlreadyBought`, exactly one buy executes. Bought
 ///         tokens stay here, pre-approved to the curve, so `exit` is a single call.
-/// @dev    Buys are paid from this contract's ETH balance (fund it via `receive`); burst txs
-///         should carry `msg.value = 0` so that every member stays executable and the
-///         executor's nonces are always consumed. Sale proceeds are forwarded to `treasury`
-///         (default: the current owner); if the receiver cannot take ETH they stay here and
-///         the owner sweeps them with `sweepEth` — an exit never reverts because of the receiver.
+/// @dev    Buys are paid from this contract's ETH balance (fund it with a plain ETH transfer,
+///         `receive`); burst txs should carry `msg.value = 0` so that every member stays
+///         executable and the executor's nonces are always consumed. Sale proceeds are forwarded
+///         to `treasury` (address(0) = the current owner, address(this) = compound in place); if
+///         the receiver cannot take ETH they stay here and the owner sweeps them — an exit never
+///         reverts because of the receiver.
+///         C-1 (owner = a wallet without custom calldata, e.g. Phantom): every operator and the
+///         treasury are set in the constructor, and a plain 0-ETH transfer from the owner sweeps
+///         the whole ETH balance to the owner (`receive`). ERC-20 positions are NOT swept that
+///         way: recovering tokens (`sweepToken`/`rescue`), changing caps, operators or the
+///         treasury still needs a calldata-capable owner wallet.
 ///         Operator keys are hot: they can only buy real Pons curves (verified against the
 ///         immutable factory), at most `maxQuoteIn` per token, once per token, within a
 ///         decaying spend budget (at most `maxSpendPerWindow` at once, refilling at
@@ -48,6 +54,8 @@ contract PonsSniper {
     error NotPendingOwner();
     error SpendLimitExceeded(uint256 spent, uint256 quoteIn, uint256 maxSpend);
     error InvalidSpendWindow();
+    error NoOperators();
+    error NothingToSweep();
 
     event Sniped(address indexed token, address indexed curve, uint256 quoteIn, uint256 tokensOut, uint256 taxBps);
     event Exited(address indexed token, address indexed curve, uint256 tokensIn, uint256 quoteOut);
@@ -60,6 +68,7 @@ contract PonsSniper {
     event TreasurySet(address indexed treasury);
     event ProceedsSent(address indexed to, uint256 amount);
     event ProceedsHeld(address indexed to, uint256 amount);
+    event Swept(address indexed to, uint256 amount);
 
     // ---------------------------------------------------------------- curve call encoding
     /// @dev buy(uint256 quoteIn, uint256 minTokensOut, address recipient)   — RESEARCH §3, §7.1
@@ -98,9 +107,23 @@ contract PonsSniper {
     /// @dev PonsV2LaunchFactory: the only source of truth for token → curve.
     address public immutable factory;
 
-    constructor(address owner_, address operator_, address factory_, uint96 maxQuoteIn_, uint96 maxSpendPerWindow_, uint32 spendWindow_) {
+    /// @param operators_ every hot key (exit key + burst keys); at least one, none zero. The
+    ///        owner may also be listed (it can snipe/exit anyway).
+    /// @param treasury_ receiver of exit proceeds: address(0) = the owner, the (predicted)
+    ///        address of this contract = keep them here and compound.
+    /// @dev C-1: everything an owner without calldata (Phantom) could not set later is set here.
+    constructor(
+        address owner_,
+        address[] memory operators_,
+        address treasury_,
+        address factory_,
+        uint96 maxQuoteIn_,
+        uint96 maxSpendPerWindow_,
+        uint32 spendWindow_
+    ) {
         if (owner_ == address(0) || factory_ == address(0)) revert ZeroAddress();
         if (spendWindow_ == 0) revert InvalidSpendWindow(); // "off" is an explicit disableSpendLimit()
+        if (operators_.length == 0) revert NoOperators();
         owner = owner_;
         factory = factory_;
         maxQuoteIn = maxQuoteIn_;
@@ -110,10 +133,14 @@ contract PonsSniper {
         emit OwnershipTransferred(address(0), owner_);
         emit MaxQuoteInSet(maxQuoteIn_);
         emit SpendLimitSet(maxSpendPerWindow_, spendWindow_);
-        if (operator_ != address(0)) {
-            operators[operator_] = true;
-            emit OperatorSet(operator_, true);
+        for (uint256 i; i < operators_.length; ++i) {
+            address op = operators_[i];
+            if (op == address(0)) revert ZeroAddress();
+            operators[op] = true;
+            emit OperatorSet(op, true);
         }
+        treasury = payable(treasury_);
+        emit TreasurySet(treasury_);
         uint256 id = block.chainid;
         // Robinhood Chain mainnet/testnet, Arbitrum One / Nova / Sepolia
         arbBlockNumbers = id == 4663 || id == 46630 || id == 42161 || id == 42170 || id == 421614;
@@ -129,7 +156,21 @@ contract PonsSniper {
         _;
     }
 
-    receive() external payable {}
+    /// @notice Plain ETH transfers. `msg.value > 0` (anyone, incl. curve sale proceeds) funds the
+    ///         contract. `msg.value == 0` from the OWNER sweeps the whole ETH balance to the owner
+    ///         (C-1: the withdraw button of a wallet that cannot send calldata) and reverts
+    ///         `NothingToSweep` when the balance is 0, so the wallet sees a failure instead of a
+    ///         silent no-op. `msg.value == 0` from anyone else reverts `NotOwner` (no state change).
+    /// @dev Funding stays the cheap first branch. Tokens are not swept here: use `sweepToken`.
+    receive() external payable {
+        if (msg.value != 0) return;
+        if (msg.sender != owner) revert NotOwner();
+        uint256 amount = address(this).balance;
+        if (amount == 0) revert NothingToSweep();
+        (bool ok,) = payable(msg.sender).call{value: amount}("");
+        if (!ok) revert TransferFailed();
+        emit Swept(msg.sender, amount);
+    }
 
     // ---------------------------------------------------------------- hot path
     /// @notice Buy `token` on `curve` once, only if the snipe tax for this contract is ≤ maxTaxBps.
@@ -240,11 +281,12 @@ contract PonsSniper {
         pendingOwner = address(0);
     }
 
-    /// @notice Send `amount` wei (0 = all) to `to`.
+    /// @notice Send `amount` wei (0 = all) to `to` (the calldata variant of the 0-ETH owner sweep).
     function sweepEth(address payable to, uint256 amount) external onlyOwner {
         if (amount == 0) amount = address(this).balance;
         (bool ok,) = to.call{value: amount}("");
         if (!ok) revert TransferFailed();
+        emit Swept(to, amount);
     }
 
     /// @notice Send `amount` (0 = all) of `token` to `to`.

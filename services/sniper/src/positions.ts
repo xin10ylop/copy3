@@ -304,6 +304,7 @@ export class Positions {
    * a block the snapshot is assumed to contain every log seen so far.
    */
   onReserves(curve: Address, r: Reserves, block?: number): void {
+    this.noteBlock(typeof block === 'number' ? block : null);
     for (const p of this.byCurve.get(curve.toLowerCase()) ?? []) {
       let at = block;
       if (at === undefined) {
@@ -318,6 +319,7 @@ export class Positions {
   onLog(l: RawLog): void {
     const addr = l.address.toLowerCase();
     const id = `${l.transactionHash ?? ''}:${String(l.logIndex ?? '')}`;
+    this.noteBlock(l.blockNumber === null || l.blockNumber === undefined ? null : Number(l.blockNumber));
     if (l.topics[0] === TOPICS.Erc20Transfer) {
       for (const p of this.byToken.get(addr) ?? []) {
         if (p.seenLogs.has(id)) continue;
@@ -365,7 +367,19 @@ export class Positions {
    * Feed fast path: exempt wallets calling transfer/transferFrom on a held token or sell on its
    * curve. Sender recovery happens only for txs addressed to those contracts.
    */
+  /**
+   * Latest block seen from any source (feed block or node log). Exit orders carry it as `atBlock`:
+   * a sell lands after the block that triggered it, so paper prices the exit on its post-state.
+   */
+  lastFeedBlock: number | null = null;
+
+  private noteBlock(b: number | null | undefined): void {
+    if (b === null || b === undefined || !Number.isFinite(b)) return;
+    if (this.lastFeedBlock === null || b > this.lastFeedBlock) this.lastFeedBlock = b;
+  }
+
   async onFeedBlock(b: FeedBlock): Promise<void> {
+    this.noteBlock(b.block);
     if (this.byKey.size === 0) return;
     for (const tx of b.txs) {
       if (!tx.to || !tx.selector) continue;
@@ -484,6 +498,7 @@ export class Positions {
           reason: sig.reason,
           gasLimit: this.o.gasLimit ?? p.preset.gasLimit,
           maxFeeGwei: this.o.maxFeeGwei ?? p.preset.maxFeeGwei,
+          ...(this.lastFeedBlock !== null ? { atBlock: this.lastFeedBlock } : {}),
         })
         .catch((e: unknown): ExitResult => ({ ok: false, tokensIn: sig.sellTokens, quoteOut: 0n, error: (e as Error).message }));
       if (res.ok) break;

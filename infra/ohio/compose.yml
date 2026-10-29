@@ -2,9 +2,10 @@
 #
 # Alchemy serves Robinhood Chain (HTTP + WS, debug_traceTransaction with callTracer, 20k-block
 # eth_getLogs), so it is NODE_HTTP / NODE_WS for the indexer, agent and sniper; the public sequencer
-# feed stays the sniper's detection source. The sniper is hard-wired to EXECUTION_MODE=paper here:
-# no executor keys ever reach this file. LIVE runs the sniper on the host (infra/executor/
-# install-executor.sh), see infra/ohio/README.md.
+# feed stays the sniper's detection source. The sniper runs EXECUTION_MODE=paper here, or probe
+# (paper + one 0-value self-transfer per planned burst from a GAS-ONLY key, to measure the race);
+# live cannot start here (SNIPER_CONTRACT is never passed, the live config refuses to start without
+# it). LIVE runs the sniper on the host (infra/executor/install-executor.sh), see infra/ohio/README.md.
 #
 # Always run it through the wrapper (it passes --env-file and the project name):
 #   hoodctl up                     # build + start postgres, migrate(+seed), indexer, tracker, agent, sniper
@@ -285,14 +286,22 @@ services:
 
   # -------------------------------------------------------------------------------------------
   # PAPER sniper: public feed -> rules -> planned burst -> simulated fill (PAPER_FILL=last: behind
-  # every other buy of the +1 s block, the pessimistic model) -> exits. Nothing is ever signed.
+  # every other buy of the +1 s block, the pessimistic model) -> exits. Nothing is ever signed,
+  # except in EXECUTION_MODE=probe: one 0-value self-transfer (21k gas) per planned burst from
+  # EXECUTOR_PRIVATE_KEYS (gas-only keys, never contract operators), sent at the burst's first slot
+  # and measured (`hoodctl race`). No SNIPER_CONTRACT is passed, so live mode refuses to start here.
   # SEND_ENDPOINTS: the first entry is used for the RTT measurement (burst timing), so the public
   # RPC (the sequencer's own front door, ~3 ms from us-east-2) goes first, Alchemy second.
   sniper:
     <<: *app
     environment:
       SERVICE: sniper
-      EXECUTION_MODE: paper
+      # paper | probe (live refuses to start without SNIPER_CONTRACT, which this file never passes)
+      EXECUTION_MODE: ${EXECUTION_MODE:-paper}
+      # probe mode only: gas-only key(s) for the probe tx (hoodctl keygen 1); ignored in paper mode
+      EXECUTOR_PRIVATE_KEYS: ${EXECUTOR_PRIVATE_KEYS:-}
+      PROBE_RECEIPT_TIMEOUT_MS: ${PROBE_RECEIPT_TIMEOUT_MS:-5000}
+      MIN_GAS_BALANCE_ETH: ${MIN_GAS_BALANCE_ETH:-0.001}
       PAPER_FILL: ${PAPER_FILL:-last}
       PAPER_BANKROLL_ETH: ${PAPER_BANKROLL_ETH:-0.1}
       PAPER_MAX_QUOTE_IN_ETH: ${PAPER_MAX_QUOTE_IN_ETH:-0.3}

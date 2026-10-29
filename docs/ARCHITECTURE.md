@@ -142,7 +142,10 @@ per-play: max buy ETH, max concurrent positions, stop-after-N, cool-down after a
 loss, daily loss limit (global kill switch), min quote reserve / max mcap at entry,
 abort if any exempt wallet *sold* in the launch block, abort if `maxTaxBps` not met,
 timeout sell, trailing stop, hard stop loss, max gas price, nonce reconciliation,
-dry-run mode (`EXECUTION_MODE=paper`) that logs the would-be burst and simulated PnL.
+dry-run mode (`EXECUTION_MODE=paper`) that logs the would-be burst and simulated PnL, and a probe
+mode (`EXECUTION_MODE=probe`): paper plus one real 0-value self-transfer at each planned burst's
+first slot. It measures where a real buy would land: block offset vs the first `T+1` block, tx
+index, and buyers ahead (`hoodctl race`). Live bursts record the same measurement.
 
 ## 7. Honest expectations
 
