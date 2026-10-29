@@ -2,7 +2,8 @@
 # HoodSniper — go live on the Ohio box in four commands (RUNBOOK §6-8, Path A).
 #
 #   sudo bash /opt/hood/hoodsniper/infra/ohio/golive.sh install            # host sniper service + .env.executor + 3 keys
-#   sudo bash /opt/hood/hoodsniper/infra/ohio/golive.sh deploy OWNER=0x…   # PonsSniper with the cold owner; prints the address to fund
+#   sudo bash /opt/hood/hoodsniper/infra/ohio/golive.sh spread             # one Phantom send to the exit key → gas to every key
+#   sudo bash /opt/hood/hoodsniper/infra/ohio/golive.sh deploy OWNER=0x…   # PonsSniper with the cold owner, funded from the exit key
 #   sudo bash /opt/hood/hoodsniper/infra/ohio/golive.sh live               # stop the paper sniper, start the live one
 #   sudo bash /opt/hood/hoodsniper/infra/ohio/golive.sh status | stop | paper
 #
@@ -51,6 +52,14 @@ rpc() { curl -sS -m 15 -X POST -H 'content-type: application/json' --data "{\"js
 balance_eth() { rpc eth_getBalance "[\"$1\",\"latest\"]" | python3 -c 'import sys,json; r=json.load(sys.stdin).get("result","0x0"); print(int(r,16)/1e18)'; }
 node_db() { (cd "$HOOD_DIR/packages/db" && as_hood node --input-type=module -e "$1"); }
 addr_of() { node_db "import {privateKeyToAccount} from 'viem/accounts'; console.log(privateKeyToAccount('$1').address)"; }
+# send_eth <from private key> <to address> <eth>: a plain transfer on Robinhood Chain (4663), waits for the receipt
+send_eth() {
+  node_db "import {createWalletClient,createPublicClient,http,parseEther} from 'viem'; import {privateKeyToAccount} from 'viem/accounts';
+const chain={id:4663,name:'Robinhood Chain',nativeCurrency:{name:'Ether',symbol:'ETH',decimals:18},rpcUrls:{default:{http:['$RPC']}}};
+const account=privateKeyToAccount('$1'); const w=createWalletClient({account,chain,transport:http('$RPC')}); const pc=createPublicClient({chain,transport:http('$RPC')});
+const hash=await w.sendTransaction({to:'$2',value:parseEther('$3')}); const r=await pc.waitForTransactionReceipt({hash,timeout:60000});
+console.log(r.status+' '+hash)"
+}
 
 cmd="${1:-help}"; shift || true
 for kv in "$@"; do case "$kv" in *=*) export "${kv%%=*}=${kv#*=}" ;; esac; done
@@ -114,7 +123,25 @@ case "$cmd" in
     fi
     [[ "$(env_get "$EXEC_ENV" EXECUTION_MODE)" == live ]] && systemctl start hood-sniper.service || true
     print_keys
-    log "next: fund the keys above, then: sudo bash $HOOD_DIR/infra/ohio/golive.sh deploy OWNER=<your cold wallet>"
+    total="$(python3 -c "print(round($KEY_FUND_ETH*($MAX_CONCURRENT+1) + $CONTRACT_FUND_ETH + 0.0005, 6))")"
+    log "next: send $total ETH from Phantom to the EXIT address above (one transfer), then: sudo bash $HOOD_DIR/infra/ohio/golive.sh spread"
+    ;;
+  spread)
+    # one Phantom transfer to the EXIT key (KEY_FUND_ETH × keys + CONTRACT_FUND_ETH + a little), then this
+    # hands KEY_FUND_ETH to every burst key; the contract is funded from the exit key by `deploy`.
+    [[ -f "$EXEC_ENV" ]] || die "run 'golive.sh install' first"
+    keys="$(env_get "$EXEC_ENV" EXECUTOR_PRIVATE_KEYS)"; IFS=',' read -ra arr <<<"$keys"; first="${arr[0]}"; exit_addr="$(addr_of "$first")"
+    n=${#arr[@]}; need="$(python3 -c "print(round($KEY_FUND_ETH*$n + $CONTRACT_FUND_ETH + 0.0005, 6))")"
+    bal="$(balance_eth "$exit_addr")"
+    log "exit key $exit_addr holds $bal ETH (needs ~$need ETH for $n keys × $KEY_FUND_ETH + contract $CONTRACT_FUND_ETH)"
+    python3 -c "import sys; sys.exit(0 if float('$bal') >= $KEY_FUND_ETH*($n-1) + 0.0002 else 1)" || die "send ~$need ETH from Phantom to $exit_addr first, then run spread again"
+    for k in "${arr[@]:1}"; do
+      to="$(addr_of "$k")"; b="$(balance_eth "$to")"
+      if python3 -c "import sys; sys.exit(0 if float('$b') >= $KEY_FUND_ETH*0.9 else 1)"; then log "$to already holds $b ETH"; continue; fi
+      log "sending $KEY_FUND_ETH ETH → $to"; send_eth "$first" "$to" "$KEY_FUND_ETH" >&2
+    done
+    print_keys
+    log "next: sudo bash $HOOD_DIR/infra/ohio/golive.sh deploy OWNER=<your cold wallet>"
     ;;
   deploy)
     [[ -n "${OWNER:-}" ]] || die "usage: golive.sh deploy OWNER=0x<cold wallet address>"
@@ -126,13 +153,16 @@ case "$cmd" in
     if [[ -n "$(env_get "$EXEC_ENV" SNIPER_CONTRACT)" && "${REDEPLOY:-0}" != 1 ]]; then
       die "SNIPER_CONTRACT is already set ($(env_get "$EXEC_ENV" SNIPER_CONTRACT)); pass REDEPLOY=1 to deploy another"
     fi
-    log "deploying PonsSniper: owner $OWNER, operators = all $(( $(tr -cd ',' <<<"$keys" | wc -c) + 1 )) keys, treasury = the contract (compounding), maxQuoteIn $MAX_QUOTE_IN_ETH ETH, $MAX_SPEND_PER_WINDOW_ETH ETH/h"
-    out="$(cd "$HOOD_DIR" && as_hood env EXECUTOR_PRIVATE_KEYS="$keys" OWNER="$OWNER" MAX_QUOTE_IN_ETH="$MAX_QUOTE_IN_ETH" MAX_SPEND_PER_WINDOW_ETH="$MAX_SPEND_PER_WINDOW_ETH" RPC_URL="$RPC" pnpm --filter @hood/contracts run deploy 2>&1 | tee /dev/stderr)"
+    fund=""
+    if python3 -c "import sys; sys.exit(0 if float('$bal') >= $CONTRACT_FUND_ETH + 0.0008 else 1)"; then fund="$CONTRACT_FUND_ETH"; fi
+    log "deploying PonsSniper: owner $OWNER, operators = all $(( $(tr -cd ',' <<<"$keys" | wc -c) + 1 )) keys, treasury = the contract (compounding), maxQuoteIn $MAX_QUOTE_IN_ETH ETH, $MAX_SPEND_PER_WINDOW_ETH ETH/h${fund:+, funding $fund ETH from the exit key}"
+    out="$(cd "$HOOD_DIR" && as_hood env EXECUTOR_PRIVATE_KEYS="$keys" OWNER="$OWNER" MAX_QUOTE_IN_ETH="$MAX_QUOTE_IN_ETH" MAX_SPEND_PER_WINDOW_ETH="$MAX_SPEND_PER_WINDOW_ETH" RPC_URL="$RPC" ${fund:+FUND_ETH="$fund"} pnpm --filter @hood/contracts run deploy 2>&1 | tee /dev/stderr)"
     contract="$(sed -n 's/^SNIPER_CONTRACT=//p' <<<"$out" | tail -n 1)"
     [[ "$contract" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "deploy did not print SNIPER_CONTRACT (see output above)"
     env_set "$EXEC_ENV" SNIPER_CONTRACT "$contract"
     log "SNIPER_CONTRACT=$contract written to $EXEC_ENV"
-    log "next: send $CONTRACT_FUND_ETH ETH from the owner wallet ($OWNER) to $contract (a plain transfer), then: sudo bash $HOOD_DIR/infra/ohio/golive.sh live"
+    log "contract balance now $(balance_eth "$contract") ETH (top up any time with a plain transfer from the owner wallet)"
+    log "next: sudo bash $HOOD_DIR/infra/ohio/golive.sh live"
     ;;
   live)
     [[ -f "$EXEC_ENV" ]] || die "run 'golive.sh install' first"
