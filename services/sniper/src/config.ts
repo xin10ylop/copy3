@@ -68,8 +68,8 @@ export const ConfigSchema = z
     /** fixed RTT to the sequencer (ms); 0 = measure against the primary send endpoint */
     RTT_MS: num(0),
     /** L2 blocks after the launch block after which burst txs revert with Expired() */
-    /** burst deadline in L2 blocks after the launch block (≈ the end of second T+2 at 10 blocks/s); the wall-clock deadlineTs is the binding one under congestion */
-    DEADLINE_BLOCKS: num(25),
+    /** burst deadline in L2 blocks after the launch block (≈ the end of second T+1 at 10 blocks/s); the wall-clock deadlineTs is the binding one under congestion */
+    DEADLINE_BLOCKS: num(20),
     HEALTH_PORT: num(8081),
     LOG_LEVEL: z.string().default('info'),
     /** none (wait for TokenLaunched/receipt) | nonce (CREATE prediction; Pons V2 uses CREATE2 → wrong) */

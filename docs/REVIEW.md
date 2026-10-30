@@ -370,6 +370,7 @@ liquidating). Tests: `positions.test.ts` (order carries the trigger block), `pap
 
 30 Oct 2026, 10:52 and 10:55 UTC: a sequencer spam wave (150–230 tx blocks) delayed two bursts
 by 0.9 s and 2.9 s after the target block; both still bought (deadlineTs = T+3) at prices the
-+1 s buyers had moved. `SNIPE_DEADLINE_SECONDS` now defaults to 2 (T+1 target, T+2 at 0.19 % tax
-still a fill, T+3 reverts `Expired` at ~25k gas) and `DEADLINE_BLOCKS` to 25. `hoodctl race`
++1 s buyers had moved. `SNIPE_DEADLINE_SECONDS` now defaults to 1 (the +1 s second only: a T+2 landing sits behind the
++1 s buyers, the backtest's losing "last in block" case) and `DEADLINE_BLOCKS` to 20; late
+members revert `Expired` at ~25k gas. `hoodctl race`
 shows such landings as `late` (offset > 0).
