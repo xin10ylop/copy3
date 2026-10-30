@@ -88,7 +88,8 @@ export interface SniperOptions {
   launchReserves?: Readonly<Record<string, Reserves>>;
   /**
    * Re-price minTokensOut this many ms before the first send, from the launch-second buys
-   * confirmed since the decision (ledger) and a fresh `getReserves` (sequencer RPC). 0 = off.
+   * confirmed since the decision (ledger) and 'latest' reserves polled from the sequencer RPC
+   * every ~100 ms while waiting (plus one last read, ≤ 60 ms). 0 = off. Default 250 (main.ts).
    * Team buys made through helper contracts are invisible to the feed and their CurveBuy logs
    * reach the node ws a few hundred ms after the decision; a bound priced without them reverted
    * SlippageExceeded at +1 s on two launches of one operator (30 Oct 2026).
@@ -995,7 +996,7 @@ export class Sniper {
    */
   private async freshReserves(curve: Address, lg: LaunchSecondLedger | undefined, afterLaunch: Reserves | null, creatorTaxBps: number, current: Reserves): Promise<Reserves> {
     const fromLedger = lg && afterLaunch && lg.priceMovingBuys > 0 ? lg.reservesAfter(afterLaunch, creatorTaxBps) : null;
-    const fromRpc = await Promise.race([this.o.chain.getReserves(curve).catch(() => null), sleep(25).then(() => null)]);
+    const fromRpc = await Promise.race([this.o.chain.getReserves(curve).catch(() => null), sleep(60).then(() => null)]);
     let best = current;
     for (const r of [fromLedger, fromRpc]) if (r && r.quote > best.quote) best = r;
     return best;
@@ -1318,12 +1319,24 @@ export class Sniper {
     // 4b) re-price right before the first send (see `repriceLeadMs`)
     const lead = this.o.repriceLeadMs ?? 0;
     if (lead > 0 && plan.times[0]! - scheduler.now() > lead + 20) {
+      // poll 'latest' reserves from the fast endpoints while waiting (every ~100 ms): a single
+      // read at the re-price point lost the race to its own 25 ms budget on 30 Oct 2026 (17:40
+      // UTC: 0.97 ETH of helper-contract team buys, the ledger had seen half, the read timed out)
+      const polled: { r: Reserves | null; on: boolean } = { r: null, on: true };
+      void (async (): Promise<void> => {
+        while (polled.on) {
+          const r = await this.o.chain.getReserves(curve).catch(() => null);
+          if (r && (!polled.r || r.quote > polled.r.quote)) polled.r = r;
+          if (polled.on) await sleep(100);
+        }
+      })();
       await new Promise<void>((res) => scheduler.at(plan.times[0]! - lead, res));
+      polled.on = false;
       if (run.status !== 'pending') {
         this.endRun(run, 'aborted', `aborted before the burst: ${run.abortReason ?? ''}`);
         return;
       }
-      const fresh = await this.freshReserves(curve, lg, afterLaunch, l.event.creatorTaxBps, reserves);
+      const fresh = await this.freshReserves(curve, lg, afterLaunch, l.event.creatorTaxBps, polled.r && polled.r.quote > reserves.quote ? polled.r : reserves);
       if (fresh.quote !== reserves.quote || fresh.token !== reserves.token) {
         const rc2 = this.risk.reserveCheck(p, fresh);
         if (!rc2.ok) {

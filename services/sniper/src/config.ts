@@ -71,7 +71,7 @@ export const ConfigSchema = z
     /** burst deadline in L2 blocks after the launch block (≈ the end of second T+1 at 10 blocks/s); the wall-clock deadlineTs is the binding one under congestion */
     DEADLINE_BLOCKS: num(20),
     /** re-price minTokensOut this many ms before the first send (0 = off); see Sniper.repriceLeadMs */
-    REPRICE_LEAD_MS: num(150),
+    REPRICE_LEAD_MS: num(250),
     HEALTH_PORT: num(8081),
     LOG_LEVEL: z.string().default('info'),
     /** none (wait for TokenLaunched/receipt) | nonce (CREATE prediction; Pons V2 uses CREATE2 → wrong) */
