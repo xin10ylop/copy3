@@ -385,3 +385,13 @@ on the launch reserves alone and the curve reverted `SlippageExceeded(uint256,ui
 150 ms, re-derives the reserves from the ledger's confirmed buys and a fresh `getReserves`
 raced across the fast endpoints (≤ 25 ms), re-checks the entry cap and re-prices minTokensOut,
 then signs. Test: `launcher.test.ts` "re-prices minTokensOut 150 ms before the first send".
+
+### D-1 — the live dump exit fired on team SELLS; the backtest's fires on transfers out (fixed)
+
+30 Oct 2026, 13:00–19:00 UTC, the same 20 launches: live −0.0017 ETH (7 wins), the chain replay
+with the backtest's exit logic +0.0051 ETH (12 wins). Entries and non-dump exits agree to the
+fourth decimal; the gap is one definition: the backtest's `dump` is an exempt Transfer to a
+non-curve wallet, the live bot also exited on any exempt curve SELL (a partial team sell 2–8 s
+after launch, after which the token ran +53 % / +83 %). `Preset.dumpOnExemptSells` (default
+false) restores the backtest's definition; sells are price events for the stop / trailing.
+Tests: `positions.test.ts` "a team wallet's curve SELL is a price event".

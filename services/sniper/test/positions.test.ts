@@ -164,11 +164,29 @@ describe('Positions manager', () => {
     expect(p.open).toHaveLength(0);
   });
 
+  it("a team wallet's curve SELL is a price event, not a dump (backtest semantics); its transfer-out still exits", async () => {
+    const chain = new FakeChain();
+    const be = new RecordingBackend();
+    const p = new Positions({ backend: be, chain, logger: silentLogger, now: () => 0 });
+    const { run } = openRun(p, { exitIfExemptSellsPct: 0, takeProfits: [{ pct: 1000, sellPct: 100 }] });
+    const pos = p.get(run.key)!;
+    p.onLog(transferLog({ token: LAUNCH.token, from: LAUNCH.deployer, to: LAUNCH.curve, value: 10n ** 24n, block: LAUNCH.block + 60, txHash: `0x${'98'.repeat(32)}`, logIndex: 0 }));
+    const sellTx = decodedTxFromRpc({ ...launchFixture.tx, hash: `0x${'97'.repeat(32)}`, from: LAUNCH.deployer, to: LAUNCH.curve, input: encodeFunctionData({ abi: parseAbi(['function sell(uint256,uint256,address) returns (uint256)']), functionName: 'sell', args: [10n ** 24n, 0n, LAUNCH.deployer] }), value: 0n });
+    await p.onFeedBlock(emptyBlock(LAUNCH.block + 61, LAUNCH.ts + 6, 0, [sellTx]));
+    await new Promise((r) => setTimeout(r, 1));
+    expect(pos.state.exemptOutflowPct).toBe(0);
+    expect(be.exits).toHaveLength(0);
+    // the transfer to a dump wallet is the signal
+    p.onLog(transferLog({ token: LAUNCH.token, from: LAUNCH.deployer, to: '0xa98da960d6000000000000000000000000000000', value: 10n ** 24n, block: LAUNCH.block + 62, txHash: `0x${'96'.repeat(32)}`, logIndex: 0 }));
+    await new Promise((r) => setTimeout(r, 1));
+    expect(be.exits.map((e) => e.reason)).toEqual(['exempt_dump']);
+  });
+
   it('an exempt sell seen as a node log and then as the same feed tx is counted once (no doubled outflow pct)', async () => {
     const chain = new FakeChain();
     const be = new RecordingBackend();
     const p = new Positions({ backend: be, chain, logger: silentLogger, now: () => 0 });
-    const { run } = openRun(p, { exitIfExemptSellsPct: 1000, takeProfits: [{ pct: 1000, sellPct: 100 }] }); // high threshold: observe the pct, no exit
+    const { run } = openRun(p, { exitIfExemptSellsPct: 1000, dumpOnExemptSells: true, takeProfits: [{ pct: 1000, sellPct: 100 }] }); // high threshold: observe the pct, no exit
     const pos = p.get(run.key)!;
     const amount = 10n ** 24n;
     const hash = `0x${'99'.repeat(32)}` as Hex;

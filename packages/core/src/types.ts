@@ -102,8 +102,20 @@ export const PresetSchema = z.object({
    * exit if exempt (team) wallets moved out ≥ this percent of their holding (transfer or sell).
    * Default 0 = exit on the FIRST exempt transfer-out/sell (dump exit on); omit-able per play.
    */
-  /** exit when exempt wallets have sold/transferred out at least this % of their holding; null disables. */
+  /**
+   * exit when exempt wallets have TRANSFERRED OUT (to a wallet other than the curve) at least this
+   * % of their holding; null disables. This is the backtest's dump signal (bt_month.py: `dump` =
+   * an exempt Transfer to a non-curve address). Exempt SELLS are price events the stop / trailing
+   * handle, unless `dumpOnExemptSells` is on.
+   */
   exitIfExemptSellsPct: z.number().min(0).nullable().default(0),
+  /**
+   * also count exempt wallets' curve SELLS as dump outflow. Off = the backtest's definition. On
+   * (the live default until 30 Oct 2026) exited on the first partial team sell, seconds after
+   * launch, while the replay of the same launches held through +53 % / +83 % runs: 20 live trades
+   * −0.0017 ETH vs +0.0051 ETH replayed.
+   */
+  dumpOnExemptSells: z.boolean().default(false),
 });
 export type Preset = z.infer<typeof PresetSchema>;
 

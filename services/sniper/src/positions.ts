@@ -332,6 +332,7 @@ export class Positions {
           const h = l.transactionHash?.toLowerCase();
           if (h && p.countedOutflowTxs.has(h)) continue;
           if (h) p.countedOutflowTxs.add(h);
+          if (to === p.curve && !p.preset.dumpOnExemptSells) continue; // a team sell is a price event (backtest semantics)
           this.addOutflow(p, BigInt(l.data), to === p.curve ? 'sell(log)' : 'transfer(log)');
         }
       }
@@ -424,6 +425,7 @@ export class Positions {
         if (!p.exempt.has(owner) || p.exempt.has(to)) continue;
         if (p.countedOutflowTxs.has(tx.hash.toLowerCase())) continue; // already counted from its log
         p.countedOutflowTxs.add(tx.hash.toLowerCase());
+        if (sel === SEL_SELL && !p.preset.dumpOnExemptSells) continue; // a team sell is a price event (backtest semantics)
         this.addOutflow(p, amount, sel === SEL_SELL ? 'sell(feed)' : 'transfer(feed)');
       }
     }
