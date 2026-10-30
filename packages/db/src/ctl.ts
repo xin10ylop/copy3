@@ -162,6 +162,92 @@ export async function race(sql: Sql, days: number, out: (line: string) => void =
   for (const l of formatRace(parsed)) out(l);
 }
 
+export interface TradeRow {
+  id: number;
+  decidedAt: Date;
+  mode: string;
+  status: string;
+  symbol: string | null;
+  buyEth: number | null;
+  pnlEth: number | null;
+  exit: string | null;
+  heldSec: number | null;
+  race: { status?: string; blockOffset?: number | null; buysAhead?: number | null } | null;
+}
+
+/** `hoodctl trades [days]`: one line per trade, net return and the running total (exported for tests). */
+export function formatTrades(rows: TradeRow[]): string[] {
+  const out: string[] = [];
+  out.push('when (UTC)           mode   symbol       buy ETH   result      pnl ETH    pnl %   held   race                  cumulative');
+  let cum = 0;
+  let wins = 0;
+  let n = 0;
+  for (const r of rows) {
+    const closed = r.status === 'closed' && r.pnlEth !== null;
+    if (closed) {
+      cum += r.pnlEth!;
+      n++;
+      if (r.pnlEth! > 0) wins++;
+    }
+    const pct = closed && r.buyEth ? (r.pnlEth! / r.buyEth) * 100 : null;
+    const race = r.race
+      ? r.race.status === 'reverted' || r.race.status === 'not_mined'
+        ? r.race.status
+        : r.race.blockOffset === 0 && (r.race.buysAhead ?? 0) === 0
+          ? 'won (first in block)'
+          : r.race.blockOffset === 0
+            ? `${r.race.buysAhead} ahead`
+            : `late +${r.race.blockOffset} blocks`
+      : '-';
+    const result = closed ? (r.pnlEth! > 0 ? 'WIN' : 'loss') : r.status;
+    out.push(
+      `${r.decidedAt.toISOString().slice(0, 19).replace('T', ' ')}  ${r.mode.padEnd(5)}  ${(r.symbol ?? '?').slice(0, 11).padEnd(11)}  ${r.buyEth === null ? '-'.padStart(7) : r.buyEth.toFixed(4).padStart(7)}   ${result.padEnd(9)}  ${closed ? (r.pnlEth! >= 0 ? '+' : '') + r.pnlEth!.toFixed(5) : '-'.padStart(8)}  ${pct === null ? '-'.padStart(6) : ((pct >= 0 ? '+' : '') + pct.toFixed(1) + '%').padStart(6)}  ${r.heldSec === null ? '-'.padStart(5) : (r.heldSec.toFixed(0) + 's').padStart(5)}   ${(closed ? `${r.exit ?? '?'}, ${race}` : race).padEnd(20)}  ${closed ? (cum >= 0 ? '+' : '') + cum.toFixed(5) : ''}`,
+    );
+  }
+  out.push('');
+  out.push(`${n} closed trade(s), ${wins} win(s), net ${cum >= 0 ? '+' : ''}${cum.toFixed(5)} ETH`);
+  return out;
+}
+
+export async function trades(sql: Sql, days: number, out: (line: string) => void = console.log): Promise<void> {
+  const rows = await sql.query<{
+    id: number;
+    decided_at: Date;
+    mode: string;
+    status: string;
+    symbol: string | null;
+    quote_in: string | number | null;
+    realized_pnl_eth: number | null;
+    exit: string | null;
+    held_s: number | null;
+    race: unknown;
+  }>(
+    `select id, decided_at, mode, status,
+            decision->'launch'->'event'->>'symbol' as symbol,
+            quote_in, realized_pnl_eth,
+            sells->0->>'reason' as exit,
+            case when sells->0->>'at' is not null then (sells->0->>'at')::numeric / 1000 - extract(epoch from decided_at) end as held_s,
+            decision->'race' as race
+       from snipes
+      where decided_at >= now() - ($1 || ' days')::interval and status in ('closed', 'failed', 'aborted', 'open', 'pending')
+      order by decided_at, id`,
+    [String(days)],
+  );
+  const parsed: TradeRow[] = rows.map((r) => ({
+    id: r.id,
+    decidedAt: new Date(r.decided_at),
+    mode: r.mode,
+    status: r.status,
+    symbol: r.symbol,
+    buyEth: r.quote_in === null ? null : Number(r.quote_in) / 1e18,
+    pnlEth: r.realized_pnl_eth === null ? null : Number(r.realized_pnl_eth),
+    exit: r.exit,
+    heldSec: r.held_s === null ? null : Number(r.held_s),
+    race: r.race ? ((typeof r.race === 'string' ? JSON.parse(r.race) : r.race) as TradeRow['race']) : null,
+  }));
+  for (const l of formatTrades(parsed)) out(l);
+}
+
 /** `hoodctl keygen [n]`: n fresh keys printed once, written nowhere (exported for tests). */
 export function keygen(n: number, out: (line: string) => void = console.log): void {
   const count = Math.max(1, Math.min(20, Math.floor(n)));
@@ -193,6 +279,8 @@ async function main(sql: Sql, cmd: string, rest: string[]): Promise<void> {
       return pnl(sql, n(rest[0], 7));
     case 'race':
       return race(sql, n(rest[0], 1));
+    case 'trades':
+      return trades(sql, n(rest[0], 1));
     case 'plays': {
       const rows = await q<{ id: number; name: string; enabled: boolean; operator: string | null; stats: unknown }>(
         `select p.id, p.name, p.enabled, o.name as operator, p.stats from plays p left join operators o on o.id = p.operator_id order by p.id`,

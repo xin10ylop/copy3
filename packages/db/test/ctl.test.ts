@@ -1,6 +1,6 @@
 /** hoodctl (packages/db/src/ctl.ts): importing it has no side effects; `status` reads the kill switch like the sniper does. */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { formatRace, keygen, killSwitchOn, race, status } from '../src/ctl.js';
+import { formatRace, formatTrades, keygen, killSwitchOn, race, status } from '../src/ctl.js';
 import { insertSnipe, setSetting } from '../src/helpers.js';
 import { makeTestDb, reset, type TestDb } from './pglite.js';
 
@@ -102,5 +102,20 @@ describe('hoodctl keygen', () => {
     expect(keys[0]).not.toBe(keys[1]);
     expect(lines.filter((l) => /^# key \d: address 0x[0-9a-fA-F]{40}$/.test(l))).toHaveLength(2);
     expect(lines.join('\n')).toMatch(/written nowhere/);
+  });
+});
+
+describe('hoodctl trades: one line per trade with the running total', () => {
+  it('shows result, pnl, %, held time, race outcome and the cumulative net', () => {
+    const t0 = new Date('2026-10-30T13:01:59Z');
+    const lines = formatTrades([
+      { id: 1, decidedAt: t0, mode: 'live', status: 'closed', symbol: 'HOOK404', buyEth: 0.003, pnlEth: -0.00056, exit: 'exempt_dump', heldSec: 90.7, race: { status: 'mined', blockOffset: 0, buysAhead: 0 } },
+      { id: 2, decidedAt: new Date(t0.getTime() + 60_000), mode: 'live', status: 'closed', symbol: 'GLADE', buyEth: 0.002, pnlEth: 0.00016, exit: 'trailing', heldSec: 4.1, race: { status: 'mined', blockOffset: 9, buysAhead: 0 } },
+      { id: 3, decidedAt: new Date(t0.getTime() + 120_000), mode: 'live', status: 'failed', symbol: 'X', buyEth: 0.003, pnlEth: null, exit: null, heldSec: null, race: { status: 'reverted' } },
+    ]);
+    expect(lines[1]).toMatch(/HOOK404.*0\.0030.*loss.*-0\.00056.*-18\.7%.*91s.*exempt_dump, won \(first in block\).*-0\.00056/);
+    expect(lines[2]).toMatch(/GLADE.*WIN.*\+0\.00016.*\+8\.0%.*4s.*trailing, late \+9 blocks.*-0\.00040/);
+    expect(lines[3]).toMatch(/failed.*reverted/);
+    expect(lines[lines.length - 1]).toBe('2 closed trade(s), 1 win(s), net -0.00040 ETH');
   });
 });
