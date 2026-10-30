@@ -85,8 +85,17 @@ export class Risk {
     this.settings = s;
   }
 
-  seed(stats: { countsByPlay: Record<number, number>; realizedPnlSince: number; tokens: string[]; playDeployers: { playId: number; deployer: string }[] }): void {
+  seed(stats: {
+    countsByPlay: Record<number, number>;
+    realizedPnlSince: number;
+    tokens: string[];
+    playDeployers: { playId: number; deployer: string }[];
+    recentLosses?: { closedAt: Date; exemptions: string[] }[];
+  }): void {
     for (const [k, v] of Object.entries(stats.countsByPlay)) this.countsByPlay.set(Number(k), v);
+    // the team cool-off survives a restart (30 Oct 2026: three restarts in ten minutes forgot four
+    // losses on one team; its fifth relaunch was bought and lost 39 %)
+    for (const l of stats.recentLosses ?? []) for (const w of l.exemptions) this.teamLossAt.set(w.toLowerCase(), Math.max(this.teamLossAt.get(w.toLowerCase()) ?? 0, l.closedAt.getTime()));
     this.realizedTodayEth = stats.realizedPnlSince;
     for (const t of stats.tokens) this.tokens.add(t.toLowerCase());
     for (const pd of stats.playDeployers) this.playDeployers.add(`${pd.playId}:${pd.deployer.toLowerCase()}`);

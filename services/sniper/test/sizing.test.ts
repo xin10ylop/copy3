@@ -155,3 +155,14 @@ describe('Risk: team cool-off after a loss', () => {
     expect(r.preCheck(decision, launch(['0xteam00000000000000000000000000000000bb']), 2_000_000 + 1000).reasons).toEqual([]);
   });
 });
+
+describe('Risk: the team cool-off survives a restart', () => {
+  it('seeds recent losses from the store so a relaunch right after a restart is still skipped', () => {
+    const r = new Risk({ mode: 'live', maxConcurrent: 3, maxGasPriceGwei: 1, dailyLossLimitEth: 1, teamCoolOffMin: 5 });
+    const now = Date.now();
+    r.seed({ countsByPlay: {}, realizedPnlSince: 0, tokens: [], playDeployers: [], recentLosses: [{ closedAt: new Date(now - 90_000), exemptions: ['0xdeployer000000000000000000000000000000dd', '0xTEAM00000000000000000000000000000000CC'] }] });
+    const decision = { play: { id: 1 }, preset: { stopAfter: 1000, firstBuyOnly: false, maxFeeGwei: 1, buyEth: 0.002 } } as unknown as Parameters<Risk['preCheck']>[0];
+    const launch = { event: { deployer: '0xdeployer000000000000000000000000000000ee', exemptions: ['0xteam00000000000000000000000000000000cc'] } } as unknown as Parameters<Risk['preCheck']>[1];
+    expect(r.preCheck(decision, launch, now).reasons.join()).toMatch(/team cool-off: 0xteam0000.*cc lost 90 s ago/);
+  });
+});

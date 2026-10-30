@@ -125,8 +125,17 @@ export class PgStore implements SniperStore {
        WHERE mode = $1 AND play_id IS NOT NULL AND (status IN ('open','closed') OR decision->>'confirmed' = 'true')`,
       [mode],
     );
+    const losses = await this.sql.query<{ closed_at: Date; exemptions: unknown }>(
+      `SELECT closed_at, decision->'launch'->'event'->'exemptions' AS exemptions FROM snipes
+       WHERE mode = $1 AND status = 'closed' AND realized_pnl_eth < 0 AND closed_at >= now() - interval '1 hour'`,
+      [mode],
+    );
     return {
       countsByPlay: Object.fromEntries(counts.map((c) => [c.play_id, Number(c.n)])),
+      recentLosses: losses.map((r) => {
+        const ex = typeof r.exemptions === 'string' ? (JSON.parse(r.exemptions) as unknown) : r.exemptions;
+        return { closedAt: new Date(r.closed_at), exemptions: Array.isArray(ex) ? ex.map((e) => String(e).toLowerCase()) : [] };
+      }),
       openCount: Number(open[0]?.n ?? 0),
       realizedPnlSince: Number(pnl[0]?.s ?? 0),
       realizedPnlTotal: Number(total[0]?.s ?? 0),
