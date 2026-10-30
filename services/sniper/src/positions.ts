@@ -327,7 +327,11 @@ export class Positions {
         const from = `0x${(l.topics[1] ?? '').slice(26)}`.toLowerCase();
         const to = `0x${(l.topics[2] ?? '').slice(26)}`.toLowerCase();
         if (p.exempt.has(from) && !p.exempt.has(to)) {
-          if (l.transactionHash && p.countedOutflowTxs.has(l.transactionHash.toLowerCase())) continue;
+          // one outflow per tx, whichever source shows it first (the feed tx and the node log of
+          // the same sell both arrive; counting both doubled exemptOutflowPct live on 30 Oct 2026)
+          const h = l.transactionHash?.toLowerCase();
+          if (h && p.countedOutflowTxs.has(h)) continue;
+          if (h) p.countedOutflowTxs.add(h);
           this.addOutflow(p, BigInt(l.data), to === p.curve ? 'sell(log)' : 'transfer(log)');
         }
       }
@@ -418,6 +422,7 @@ export class Positions {
           amount = args[2] as bigint;
         } else continue;
         if (!p.exempt.has(owner) || p.exempt.has(to)) continue;
+        if (p.countedOutflowTxs.has(tx.hash.toLowerCase())) continue; // already counted from its log
         p.countedOutflowTxs.add(tx.hash.toLowerCase());
         this.addOutflow(p, amount, sel === SEL_SELL ? 'sell(feed)' : 'transfer(feed)');
       }

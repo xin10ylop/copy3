@@ -1,5 +1,5 @@
 import { TOPICS, decodedTxFromRpc, parsePreset, quoteSell, type Preset, type Reserves } from '@hood/core';
-import { encodeFunctionData, parseAbi, parseEther, type Address } from 'viem';
+import { encodeFunctionData, parseAbi, parseEther, type Address, type Hex } from 'viem';
 import { describe, expect, it } from 'vitest';
 import type { ExecutionBackend, ExitOrder, ExitResult } from '../src/executor.js';
 import { silentLogger } from '../src/log.js';
@@ -162,6 +162,24 @@ describe('Positions manager', () => {
     expect(be.exits[0]).toMatchObject({ reason: 'exempt_dump', tokensIn: 25_000_000n * 10n ** 18n, token: LAUNCH.token, curve: LAUNCH.curve });
     expect(closed).toBe(1);
     expect(p.open).toHaveLength(0);
+  });
+
+  it('an exempt sell seen as a node log and then as the same feed tx is counted once (no doubled outflow pct)', async () => {
+    const chain = new FakeChain();
+    const be = new RecordingBackend();
+    const p = new Positions({ backend: be, chain, logger: silentLogger, now: () => 0 });
+    const { run } = openRun(p, { exitIfExemptSellsPct: 1000, takeProfits: [{ pct: 1000, sellPct: 100 }] }); // high threshold: observe the pct, no exit
+    const pos = p.get(run.key)!;
+    const amount = 10n ** 24n;
+    const hash = `0x${'99'.repeat(32)}` as Hex;
+    p.onLog(transferLog({ token: LAUNCH.token, from: LAUNCH.deployer, to: LAUNCH.curve, value: amount, block: LAUNCH.block + 60, txHash: hash, logIndex: 0 }));
+    const afterLog = pos.state.exemptOutflowPct;
+    expect(afterLog).toBeGreaterThan(0);
+    const data = encodeFunctionData({ abi: parseAbi(['function sell(uint256,uint256,address) returns (uint256)']), functionName: 'sell', args: [amount, 0n, LAUNCH.deployer] });
+    const tx = decodedTxFromRpc({ ...launchFixture.tx, hash, from: LAUNCH.deployer, to: LAUNCH.curve, input: data, value: 0n });
+    await p.onFeedBlock(emptyBlock(LAUNCH.block + 60, LAUNCH.ts + 6, 0, [tx]));
+    expect(pos.state.exemptOutflowPct).toBe(afterLog);
+    expect(be.exits).toHaveLength(0);
   });
 
   it('exits on an exempt `transfer` call seen in the feed (before the log arrives) and retries failed exits', async () => {
