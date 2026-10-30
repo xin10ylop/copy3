@@ -46,7 +46,9 @@ function harness(presetOver: Record<string, unknown>, opts: { receipt?: boolean 
   const store = new MemoryStore({ plays: [play({ id: 9, name: 'shib-dev', trigger: { deployerIn: [LAUNCH.deployer] }, preset: presetOver })] });
   const chain = new FakeChain();
   chain.latest.set(LAUNCH.curve, INITIAL);
-  chain.atBlock = (_c, b) => (b > LAUNCH.block + 8 ? undefined : b >= LAUNCH.block + 5 ? afterTeam() : INITIAL); // post-fill blocks: unknown → exits price on the book
+  // post-fill blocks: the fake chain's state IS the position book the replayed trades maintain
+  // (deterministic: no retry race between an exit and the next replayed trade)
+  chain.atBlock = (_c, b) => (b > LAUNCH.block + 8 ? (sniper.positions.book(LAUNCH.curve) ?? undefined) : b >= LAUNCH.block + 5 ? afterTeam() : INITIAL);
   chain.strictBlocks = true;
   if (opts.receipt !== false) {
     chain.receipts.set(LAUNCH.txHash, launchReceipt());
