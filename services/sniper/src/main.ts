@@ -129,6 +129,7 @@ async function main(): Promise<void> {
     maxGasPriceGwei: cfg.MAX_GAS_PRICE_GWEI,
     deadlineBlocks: cfg.DEADLINE_BLOCKS,
     repriceLeadMs: cfg.REPRICE_LEAD_MS,
+    teamCoolOffMin: cfg.TEAM_COOLOFF_MIN,
     addressTimeoutMs: cfg.ADDRESS_TIMEOUT_MS,
     receiptPollMs: cfg.RECEIPT_POLL_MS,
     reservesPollMs: cfg.RESERVES_POLL_MS,

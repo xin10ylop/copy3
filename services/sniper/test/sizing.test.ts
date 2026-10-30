@@ -138,3 +138,20 @@ describe('daily loss limit as a share of the bankroll', () => {
     expect(() => loadConfig({ DAILY_LOSS_LIMIT_PCT: '0' })).toThrow();
   });
 });
+
+describe('Risk: team cool-off after a loss', () => {
+  const launch = (exempt: string[]) =>
+    ({ event: { deployer: '0xdeployer000000000000000000000000000000dd', exemptions: exempt } }) as unknown as Parameters<Risk['preCheck']>[1];
+  const decision = { play: { id: 1 }, preset: { stopAfter: 1000, firstBuyOnly: false, maxFeeGwei: 1, buyEth: 0.002 } } as unknown as Parameters<Risk['preCheck']>[0];
+  it("skips a launch whose team wallet lost within the window; the deployer alone does not count; off after the window", () => {
+    const r = new Risk({ mode: 'live', maxConcurrent: 3, maxGasPriceGwei: 1, dailyLossLimitEth: 1, teamCoolOffMin: 5 });
+    const team = ['0xdeployer000000000000000000000000000000dd', '0xTEAM00000000000000000000000000000000AA'];
+    r.onPositionClosed(-0.0006, true, team, 1_000_000);
+    expect(r.preCheck(decision, launch(['0xteam00000000000000000000000000000000aa']), 1_000_000 + 60_000).reasons.join()).toMatch(/team cool-off: 0xteam0000.* lost 60 s ago \(cool-off 5 min\)/);
+    expect(r.preCheck(decision, launch(['0xdeployer000000000000000000000000000000dd']), 1_000_000 + 60_000).reasons).toEqual([]); // fresh deployer, no team overlap
+    expect(r.preCheck(decision, launch(['0xteam00000000000000000000000000000000aa']), 1_000_000 + 5 * 60_000 + 1).reasons).toEqual([]);
+    // a win does not start a cool-off
+    r.onPositionClosed(+0.001, true, ['0xteam00000000000000000000000000000000bb'], 2_000_000);
+    expect(r.preCheck(decision, launch(['0xteam00000000000000000000000000000000bb']), 2_000_000 + 1000).reasons).toEqual([]);
+  });
+});

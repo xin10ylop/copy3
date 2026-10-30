@@ -395,3 +395,12 @@ non-curve wallet, the live bot also exited on any exempt curve SELL (a partial t
 after launch, after which the token ran +53 % / +83 %). `Preset.dumpOnExemptSells` (default
 false) restores the backtest's definition; sells are price events for the stop / trailing.
 Tests: `positions.test.ts` "a team wallet's curve SELL is a price event".
+
+### K-1 — serial relaunches by one team (fixed: TEAM_COOLOFF_MIN)
+
+30 Oct 2026, 20:56–21:01 UTC: one operator relaunched "TUSK" four times in five minutes; the bot
+bought each (first in block every time), each closed −30 to −39 % on the 60 s timeout. After a
+position closes at a loss, launches whose team wallets overlap it are skipped for
+`TEAM_COOLOFF_MIN` (default 5). Backtest, 30 days, team ≥ 0.05 & 2+ wallets: 5 min → +24.73 ETH
+vs +23.64 (297 skipped trades worth −1.10); 15 min → +24.02; ≥ 30 min loses money. Test:
+`sizing.test.ts` "Risk: team cool-off after a loss".

@@ -95,6 +95,8 @@ export interface SniperOptions {
    * SlippageExceeded at +1 s on two launches of one operator (30 Oct 2026).
    */
   repriceLeadMs?: number;
+  /** skip a team's launches for this many minutes after one of them closed at a loss (0 = off); see Risk */
+  teamCoolOffMin?: number;
   /** max wait for getReserves when start reserves are known. Default 5 ms. */
   reservesWaitMs?: number;
   /** live: the PonsSniper contract (chain-truth reconciliation, H3/H4) */
@@ -219,6 +221,7 @@ export class Sniper {
       dailyLossLimitEth: o.dailyLossLimitEth ?? (o.dailyLossLimitPct === undefined ? 0.5 : undefined),
       dailyLossLimitPct: o.dailyLossLimitPct,
       maxGasPriceGwei: o.maxGasPriceGwei ?? 1,
+      teamCoolOffMin: o.teamCoolOffMin ?? 0,
     });
     this.paperBank = o.mode === 'paper' ? new PaperBankroll(parseEther(String(o.paperBankrollEth ?? 0.1))) : null;
     const pl = o.paperLimits ?? DEFAULT_PAPER_LIMITS;
@@ -248,7 +251,7 @@ export class Sniper {
         p.run.ended = true;
         this.counters.closed!++;
         // R4-1: an adopted orphan holds no MAX_CONCURRENT slot and its PnL is not daily-loss PnL
-        this.risk.onPositionClosed(p.run.orphan ? 0 : pnl, p.run.slot !== false);
+        this.risk.onPositionClosed(p.run.orphan ? 0 : pnl, p.run.slot !== false, p.exempt);
         this.paperBank?.close(p.key, pnl);
         this.runs.delete(p.key);
         this.recorder.snipe(p.run, p, 'snipe_closed');

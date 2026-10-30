@@ -72,6 +72,8 @@ export const ConfigSchema = z
     DEADLINE_BLOCKS: num(20),
     /** re-price minTokensOut this many ms before the first send (0 = off); see Sniper.repriceLeadMs */
     REPRICE_LEAD_MS: num(250),
+    /** skip a team's launches this many minutes after one of them lost (0 = off); see Risk.teamCoolOffMin */
+    TEAM_COOLOFF_MIN: num(5),
     HEALTH_PORT: num(8081),
     LOG_LEVEL: z.string().default('info'),
     /** none (wait for TokenLaunched/receipt) | nonce (CREATE prediction; Pons V2 uses CREATE2 → wrong) */

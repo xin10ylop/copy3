@@ -34,6 +34,14 @@ export interface RiskOptions {
   dailyLossLimitPct?: number | undefined;
   maxGasPriceGwei: number;
   mode: 'live' | 'paper';
+  /**
+   * After a position closes at a loss, skip launches whose team (exempt wallets other than the
+   * deployer) overlaps that position's team for this many minutes. 0 = off. Backtest, 30 days,
+   * team ≥ 0.05 & 2+ wallets, first in block: 5 min → +24.73 ETH vs +23.64 (297 skipped trades
+   * worth −1.10); 15 min → +24.02; 30 min and beyond lose money. Live, 30 Oct 2026 20:56–21:01
+   * UTC: one operator relaunched "TUSK" four times in five minutes, each bought, each −30 to −39 %.
+   */
+  teamCoolOffMin?: number;
 }
 
 /** Percentage mode before any bankroll figure is known. */
@@ -163,6 +171,8 @@ export class Risk {
     if (this.gasPriceWei !== null && Number(this.gasPriceWei) / 1e9 > this.opts.maxGasPriceGwei)
       reasons.push(`gas price ${Number(this.gasPriceWei) / 1e9} gwei > cap ${this.opts.maxGasPriceGwei}`);
     if (p.buyEth <= 0) reasons.push('buyEth must be > 0');
+    const cool = this.teamCoolOff(l.event.exemptions, l.event.deployer, now);
+    if (cool) reasons.push(`team cool-off: ${cool}`);
     return { ok: reasons.length === 0, reasons };
   }
 
@@ -250,9 +260,29 @@ export class Risk {
   }
 
   /** A position closed: free its slot and book its PnL toward this mode's daily loss (paper too). */
-  onPositionClosed(pnlEth: number, heldSlot = true): void {
+  onPositionClosed(pnlEth: number, heldSlot = true, team: Iterable<string> = [], now = Date.now()): void {
     this.rollDay();
     if (heldSlot) this.openCount = Math.max(0, this.openCount - 1);
     this.realizedTodayEth += pnlEth;
+    if (pnlEth < 0 && (this.opts.teamCoolOffMin ?? 0) > 0) {
+      for (const w of team) this.teamLossAt.set(w.toLowerCase(), now);
+      if (this.teamLossAt.size > 5000) for (const k of [...this.teamLossAt.keys()].slice(0, 1000)) this.teamLossAt.delete(k);
+    }
+  }
+
+  /** wallet → when a position with that wallet in its team last closed at a loss */
+  private readonly teamLossAt = new Map<string, number>();
+
+  /** The team wallets (exempt set minus the deployer) that closed at a loss within the cool-off. */
+  teamCoolOff(exemptions: readonly string[], deployer: string, now = Date.now()): string | null {
+    const min = this.opts.teamCoolOffMin ?? 0;
+    if (min <= 0) return null;
+    for (const w of exemptions) {
+      const k = w.toLowerCase();
+      if (k === deployer.toLowerCase()) continue;
+      const at = this.teamLossAt.get(k);
+      if (at !== undefined && now - at <= min * 60_000) return `${k} lost ${Math.round((now - at) / 1000)} s ago (cool-off ${min} min)`;
+    }
+    return null;
   }
 }
