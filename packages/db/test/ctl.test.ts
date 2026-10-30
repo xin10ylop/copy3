@@ -112,10 +112,17 @@ describe('hoodctl trades: one line per trade with the running total', () => {
       { id: 1, decidedAt: t0, mode: 'live', status: 'closed', symbol: 'HOOK404', buyEth: 0.003, pnlEth: -0.00056, exit: 'exempt_dump', heldSec: 90.7, race: { status: 'mined', blockOffset: 0, buysAhead: 0 } },
       { id: 2, decidedAt: new Date(t0.getTime() + 60_000), mode: 'live', status: 'closed', symbol: 'GLADE', buyEth: 0.002, pnlEth: 0.00016, exit: 'trailing', heldSec: 4.1, race: { status: 'mined', blockOffset: 9, buysAhead: 0 } },
       { id: 3, decidedAt: new Date(t0.getTime() + 120_000), mode: 'live', status: 'failed', symbol: 'X', buyEth: 0.003, pnlEth: null, exit: null, heldSec: null, race: { status: 'reverted' } },
+      { id: 4, decidedAt: new Date(t0.getTime() + 180_000), mode: 'live', status: 'aborted', symbol: 'Hype', buyEth: 0.002, pnlEth: null, exit: null, heldSec: null, race: null, notes: 'planned 0.002; aborted: launch rejected: team cool-off: 0x01d2 lost 2 min ago' },
+      { id: 5, decidedAt: new Date(t0.getTime() + 240_000), mode: 'live', status: 'closed', symbol: 'APPLE', buyEth: 0.002, pnlEth: -0.00063, exit: 'stop_loss', heldSec: 58, race: { status: 'mined', blockOffset: 0, buysAhead: 0 }, notes: 'exit stop_loss at -32.1% (peak +29.6%, held 57.9s, snapshot block 5 +16 logs, last block 6)' },
     ]);
     expect(lines[1]).toMatch(/HOOK404.*0\.0030.*loss.*-0\.00056.*-18\.7%.*91s.*exempt_dump, won \(first in block\).*-0\.00056/);
     expect(lines[2]).toMatch(/GLADE.*WIN.*\+0\.00016.*\+8\.0%.*4s.*trailing, late \+9 blocks.*-0\.00040/);
     expect(lines[3]).toMatch(/failed.*reverted/);
-    expect(lines[lines.length - 1]).toBe('2 closed trade(s), 1 win(s), net -0.00040 ETH');
+    // the note that explains a row sits under it: the abort reason, or the exit-signal reading
+    expect(lines[4]).toMatch(/Hype.*aborted/);
+    expect(lines[5]).toBe(`${' '.repeat(28)}└ aborted: launch rejected: team cool-off: 0x01d2 lost 2 min ago`);
+    expect(lines[6]).toMatch(/APPLE.*loss.*-0\.00063.*stop_loss, won \(first in block\)/);
+    expect(lines[7]).toMatch(/└ exit stop_loss at -32\.1% \(peak \+29\.6%/);
+    expect(lines[lines.length - 1]).toBe('3 closed trade(s), 1 win(s), net -0.00103 ETH');
   });
 });

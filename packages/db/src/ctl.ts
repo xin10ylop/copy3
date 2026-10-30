@@ -173,6 +173,16 @@ export interface TradeRow {
   exit: string | null;
   heldSec: number | null;
   race: { status?: string; blockOffset?: number | null; buysAhead?: number | null } | null;
+  /** run notes (abort reason, exit signal reading, …); shown as a second line */
+  notes?: string | null;
+}
+
+/** The note that explains a row: the abort reason for aborted runs, the exit-signal reading for closed ones. */
+function whyOf(r: TradeRow): string | null {
+  if (!r.notes) return null;
+  const parts = r.notes.split('; ').map((x) => x.trim()).filter(Boolean);
+  if (r.status === 'closed') return parts.find((x) => x.startsWith('exit ')) ?? null;
+  return parts.filter((x) => !x.startsWith('exit ')).slice(-1)[0] ?? null;
 }
 
 /** `hoodctl trades [days]`: one line per trade, net return and the running total (exported for tests). */
@@ -203,6 +213,8 @@ export function formatTrades(rows: TradeRow[]): string[] {
     out.push(
       `${r.decidedAt.toISOString().slice(0, 19).replace('T', ' ')}  ${r.mode.padEnd(5)}  ${(r.symbol ?? '?').slice(0, 11).padEnd(11)}  ${r.buyEth === null ? '-'.padStart(7) : r.buyEth.toFixed(4).padStart(7)}   ${result.padEnd(9)}  ${closed ? (r.pnlEth! >= 0 ? '+' : '') + r.pnlEth!.toFixed(5) : '-'.padStart(8)}  ${pct === null ? '-'.padStart(6) : ((pct >= 0 ? '+' : '') + pct.toFixed(1) + '%').padStart(6)}  ${r.heldSec === null ? '-'.padStart(5) : (r.heldSec.toFixed(0) + 's').padStart(5)}   ${(closed ? `${r.exit ?? '?'}, ${race}` : race).padEnd(20)}  ${closed ? (cum >= 0 ? '+' : '') + cum.toFixed(5) : ''}`,
     );
+    const why = whyOf(r);
+    if (why) out.push(`${' '.repeat(28)}└ ${why.slice(0, 150)}`);
   }
   out.push('');
   out.push(`${n} closed trade(s), ${wins} win(s), net ${cum >= 0 ? '+' : ''}${cum.toFixed(5)} ETH`);
@@ -221,8 +233,9 @@ export async function trades(sql: Sql, days: number, out: (line: string) => void
     exit: string | null;
     held_s: number | null;
     race: unknown;
+    notes: string | null;
   }>(
-    `select id, decided_at, mode, status,
+    `select id, decided_at, mode, status, notes,
             decision->'launch'->'event'->>'symbol' as symbol,
             quote_in, realized_pnl_eth,
             sells->0->>'reason' as exit,
@@ -244,6 +257,7 @@ export async function trades(sql: Sql, days: number, out: (line: string) => void
     exit: r.exit,
     heldSec: r.held_s === null ? null : Number(r.held_s),
     race: r.race ? ((typeof r.race === 'string' ? JSON.parse(r.race) : r.race) as TradeRow['race']) : null,
+    notes: r.notes,
   }));
   for (const l of formatTrades(parsed)) out(l);
 }
