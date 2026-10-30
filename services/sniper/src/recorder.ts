@@ -113,11 +113,25 @@ export class Recorder {
     await Promise.all(this.chains.values());
   }
 
+  /**
+   * What an UPDATE may write. A writer that does not hold the position must not touch the
+   * position's columns: the race measurement (which can finish after the position closed —
+   * 30 Oct 2026: two closed rows lost their sells and PnL) only owns decision + notes, and any
+   * other position-less update of a filled run keeps the row's sells / realizedPnlEth / closedAt.
+   */
+  static patchFor(run: SnipeRun, p: PositionEntry | undefined, type: string, full: SnipeRecord): Partial<SnipeRecord> {
+    if (type === 'race') return { decision: full.decision, notes: full.notes };
+    if (p || !run.fill) return full;
+    const { sells: _s, realizedPnlEth: _r, closedAt: _c, ...rest } = full;
+    return rest;
+  }
+
   /** Insert on first call, update afterwards (serialised per run). */
   snipe(run: SnipeRun, p?: PositionEntry, type = 'snipe_update'): void {
     // N7: a run that already has a row (its binding dropped after it ended) is updated, never re-inserted
     const prev = this.chains.get(run.key) ?? Promise.resolve<number | null>(run.id > 0 ? run.id : null);
     const rec = snipeRecord(run, p);
+    const patch = Recorder.patchFor(run, p, type, rec);
     const next = prev.then(async (id) => {
       try {
         if (id === null) {
@@ -127,7 +141,7 @@ export class Recorder {
           await this.notify({ id: newId, type, status: run.status, playId: run.playId, token: rec.token, mode: run.mode, ...(p ? { phase: p.phase } : {}) });
           return newId;
         }
-        await this.store.updateSnipe(id, rec);
+        await this.store.updateSnipe(id, patch);
         this.stats.writes++;
         await this.notify({ id, type, status: run.status, playId: run.playId, token: rec.token, mode: run.mode, ...(p ? { phase: p.phase } : {}) });
         return id;
@@ -157,7 +171,7 @@ export class Recorder {
       return;
     }
     if (run.id <= 0) return; // never written: nothing to update
-    const rec = snipeRecord(run, p);
+    const rec = Recorder.patchFor(run, p, type, snipeRecord(run, p));
     this.store.updateSnipe(run.id, rec).then(
       () => {
         this.stats.writes++;
