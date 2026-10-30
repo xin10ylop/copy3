@@ -242,6 +242,13 @@ export class Sniper {
       ...(o.exitBackoffMs !== undefined ? { exitBackoffMs: o.exitBackoffMs } : {}),
       ...(o.maxExitBackoffMs !== undefined ? { maxExitBackoffMs: o.maxExitBackoffMs } : {}),
       ...(o.stuckRearmMs !== undefined ? { stuckRearmMs: o.stuckRearmMs } : {}),
+      onExitSignal: (p, s, r) => {
+        // the trigger reading, in the log and on the run (hoodctl trades shows the notes)
+        o.logger.info({ key: p.key, token: p.token, reason: s.reason, ...r }, 'exit signal');
+        p.run.notes.push(
+          `exit ${s.reason} at ${r.pnlPct.toFixed(1)}% (peak ${r.peakPnlPct.toFixed(1)}%, held ${(r.heldMs / 1000).toFixed(1)}s, snapshot block ${r.snapshotBlock} +${r.deltas} logs, last block ${r.lastBlock ?? '?'})`,
+        );
+      },
       onSale: (p, s) => {
         this.recorder.snipe(p.run, p, 'snipe_sell');
         o.logger.info({ key: p.key, reason: s.reason, tokensIn: s.tokensIn.toString(), quoteOut: s.quoteOut.toString(), estimated: s.estimated }, 'sold');

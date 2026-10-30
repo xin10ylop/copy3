@@ -412,6 +412,40 @@ describe('M5: reserves at an explicit block, logs at or below it ignored', () =>
   });
 });
 
+describe('exit signal audit (30 Oct 2026: a stop_loss closed at −31 % realised, trigger reading unknown)', () => {
+  it('onExitSignal reports the reading the stop loss fired on: pnl %, peak, reserves, snapshot block, deltas, last block', async () => {
+    const chain = new FakeChain();
+    const be = new RecordingBackend();
+    const seen: { reason: string; read: Record<string, unknown> }[] = [];
+    const p = new Positions({ backend: be, chain, logger: silentLogger, now: () => 5000, onExitSignal: (_p, s, r) => seen.push({ reason: s.reason, read: { ...r } }) });
+    const pl = play({ id: 1, trigger: { deployerIn: [LAUNCH.deployer] }, preset: { stopLossPct: 40, trailing: null, timeoutSec: 3600 } });
+    const r0 = { quote: 2_048_780_487_804_878_047n, token: 820_000_000n * 10n ** 18n };
+    const { run } = openRun(p, {}, { preset: pl.preset, reserves: r0, reservesBlock: 100 });
+    const pos = p.get(run.key)!;
+    // two sells at block 101 take the mark past −40 %: the second one fires the stop
+    const sellTokens = 110_000_000n * 10n ** 18n;
+    let r = r0;
+    for (const [i, hash] of (['0x5e11', '0x5e12'] as const).entries()) {
+      const gross = (r.quote * sellTokens) / (r.token + sellTokens);
+      p.onLog(curveTradeLog({ curve: LAUNCH.curve, side: 'sell', trader: LAUNCH.deployer, recipient: LAUNCH.deployer, quote: gross - gross / 100n, tokens: sellTokens, fee: gross / 100n, tax: 0n, block: 101, txHash: hash, logIndex: i }));
+      r = { quote: r.quote - gross, token: r.token + sellTokens };
+    }
+    await flush();
+    expect(be.exits).toHaveLength(1);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.reason).toBe('stop_loss');
+    const read = seen[0]!.read;
+    expect(read.pnlPct as number).toBeLessThanOrEqual(-40);
+    expect(read.pnlPct).toBe(pos.lastPnlPct);
+    expect(read.entryPrice).toBe(pos.state.entryPrice);
+    expect(read.reserves).toEqual({ quote: r.quote.toString(), token: r.token.toString() });
+    expect(read.snapshotBlock).toBe(100);
+    expect(read.deltas).toBe(2);
+    expect(read.lastBlock).toBe(101);
+    expect(read.heldMs).toBe(5000 - pos.state.openedAtMs);
+  });
+});
+
 describe('L1: zero-size take-profit levels', () => {
   it('a level whose share rounds to 0 tokens is consumed without an order; the next level still fires', () => {
     const s = newPositionState(E, 3n, 0);

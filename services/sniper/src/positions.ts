@@ -50,6 +50,24 @@ const GRADUATED_RE = /AlreadyGraduated|0xe6a0d45f/i;
 /** paper-only synthetic deltas (our simulated sales) are never contained in a chain snapshot */
 const NEVER_PRUNED = Number.MAX_SAFE_INTEGER;
 
+/** The book's state when an exit signal fired (30 Oct 2026: a stop_loss closed at −31 % realised, trigger reading unknown). */
+export interface ExitReading {
+  /** sell value vs cost at the trigger, % (what the stop loss / trailing compare) */
+  pnlPct: number;
+  /** peak of that figure so far, % */
+  peakPnlPct: number;
+  /** sell-value per token (quoteSell over the whole holding / tokens) and the entry price */
+  mark: number | null;
+  entryPrice: number;
+  reserves: { quote: string; token: string } | null;
+  /** block of the reserves snapshot and how many log deltas sit on top of it */
+  snapshotBlock: number;
+  deltas: number;
+  /** latest block seen from any source */
+  lastBlock: number | null;
+  heldMs: number;
+}
+
 export interface SaleRecord {
   reason: string;
   tokensIn: bigint;
@@ -146,6 +164,8 @@ export interface PositionsOptions {
   /** `recheck` re-arms a stuck position that still holds tokens this long after it got stuck. Default 300 000 ms. */
   stuckRearmMs?: number;
   onSale?: (p: PositionEntry, s: SaleRecord) => void;
+  /** An exit signal fired: what the book read at that moment (audit of stop-loss / trailing triggers). */
+  onExitSignal?: (p: PositionEntry, s: ExitSignal, read: ExitReading) => void;
   onClosed?: (p: PositionEntry, pnlEth: number) => void;
   onExitFailed?: (p: PositionEntry, err: string) => void;
   onAlert?: (p: PositionEntry, type: PositionAlert, detail: Record<string, unknown>) => void;
@@ -478,6 +498,17 @@ export class Positions {
     if (!sig || sig.sellTokens <= 0n) return; // L1: never send a zero-size order
     if (now < p.nextExitAt) return; // backoff after a failed round (H4)
     p.exiting = true;
+    this.o.onExitSignal?.(p, sig, {
+      pnlPct: sig.pnlPct,
+      peakPnlPct: p.state.peakPnlPct,
+      mark,
+      entryPrice: p.state.entryPrice,
+      reserves: p.reserves ? { quote: p.reserves.quote.toString(), token: p.reserves.token.toString() } : null,
+      snapshotBlock: p.book.baseBlock,
+      deltas: [...p.book.deltas.values()].filter((d) => d.block > p.book.baseBlock).length,
+      lastBlock: this.lastFeedBlock,
+      heldMs: now - p.state.openedAtMs,
+    });
     void this.exit(p, sig).catch((e: unknown) => {
       p.exiting = false;
       p.lastError = (e as Error).message;
