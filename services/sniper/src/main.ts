@@ -128,6 +128,7 @@ async function main(): Promise<void> {
     paperBankrollEth: cfg.PAPER_BANKROLL_ETH,
     maxGasPriceGwei: cfg.MAX_GAS_PRICE_GWEI,
     deadlineBlocks: cfg.DEADLINE_BLOCKS,
+    repriceLeadMs: cfg.REPRICE_LEAD_MS,
     addressTimeoutMs: cfg.ADDRESS_TIMEOUT_MS,
     receiptPollMs: cfg.RECEIPT_POLL_MS,
     reservesPollMs: cfg.RESERVES_POLL_MS,

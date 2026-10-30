@@ -86,6 +86,14 @@ export interface SniperOptions {
   nonce?: () => number | null;
   /** start reserves per launchConfigId (default: config 0 = 1.68 ETH virtual quote / 1e27 tokens) */
   launchReserves?: Readonly<Record<string, Reserves>>;
+  /**
+   * Re-price minTokensOut this many ms before the first send, from the launch-second buys
+   * confirmed since the decision (ledger) and a fresh `getReserves` (sequencer RPC). 0 = off.
+   * Team buys made through helper contracts are invisible to the feed and their CurveBuy logs
+   * reach the node ws a few hundred ms after the decision; a bound priced without them reverted
+   * SlippageExceeded at +1 s on two launches of one operator (30 Oct 2026).
+   */
+  repriceLeadMs?: number;
   /** max wait for getReserves when start reserves are known. Default 5 ms. */
   reservesWaitMs?: number;
   /** live: the PonsSniper contract (chain-truth reconciliation, H3/H4) */
@@ -980,6 +988,19 @@ export class Sniper {
     return run;
   }
 
+  /**
+   * The most advanced view of the curve right before the burst: the ledger's confirmed
+   * launch-second buys applied to the launch reserves, or a fresh 'latest' read (≤ 25 ms, the
+   * fast endpoints), whichever has absorbed more buying (the larger quote reserve).
+   */
+  private async freshReserves(curve: Address, lg: LaunchSecondLedger | undefined, afterLaunch: Reserves | null, creatorTaxBps: number, current: Reserves): Promise<Reserves> {
+    const fromLedger = lg && afterLaunch && lg.priceMovingBuys > 0 ? lg.reservesAfter(afterLaunch, creatorTaxBps) : null;
+    const fromRpc = await Promise.race([this.o.chain.getReserves(curve).catch(() => null), sleep(25).then(() => null)]);
+    let best = current;
+    for (const r of [fromLedger, fromRpc]) if (r && r.quote > best.quote) best = r;
+    return best;
+  }
+
   /** Decide on a detected launch and, if it matches, run the snipe to a fill (or not). */
   async handleLaunch(l: DetectedLaunch): Promise<SnipeRun | null> {
     const t0 = performance.now();
@@ -1293,6 +1314,33 @@ export class Sniper {
     if (plan.times.length === 0) {
       this.endRun(run, 'aborted', 'too late after confirming the launch');
       return;
+    }
+    // 4b) re-price right before the first send (see `repriceLeadMs`)
+    const lead = this.o.repriceLeadMs ?? 0;
+    if (lead > 0 && plan.times[0]! - scheduler.now() > lead + 20) {
+      await new Promise<void>((res) => scheduler.at(plan.times[0]! - lead, res));
+      if (run.status !== 'pending') {
+        this.endRun(run, 'aborted', `aborted before the burst: ${run.abortReason ?? ''}`);
+        return;
+      }
+      const fresh = await this.freshReserves(curve, lg, afterLaunch, l.event.creatorTaxBps, reserves);
+      if (fresh.quote !== reserves.quote || fresh.token !== reserves.token) {
+        const rc2 = this.risk.reserveCheck(p, fresh);
+        if (!rc2.ok) {
+          this.endRun(run, 'aborted', `repriced ${lead} ms before the first send: ${rc2.reasons.join('; ')}`);
+          return;
+        }
+        const mo2 = planMinOut({ ...p, maxTaxBps: run.maxTaxBps }, fresh, run.quoteIn, l.event.creatorTaxBps);
+        run.notes.push(`repriced ${lead} ms before the first send: expected ${mo2.expectedOut} (was ${mo.expectedOut}), ${lg?.priceMovingBuys ?? 0} launch-second buy(s) priced`);
+        run.minTokensOut = mo2.minTokensOut;
+        reserves = fresh;
+      }
+      plan = clock.planBurst({ launchTs: l.ts, now: scheduler.now(), burst: p.burst, rttMs });
+      run.plan = { ...plan, rttMs };
+      if (plan.times.length === 0) {
+        this.endRun(run, 'aborted', 'too late after re-pricing');
+        return;
+      }
     }
     this.recorder.snipe(run, undefined, 'snipe_armed');
     const fill = await this.o.backend.execute({

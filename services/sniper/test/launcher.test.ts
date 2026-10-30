@@ -92,7 +92,7 @@ const buyReceipt = (tx: DecodedTx, block: number): ReceiptLite => ({
 
 const TEAM_BUY_PLAY = { id: 21, name: 'team-buy-0.1', trigger: { launchSecond: { minTeamBuyEth: 0.1 } }, preset: { stopAfter: 1000, firstBuyOnly: false } };
 
-function harness(plays: Parameters<typeof play>[0][] = [TEAM_BUY_PLAY], launchers: string[] = DEFAULT_LAUNCHERS as string[]) {
+function harness(plays: Parameters<typeof play>[0][] = [TEAM_BUY_PLAY], launchers: string[] = DEFAULT_LAUNCHERS as string[], extra: Partial<ConstructorParameters<typeof Sniper>[0]> = {}) {
   const store = new MemoryStore({ plays: plays.map((p) => play(p)) });
   const chain = new FakeChain();
   chain.latest.set(LAUNCH.curve, INITIAL);
@@ -116,6 +116,7 @@ function harness(plays: Parameters<typeof play>[0][] = [TEAM_BUY_PLAY], launcher
     receiptPollMs: 1,
     reconcileMs: 1e9,
     sniperContract: '0x5151515151515151515151515151515151515151' as Address,
+    ...extra,
   });
   refs.push(sniper);
   const feed = (b: FeedBlock): void => {
@@ -185,6 +186,34 @@ describe('log-originated launches (third-party launcher contracts)', () => {
     expect(run.decision.reasons.join()).toMatch(/launchSecond: team 0\.804 ETH by 1 wallet\(s\), dev 0 ETH/);
     expect(run.confirmed).toBe(true);
     expect(h.sniper.ledger(LTX)!.stats().confirmed).toEqual({ teamBuyEth: 0.804, teamBuyers: 1, devBuyEth: 0 });
+    h.backend.resolveFill!(null);
+  });
+
+  it('re-prices minTokensOut 150 ms before the first send from launch-second buys confirmed after the decision (helper-contract team buys)', async () => {
+    // 30 Oct 2026: an operator's team buys 0.7 ETH through a helper contract in the block after the
+    // launch; invisible to the feed, their CurveBuy logs reach the ws after the decision → the bound
+    // priced without them reverted SlippageExceeded at +1 s, twice.
+    const h = harness([TEAM_BUY_PLAY], DEFAULT_LAUNCHERS as string[], { repriceLeadMs: 150 });
+    await h.sniper.start();
+    h.warm();
+    const buy = teamBuyTx(0.19);
+    h.chain.receipts.set(buy.hash, buyReceipt(buy, h.blockAt(3)));
+    h.second(new Map([[2, [launcherTx()]], [3, [buy]]]), 0, 4);
+    await waitFor(() => h.sniper.activeRuns[0]?.plan !== undefined);
+    const run = h.sniper.activeRuns[0]!;
+    const before = run.minTokensOut;
+    expect(before).toBeGreaterThan(0n);
+    expect(h.backend.orders).toHaveLength(0); // not signed yet: waiting for the re-price point
+    // two more team buys (0.3 ETH each) land in the launch second through a helper contract: only their logs show
+    for (const [i, who] of [TEAM, LAUNCH.deployer].entries()) {
+      h.chain.emitTokenLog(curveTradeLog({ curve: LAUNCH.curve, side: 'buy', trader: '0x14b9a54400000000000000000000000000000000', recipient: who, quote: parseEther('0.3'), tokens: 10n ** 26n, fee: parseEther('0.003'), tax: 0n, block: h.blockAt(4), txHash: `0x${(0xc0 + i).toString(16).repeat(32)}` as Hex, logIndex: i }));
+    }
+    h.second(new Map(), 5, 9); // T+0.5 … T+0.9 s: passes the re-price point (first send − 150 ms)
+    h.sched.advance(h.sched.t); // the manual scheduler fires the re-price timer
+    await waitFor(() => h.backend.orders.length === 1);
+    expect(run.minTokensOut).toBeLessThan(before); // 0.6 ETH more bought → fewer tokens expected → lower bound
+    expect(run.notes.join('; ')).toMatch(/repriced 150 ms before the first send: expected \d+ \(was \d+\)/);
+    expect(h.backend.orders[0]!.run.minTokensOut).toBe(run.minTokensOut);
     h.backend.resolveFill!(null);
   });
 

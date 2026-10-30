@@ -230,6 +230,19 @@ export class ViemChain implements ChainClient {
   }
 
   async getReserves(curve: Address, blockNumber?: number): Promise<Reserves> {
+    if (blockNumber === undefined && this.receiptClients.length > 1) {
+      // 'latest' from whichever endpoint answers first (the sequencer RPC has the state ~100 ms
+      // after a block, a third-party node up to ~1 s later); a block-pinned read needs the archive node
+      const one = async (c: PublicClient): Promise<Reserves> => {
+        const [q, t] = await c.readContract({ address: curve, abi: curveAbi, functionName: 'getReserves' });
+        return { quote: BigInt(q as bigint), token: BigInt(t as bigint) };
+      };
+      try {
+        return await Promise.any(this.receiptClients.map((c) => one(c)));
+      } catch (e) {
+        throw (e as AggregateError).errors?.[0] ?? e;
+      }
+    }
     const [quote, token] = await this.http.readContract({
       address: curve,
       abi: curveAbi,

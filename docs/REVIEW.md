@@ -374,3 +374,14 @@ by 0.9 s and 2.9 s after the target block; both still bought (deadlineTs = T+3) 
 +1 s buyers, the backtest's losing "last in block" case) and `DEADLINE_BLOCKS` to 20; late
 members revert `Expired` at ~25k gas. `hoodctl race`
 shows such landings as `late` (offset > 0).
+
+### S-1 — minTokensOut priced before the launch-second buys landed (fixed)
+
+30 Oct 2026, 15:42 and 15:47 UTC: one operator's team bought 0.7 ETH through a helper contract
+in the block after the launch. Those buys are internal calls (invisible to the feed); their
+CurveBuy logs reached the node ws after the decision, so the burst's minTokensOut was priced
+on the launch reserves alone and the curve reverted `SlippageExceeded(uint256,uint256)` at +1 s
+(race won, no fill, twice). `REPRICE_LEAD_MS` (default 150): the run waits until first send −
+150 ms, re-derives the reserves from the ledger's confirmed buys and a fresh `getReserves`
+raced across the fast endpoints (≤ 25 ms), re-checks the entry cap and re-prices minTokensOut,
+then signs. Test: `launcher.test.ts` "re-prices minTokensOut 150 ms before the first send".
