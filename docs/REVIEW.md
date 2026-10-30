@@ -365,3 +365,11 @@ retries for an RPC behind the feed), falling back to the book only when no block
 optimistic by the next block's panic sells, like the backtest (which applies the exempt sells before
 liquidating). Tests: `positions.test.ts` (order carries the trigger block), `paper-e2e.test.ts`
 "paper exit pricing (post-dump reserves)".
+
+### T-1 — burst deadline T+3 let congested-sequencer landings buy late (fixed)
+
+30 Oct 2026, 10:52 and 10:55 UTC: a sequencer spam wave (150–230 tx blocks) delayed two bursts
+by 0.9 s and 2.9 s after the target block; both still bought (deadlineTs = T+3) at prices the
++1 s buyers had moved. `SNIPE_DEADLINE_SECONDS` now defaults to 2 (T+1 target, T+2 at 0.19 % tax
+still a fill, T+3 reverts `Expired` at ~25k gas) and `DEADLINE_BLOCKS` to 25. `hoodctl race`
+shows such landings as `late` (offset > 0).

@@ -4,7 +4,7 @@ import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, keccak256, 
 import { privateKeyToAccount } from 'viem/accounts';
 import { describe, expect, it } from 'vitest';
 import type { ReceiptLite } from '../src/chain.js';
-import { LiveExecutor, NonceManager, decodeSniped } from '../src/executor.js';
+import { LiveExecutor, NonceManager, SNIPE_DEADLINE_SECONDS, decodeSniped } from '../src/executor.js';
 import { silentLogger } from '../src/log.js';
 import { ManualScheduler } from '../src/scheduler.js';
 import type { SnipeRun } from '../src/types.js';
@@ -118,7 +118,7 @@ describe('LiveExecutor burst', () => {
       expect(await recoverTransactionAddress({ serializedTransaction: m.raw as `0x02${string}` })).toBe(account.address);
       const call = decodeFunctionData({ abi: sniperAbi, data: tx.data! });
       expect(call.functionName).toBe('snipe');
-      expect(call.args).toEqual([expect.stringMatching(new RegExp(LAUNCH.curve, 'i')), expect.stringMatching(new RegExp(LAUNCH.token, 'i')), parseEther('0.07'), 123_456n, 1000, BigInt(LAUNCH.block + 40), BigInt(LAUNCH.ts + 3)]);
+      expect(call.args).toEqual([expect.stringMatching(new RegExp(LAUNCH.curve, 'i')), expect.stringMatching(new RegExp(LAUNCH.token, 'i')), parseEther('0.07'), 123_456n, 1000, BigInt(LAUNCH.block + 40), BigInt(LAUNCH.ts + SNIPE_DEADLINE_SECONDS)]);
     }
 
     // receipts: members 0-2 landed in T blocks (TaxTooHigh), 3 bought, 4-8 AlreadyBought, 9 dropped

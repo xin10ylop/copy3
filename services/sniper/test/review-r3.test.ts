@@ -174,7 +174,7 @@ describe('NEW-3: a runtime "no fill" is final only once the chain head passed th
     h.launchSecond();
     await waitFor(() => h.scripted!.orders.length === 1);
     const run = h.scripted!.orders[0]!.run;
-    expect(run.deadlineTs).toBe(T + 3); // NEW-3: the wall-clock deadline passed to snipe()
+    expect(run.deadlineTs).toBe(T + 2); // NEW-3: the wall-clock deadline passed to snipe() (SNIPE_DEADLINE_SECONDS, T+2 since the 30 Oct congestion)
     h.scripted!.resolveFill!(null); // receipts timed out: no fill seen, bought() still false
     await sleep(100); // several reconcile ticks
     expect(run.status).toBe('pending');

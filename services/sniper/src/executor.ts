@@ -250,9 +250,15 @@ export function decodeSniped(
 }
 
 /** Seconds after the launch second a burst member may still buy (tax is 0 from T+3). NEW-3. */
-export const SNIPE_DEADLINE_SECONDS = 3;
+/**
+ * Latest launch-relative second a member may buy in. 2: the first +1 s block is the target and a
+ * landing in second T+2 (0.19 % tax) is still a fill; T+3 is not — under a sequencer spam wave
+ * (30 Oct 2026: 150–230 tx blocks) two bursts landed 0.9 s and 2.9 s after the target block and
+ * bought at a price the +1 s buyers had already moved. SNIPE_DEADLINE_SECONDS overrides.
+ */
+export const SNIPE_DEADLINE_SECONDS = Number(process.env.SNIPE_DEADLINE_SECONDS ?? 2) || 2;
 
-/** `snipe(…, deadlineTs)`: the latest block timestamp a member may buy in (launch ts + 3). */
+/** `snipe(…, deadlineTs)`: the latest block timestamp a member may buy in (launch ts + SNIPE_DEADLINE_SECONDS). */
 export function snipeDeadlineTs(run: Pick<SnipeRun, 'launch' | 'deadlineTs'>): number {
   return run.deadlineTs ?? run.launch.ts + SNIPE_DEADLINE_SECONDS;
 }
