@@ -1,5 +1,7 @@
 # HoodSniper
 
+**Live now. What runs, every setting, the daily routine and the numbers: [docs/STATE.md](docs/STATE.md).**
+
 HoodSniper finds memecoin-launch "operator plays" on the **Pons V2** launchpad on **Robinhood Chain**
 (EVM L2, chainId 4663, Arbitrum Nitro) and snipes them in the first taxed second. It replaces the
 Telegram-bot stack from the reference video, built from TradeWiz dev-snipe presets, Packet Tracker
@@ -48,11 +50,11 @@ Nobody has to pick operators for the system to trade. Two kinds of plays run sid
 ```
 sequencer feed ─► sniper (Ohio) ─┬─ launch block: operator plays (armed funder, deployer, team wallets, name) ─┐
                                  └─ launch-second ledger: team / dev buys in second T, every block            │
-                                      → generic play team-buy-0.1 ("a tax-exempt non-deployer wallet          │
-                                        bought ≥ 0.1 ETH in the launch second")                               │
+                                      → generic play team-buy-0.1 (now: tax-exempt non-deployer wallets       │
+                                        bought ≥ 0.02 ETH from ≥ 2 wallets in the launch second)             │
                                                                                                               ▼
                      match (µs, memory) → launch receipt + the team buys' CurveBuy receipts (proof) → burst into T+1
-                     → exits: first exempt transfer-out (dump), trailing +50 %/−20 %, SL 40 %, 60 s timeout
+                     → exits: first exempt transfer-out (dump), trailing +50 %/−20 %, SL 20 %, 60 s timeout, 5-min team cool-off
 
 agent serve (Chicago) ─┬─ every SCOUT_INTERVAL_MIN: runners → operator clusters → Opus unravels new ones →
                        │  proposes plays → settings.auto_approve enables the strong ones, the rest → Telegram card
@@ -74,9 +76,10 @@ agent serve (Chicago) ─┬─ every SCOUT_INTERVAL_MIN: runners → operator c
    Opus unravel clusters no operator play covers yet, and proposes plays. A proposal whose backtest
    clears `settings.auto_approve` (≥ 10 coins, ≥ 0.002 ETH per snipe, ≥ 35 % wins, < 20 plays
    enabled) is enabled at once; the others arrive in Telegram with Approve / Reject.
-4. **Every night** (03:00 UTC by default) the agent refits each enabled play's exits on the last
-   3 days, disables plays that stopped paying (rolling realised expectancy over the last 30 snipes,
-   paper or live, or refit expectancy ≤ 0) and blacklists losing operators on the generic plays.
+4. **Every night** (03:00 UTC by default; `NIGHTLY_HOUR_UTC=-1` turns it off — it is off on the live
+   box, see STATE.md) the agent refits each enabled play's exits on the last 3 days, disables plays
+   that stopped paying (rolling realised expectancy over the last 30 snipes, paper or live, or refit
+   expectancy ≤ 0) and blacklists losing operators on the generic plays.
 5. **Sizing.** Fixed `buyEth`, or `sizing.mode = bankroll`: a share of the contract balance per
    snipe (start at 0.01 ETH with ~0.1 ETH in the contract; the size follows the balance), with the
    daily loss limit at 15 % of the day's starting balance.
@@ -113,23 +116,9 @@ Telegram commands: `/status /play <ca> /scout /plays /play_on /play_off /watch /
 Approve/Reject buttons. Alerts cover armed wallets, burst sent, filled (entry mcap, tax), closed
 (PnL, reason, hold time), aborted, errors, and a daily summary.
 
-## Status (2026-10-28)
+## Status
 
-| Component | State |
-|---|---|
-| packages/core: addresses, ABIs, feed decoder, curve math, clock, zod types (incl. `launchSecond`, `sizing`) | typecheck ok, 73 tests pass (6 live tests skipped without `LIVE=1`) |
-| packages/db: schema, migrations, NOTIFY triggers, helpers (postgres.js + PGlite), `seed` (generic plays + settings) | ok, 20 tests |
-| contracts: PonsSniper.sol + deploy script | ok, 10 tests. Curve call encoding and contract callers still to verify live (RESEARCH §7) |
-| services/indexer: live + backfill | ok, 62 tests (one PGlite round-trip test is timing-flaky under a parallel workspace run; it passes alone) |
-| services/tracker: funding-trail watcher | ok, 32 tests |
-| services/agent: Opus 5.5 play finder / scout / backtest, auto-approval, nightly refit / disable / blacklist | ok, 96 tests |
-| services/sniper: feed → burst → exits, paper mode, launch-second ledger, bankroll sizing | ok, 172 tests. Must pass the paper gate before live |
-| services/telegram: bot, approvals, notifier | ok, 96 tests (incl. PGlite store + trigger e2e, real agent/tracker binding) |
-| infra: compose, Dockerfile, Cherry, executor, backups, health | `docker compose config` ok, `bash -n` + shellcheck clean, cloud-init YAML parses, `terraform validate` ok |
-| Live trading | **Not yet.** Paper first (RUNBOOK §7) |
-
-Monthly running cost: ≈ $545-900 (Chicago server $233, L1 endpoints, Ohio VM ≈ $70, Anthropic,
-gas). See RUNBOOK §11.
+See [docs/STATE.md](docs/STATE.md) (live since 29 Oct 2026). Test counts per package: `pnpm test`.
 
 ## Operating without Telegram
 

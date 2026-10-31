@@ -1,5 +1,7 @@
 # Path A: the paper stack on one Ohio box (Alchemy, no own node)
 
+> The box is live. Current settings, routine and numbers: [docs/STATE.md](../../docs/STATE.md).
+
 One Ubuntu VM in AWS us-east-2 runs the whole system in **paper mode** for a week, with Alchemy as
 the Robinhood Chain node. There is no Chicago box, no nitro node and no WireGuard. Alchemy serves
 Robinhood Chain over HTTP and WS (`eth_subscribe newHeads`, `debug_traceTransaction` with
@@ -161,6 +163,7 @@ extrapolate.
 | Task | Command |
 |---|---|
 | Stop new paper entries / resume | `hoodctl kill "reason"` / `hoodctl resume` (also stops probes) |
+| Every run of the last day, with the reason under each row (times in `HOOD_TZ`) | `hoodctl trades 1` |
 | Race measurements (probe / live) | `hoodctl race 1` |
 | Enable / disable a play | `hoodctl plays`, `hoodctl play on 3`, `hoodctl play off 3` |
 | Run the nightly job or a scout pass now | `hoodctl nightly` / `hoodctl scout` |

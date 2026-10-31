@@ -1,3 +1,26 @@
+# Correction (31 Oct 2026): the backtests below act inside blocks; the bot cannot
+
+Backtests #1–#3 evaluate every exit after every trade (log), so they (a) sell at the moment a team
+transfer-out appears, before the sale that sits in the same block — 1 800 of ~2 060 dumps in the month
+have the receiving wallet's sale in the transfer's block — and (b) catch price spikes that rise and
+fall inside one block. A bot sees a block after it is sealed and its sell lands a block later.
+Re-evaluated per block (`scripts/backtest/sim_block.py`), our rule (team ≥ 0.02 ETH, 2+ wallets),
+first in block, 0.07 ETH:
+
+| execution model | month (28 Sep – 28 Oct) |
+|---|---|
+| per-trade (the figures below) | +25.2 ETH |
+| per-block, no sell lag (optimistic) | +5.8 ETH |
+| per-block, one-block sell lag (realistic) | **+4.8 ETH** |
+| per-block, lag on every exit (pessimistic) | +4.6 ETH |
+
+Per-block, the edge is in the last two weeks of the window (first 18 days −0.0007/trade, last 12 days
++0.0039/trade, +6.7 ETH; last 10 days +5.0 ETH). A per-block walk-forward exit grid (TP, trailing, SL,
+timeout, dump on/off) finds nothing that beats the current preset out of sample. Buy-size sensitivity
+and the tests of wider entry rules, +2 s entry, operator history, dump pre-emption and spike capture
+are in `docs/STATE.md` ("What we know"). The live/backtest comparison on 30 Oct was done per block and
+matches the live trades. The per-trade numbers below remain as the record of how the strategy was found.
+
 # Backtest #1 – first look (one day of Pons V2 launches, 2026-10-28)
 
 Data: every Pons V2 launch over the last 300k blocks (8.7 h), 808 ETH-paired
