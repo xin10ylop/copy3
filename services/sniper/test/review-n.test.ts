@@ -628,7 +628,7 @@ describe('receipt race (launcher-contract launches are built from the receipt)',
     });
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-  it('the first endpoint to hold the receipt wins (the sequencer RPC beats a lagging node)', async () => {
+  it('the sequencer RPC is asked first and alone; the lagging archive node is not even called when the sequencer has the receipt', async () => {
     const calls: string[] = [];
     const slowNode = endpoint('node', () => sleep(150).then(() => null), calls); // Alchemy: not found yet
     const sequencer = endpoint('seq', () => sleep(5).then(() => receipt), calls);
@@ -638,7 +638,15 @@ describe('receipt race (launcher-contract launches are built from the receipt)',
     expect(r?.blockNumber).toBe(100_000_000);
     expect(r?.transactionIndex).toBe(2);
     expect(Date.now() - t0).toBeLessThan(120);
-    expect(calls).toEqual(expect.arrayContaining(['node:eth_getTransactionReceipt', 'seq:eth_getTransactionReceipt']));
+    expect(calls).toContain('seq:eth_getTransactionReceipt');
+    expect(calls).not.toContain('node:eth_getTransactionReceipt'); // 31 Oct 2026: every 20 ms poll used to hit Alchemy too
+  });
+
+  it('a sequencer RPC that errors (not "not found") falls back to the archive node', async () => {
+    const calls: string[] = [];
+    const vc = new ViemChain({ httpUrl: 'http://unused', transport: endpoint('node', async () => receipt, calls), receiptTransports: [endpoint('seq', () => Promise.reject(new Error('ECONNRESET')), calls)] });
+    expect((await vc.getReceipt(receipt.transactionHash as Hex))?.blockNumber).toBe(100_000_000);
+    expect(calls).toEqual(['seq:eth_getTransactionReceipt', 'node:eth_getTransactionReceipt']);
   });
 
   it('not found everywhere → null; an endpoint error does not hide the other endpoint’s receipt', async () => {

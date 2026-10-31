@@ -238,9 +238,9 @@ export class ViemChain implements ChainClient {
         return { quote: BigInt(q as bigint), token: BigInt(t as bigint) };
       };
       try {
-        return await Promise.any(this.receiptClients.map((c) => one(c)));
-      } catch (e) {
-        throw (e as AggregateError).errors?.[0] ?? e;
+        return await Promise.any(this.receiptClients.slice(1).map((c) => one(c)));
+      } catch {
+        return one(this.http); // every sequencer RPC failed: the archive node
       }
     }
     const [quote, token] = await this.http.readContract({
@@ -380,20 +380,30 @@ export class ViemChain implements ChainClient {
         transactionIndex: Number(r.transactionIndex),
       };
     };
+    const notFound = (e: unknown): boolean => (e as { name?: string }).name === 'TransactionReceiptNotFoundError';
     if (this.receiptClients.length === 1) {
       try {
         return await one(this.http);
       } catch (e) {
-        if ((e as { name?: string }).name === 'TransactionReceiptNotFoundError') return null;
+        if (notFound(e)) return null;
         throw e;
       }
     }
+    // The sequencer RPC(s) (receiptUrls) answer first and are polled every RECEIPT_POLL_MS for every
+    // launch's receipt; the archive node (Alchemy, metered) is asked only when they fail outright,
+    // not when the receipt simply is not mined yet (31 Oct 2026: every poll hit both endpoints).
+    const fast = this.receiptClients.slice(1);
     try {
-      return await Promise.any(this.receiptClients.map((c) => one(c)));
+      return await Promise.any(fast.map((c) => one(c)));
     } catch (e) {
       const errors = (e as AggregateError).errors ?? [e];
-      if (errors.some((x) => (x as { name?: string }).name === 'TransactionReceiptNotFoundError')) return null;
-      throw errors[0];
+      if (errors.some(notFound)) return null;
+    }
+    try {
+      return await one(this.http);
+    } catch (e) {
+      if (notFound(e)) return null;
+      throw e;
     }
   }
 
