@@ -25,15 +25,17 @@ it would make the next bootstrap's seed create a second, enabled `team-buy-0.1`,
 | Setting | Value | Where | Why |
 |---|---|---|---|
 | trigger | team buys ≥ **0.02 ETH** from ≥ **2** tax-exempt non-deployer wallets in the launch second | `plays.trigger.launchSecond` (`minTeamBuyEth`, `minTeamBuyers`) | 30-day backtest: 0.02 + 2 wallets is the only widening that adds launches without losing; single-wallet teams and dev-only launches lose |
-| entry | first block of T+1 s (6.18 % tax), burst 16 sends 8 ms apart from −120 ms before the boundary, deadline T+1 only | preset `burst`, env `SNIPE_DEADLINE_SECONDS=1` | late fills (+7…+29 blocks) were all losses; the backtest only ever enters at T+1 |
+| entry | first block of T+1 s (6.18 % tax), burst **40 sends 3 ms apart** from −120 ms before the boundary, deadline T+1 only; fee cap 0.2 gwei (chain price 0.02) | preset `burst`, `maxFeeGwei`; env `SNIPE_DEADLINE_SECONDS=1` | late fills (+7…+29 blocks) were all losses; denser spray for the same-block races; the 1 gwei cap made the gas preflight refuse a launch on 31 Oct |
 | re-price | reserves re-read before the first send with whatever time is left (`REPRICE_LEAD_MS=250`) | env | helper-contract team buys reached the logs after the decision → SlippageExceeded reverts |
 | size | bankroll mode, 0.002–0.003 ETH per buy (bankroll × 0.35 / 2) | `plays.preset.sizing`, set by `golive.sh live` | test size until live confirms the per-block model |
-| exits | trailing +50 % / −20 %, **stop loss 20 %** (on sell value vs cost), timeout 60 s, dump exit on an exempt wallet's **transfer-out** (not on its sells) | `plays.preset` (`trailing`, `stopLossPct`, `timeoutSec`, `exitIfExemptSellsPct` empty) | the backtest's exits; stop 20 rated best in the per-trade sweep, stays until the per-block refit says otherwise (it found nothing better) |
+| exits | **trailing: arms at +20 % on sell value (≈ +30 % price), sells on a 15 % pullback**; **stop loss 20 %** (on sell value vs cost); timeout 60 s; dump exit on an exempt wallet's **transfer-out** (not on its sells) | `plays.preset` (`trailing`, `stopLossPct`, `timeoutSec`, `exitIfExemptSellsPct` empty) | per-block month: trail 30/15 (price) beats 50/20 in every window (+7.9 vs +6.1 month, +5.0 vs +4.5 last 10 days); stop 20 unchanged |
 | team cool-off | 5 min after a loss, same team wallets skipped; survives a restart | env `TEAM_COOLOFF_MIN=5` | serial relaunches (TUSK ×5); backtest +1.1 ETH/month |
 | entry cap | market cap ≤ 4.2 ETH after the launch second | preset `maxEntryMcapEth` | the graduation threshold |
 | concurrency | 3 positions, one burst key each | env `MAX_CONCURRENT=3` | a 4th key is needed to raise it |
 
 ## Daily routine
+
+An **epoch** (`hoodctl epoch now "why"`) makes `trades` / `race` / `pnl` / `status` count from a moment; set on 31 Oct 15:14 Beirut ("race fix live"). `hoodctl trades 3 all` shows every row.
 
 ```
 hoodctl trades 1        # every run of the last 24 h with the note that explains it (abort reason, exit reading, decision latency)
@@ -66,7 +68,7 @@ Per-block walk-forward refit of the exits found nothing better than the current 
 Buy size: return per trade falls with size (1.66 % at 0.07, 1.35 % at 0.2, 0.65 % at 0.5); the useful
 top is 0.2–0.3 ETH per buy on this data.
 
-**Race.** 20 of 33 live sends first in block (61 %). Losses: 3 to a faster bot in the same block, 10 to
+**Race.** Before the fix: 20 of 33 live sends first in block (61 %). After it (31 Oct, from 15:14 Beirut): decisions in 24–200 ms (helper and proxy buys decoded from the feed), first in block 6 of 7. Losses: 3 to a faster bot in the same block, 10 to
 late decisions (helper-contract team buys were only known from node logs 300–1 100 ms after the launch).
 The backtest's edge is very race-sensitive: ≈ first-in-block value × ⅓ at 61 %. Fix shipped 31 Oct
 (4c7451b): helper buys decoded from the feed; `hoodctl trades` notes "decided N ms after the launch
@@ -96,4 +98,4 @@ dump exit on transfers only (not team sells) · deadline T+1 · re-price before 
 time is left) · 600k gas · receipts and reserves raced via the sequencer RPC · reserve book that cannot
 double count · 5-min team cool-off (restart-safe) · daily loss base = total bankroll, then removed ·
 stop 40 → 20 · helper-contract buys as feed hints · exit-signal reading and abort reason in `hoodctl trades` ·
-timestamps in `HOOD_TZ` · nightly auto-disable off.
+timestamps in `HOOD_TZ` · nightly auto-disable off · helper (0x6f49227e) and proxy (0x240acbf8) team buys decoded from the feed · burst 40 × 3 ms · fee cap 0.2 gwei · trailing 20/15 · epoch.
