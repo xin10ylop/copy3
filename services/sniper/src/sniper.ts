@@ -1048,6 +1048,9 @@ export class Sniper {
   private async decide(l: DetectedLaunch, d: Decision, t0: number, ledger: LaunchSecondLedger | undefined, source: 'launch' | 'launch-second'): Promise<SnipeRun> {
     const run = this.newRun(l, d);
     if (ledger) run.ledger = ledger;
+    // the race starts here: how long after the launch block reached us did we decide (the +1 s
+    // send window closes ~880 ms after the launch block; a decision past ~600 ms lands late)
+    run.notes.push(`decided ${Math.max(0, Math.round(this.o.scheduler.now() - l.receivedAt))} ms after the launch block arrived (${source})`);
     const verdict = this.risk.preCheck(d, l);
     // N15 / NEW-4 / NEW-6: what the contract would refuse (QuoteTooLarge, SpendLimitExceeded) is refused here
     const lim = this.limitsCheck(run, d.preset);

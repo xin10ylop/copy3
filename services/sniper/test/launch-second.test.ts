@@ -74,6 +74,37 @@ function curveBuyTx(eth: number, recipient: Address = TEAM): DecodedTx {
   });
 }
 
+
+/** The helper contract's calldata: (curve, u, u, u, address[] recipients, uint[] amounts, uint[] minOut, u), value = Σ amounts unless given. */
+function helperBuyTx(curve: Address, recipients: Address[], amounts: bigint[], value?: bigint): DecodedTx {
+  const w = (x: bigint | string): string => (typeof x === 'string' ? x.slice(2).toLowerCase().padStart(64, '0') : x.toString(16).padStart(64, '0'));
+  const arr = (xs: (bigint | string)[]): string => w(BigInt(xs.length)) + xs.map(w).join('');
+  const headWords = 8;
+  const offR = BigInt(headWords * 32);
+  const offA = offR + BigInt((1 + recipients.length) * 32);
+  const offM = offA + BigInt((1 + amounts.length) * 32);
+  const input = `0x6f49227e${w(curve)}${w(0n)}${w(1_806_451_612_903_225_808n)}${w(929_999_999_999_999_999_202_857_143n)}${w(offR)}${w(offA)}${w(offM)}${w(300_000_000_000_000_028_104_107_141n)}${arr(recipients)}${arr(amounts)}${arr(amounts.map(() => 0n))}` as Hex;
+  const total = amounts.reduce((a, b) => a + b, 0n);
+  return decodedTxFromRpc({
+    ...launchFixture.tx,
+    hash: `0x${(++n).toString(16).padStart(4, '0').repeat(16)}` as Hex,
+    from: recipients[0]!,
+    to: '0x14b9a544e8c179fc2040d3089dcc73baf25aa8f9' as Address,
+    value: value ?? total,
+    nonce: n,
+    input,
+  });
+}
+function helperBuyReceipt(tx: DecodedTx, block: number, recipients: Address[], amounts: bigint[]): ReceiptLite {
+  return {
+    transactionHash: tx.hash,
+    status: 'success',
+    blockNumber: block,
+    gasUsed: 300_000n,
+    logs: recipients.map((r, i) => curveTradeLog({ curve: LAUNCH.curve, side: 'buy', trader: tx.to!, recipient: r, quote: amounts[i]!, tokens: 10n ** 25n, fee: amounts[i]! / 100n, tax: 0n, block, txHash: tx.hash, logIndex: i })),
+  };
+}
+
 /** `token.transfer(to, amount)` from an exempt wallet: the team moving tokens out (dump signal). */
 function transferTx(from: Address, to: Address): DecodedTx {
   return decodedTxFromRpc({
@@ -224,6 +255,45 @@ describe('launch-second fingerprint: ledger → rules → burst at T+1', () => {
     await waitFor(() => h.scripted!.orders.length === 1);
     expect(h.scripted!.orders[0]!.run.decision.reasons.join()).toMatch(/team 0\.11 ETH/);
     h.scripted!.resolveFill!(null);
+  });
+
+  it('a helper-contract team buy (one tx, several recipients) is a hint from the feed: match in the launch second, confirmed by its receipt', async () => {
+    // 31 Oct 2026 00:05 UTC: 0.89 ETH for 6 wallets through 0x14b9a544…; the logs reached the ws
+    // after the decision, 2 of 6 priced. From the feed the whole buy is known ~500 ms earlier.
+    const h = harness();
+    await h.sniper.start();
+    h.warm();
+    const amounts = [parseEther('0.07'), parseEther('0.05')];
+    const tx = helperBuyTx(LAUNCH.curve, [TEAM, TEAM], amounts); // the fixture exempts the deployer and TEAM only
+    h.chain.receipts.set(tx.hash, helperBuyReceipt(tx, h.blockAt(3), [TEAM, TEAM], amounts));
+    h.launchSecond(new Map([[3, [tx]]]), 0, 4);
+    await waitFor(() => h.scripted!.orders.length === 1);
+    const run = h.scripted!.orders[0]!.run;
+    expect(run.decision.reasons.join()).toMatch(/launchSecond: team 0\.12 ETH by 1 wallet\(s\), dev 0 ETH \(seen\)/);
+    expect(run.notes.join()).toMatch(/launch-second confirmed: launchSecond: team 0\.12 ETH by 1 wallet\(s\).*\(confirmed\)/);
+    expect(run.notes.join()).toMatch(/decided \d+ ms after the launch block arrived \(launch-second\)/);
+    expect(h.chain.calls.filter((c) => c === `getReceipt:${tx.hash.slice(0, 10)}`).length).toBeGreaterThanOrEqual(1);
+    expect(run.notes.join()).toMatch(/reserves: launch config \+ 2 launch-second buy\(s\) from the ledger/);
+    h.scripted!.resolveFill!(null);
+  });
+
+  it('a helper buy for ANOTHER curve, or whose amounts do not add up to the value, is not a hint; a reverted helper buy refutes every recipient', async () => {
+    const wallets = [TEAM, '0xabababababababababababababababababababab' as Address];
+    const lg = new LaunchSecondLedger({ event: { deployer: LAUNCH.deployer, name: 'S', symbol: 'S', launchKind: 'launchToken', exemptions: wallets, creatorFeeRecipient: TEAM, creatorTaxBps: 0, devBuyQuoteIn: 0n, pairToken: QUOTE_TOKENS.eth, launchConfigId: 0n }, block: LAUNCH.block, ts: T, receivedAt: 0, txHash: LAUNCH.txHash, token: LAUNCH.token, curve: LAUNCH.curve, addressSource: 'receipt', source: 'feed', origin: 'feed' } as never);
+    lg.setAddresses(LAUNCH.token, LAUNCH.curve);
+    lg.setExemptions(wallets);
+    const other = helperBuyTx('0x9999999999999999999999999999999999999999' as Address, [wallets[0]!], [parseEther('0.2')]);
+    expect(lg.ingestTx(other, LAUNCH.block + 1)).toBeNull();
+    const short = helperBuyTx(LAUNCH.curve, [wallets[0]!], [parseEther('0.2')], parseEther('0.1')); // value ≠ Σ amounts
+    expect(lg.ingestTx(short, LAUNCH.block + 1)).toBeNull();
+    const good = helperBuyTx(LAUNCH.curve, [wallets[0]!, wallets[1]!], [parseEther('0.07'), parseEther('0.05')]);
+    expect(lg.ingestTx(good, LAUNCH.block + 1)).toBe('buy');
+    expect(lg.stats().seen).toEqual({ teamBuyEth: 0.12, teamBuyers: 2, devBuyEth: 0 });
+    expect(lg.pendingHints()).toEqual([good.hash.toLowerCase()]);
+    // reverted on chain: both hints refuted, nothing counts any more
+    expect(lg.applyReceipt({ transactionHash: good.hash, status: 'reverted', blockNumber: LAUNCH.block + 1, gasUsed: 1n, logs: [] })).toBe(true);
+    expect(lg.stats().seen).toEqual({ teamBuyEth: 0, teamBuyers: 0, devBuyEth: 0 });
+    expect(lg.pendingHints()).toEqual([]);
   });
 
   it('a team buy routed through a contract (invisible to the feed decoder) fires from the node CurveBuy log', async () => {

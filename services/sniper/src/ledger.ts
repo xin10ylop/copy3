@@ -37,14 +37,49 @@ export const SEL_BUY = SELECTORS.curveBuy;
 export const SEL_SELL = SELECTORS.curveSell;
 export const SEL_TRANSFER = '0xa9059cbb';
 export const SEL_TRANSFER_FROM = '0x23b872dd';
+/**
+ * The team-buy helper contract (0x14b9a544…, 973 of ~1 300 helper-bought team launches in the
+ * 30-day backtest): one tx, `msg.value` split over several recipients, one CurveBuy log each.
+ * Calldata: (address curve, uint256, uint256, uint256, address[] recipients, uint256[] amounts,
+ * uint256[] minOut, uint256). Decoded from the feed it is a team-buy hint ~500 ms before the
+ * node's logs (31 Oct 2026: the decision fired on 2 of 6 logs with 200 ms left to the send).
+ */
+export const SEL_HELPER_BUY = '0x6f49227e';
 /** selectors the ledger cares about (buffered per second by the sniper) */
-export const LEDGER_SELECTORS: ReadonlySet<string> = new Set([SEL_BUY, SEL_SELL, SEL_TRANSFER, SEL_TRANSFER_FROM]);
+export const LEDGER_SELECTORS: ReadonlySet<string> = new Set([SEL_BUY, SEL_SELL, SEL_TRANSFER, SEL_TRANSFER_FROM, SEL_HELPER_BUY]);
 
 const ZERO = '0x0000000000000000000000000000000000000000';
 const word = (input: string, i: number): string => input.slice(10 + i * 64, 10 + (i + 1) * 64);
 const wordAddr = (input: string, i: number): string => `0x${word(input, i).slice(24)}`.toLowerCase();
 const topicAddr = (t: string | undefined): string => `0x${(t ?? '').slice(26)}`.toLowerCase();
 const wei = (x: bigint): number => Number(x) / 1e18;
+const wordInt = (input: string, i: number): bigint => BigInt(`0x${word(input, i)}`);
+
+/**
+ * Recipients and amounts of a helper-contract team buy (`SEL_HELPER_BUY`) for `curve`, or null
+ * when the calldata is not that shape, names another curve, or the amounts do not add up to the
+ * tx value (a native-quote buy with value ≠ Σ amounts reverts).
+ */
+export function decodeHelperBuy(input: string, value: bigint, curve: string): { recipient: string; quoteIn: bigint }[] | null {
+  const words = Math.floor((input.length - 10) / 64);
+  if (words < 8 || wordAddr(input, 0) !== curve) return null;
+  const arr = (i: number): bigint[] | null => {
+    const off = wordInt(input, i);
+    if (off % 32n !== 0n) return null;
+    const at = Number(off / 32n);
+    if (at + 1 > words) return null;
+    const n = Number(wordInt(input, at));
+    if (n <= 0 || n > 256 || at + 1 + n > words) return null;
+    return Array.from({ length: n }, (_, k) => wordInt(input, at + 1 + k));
+  };
+  const recipients = arr(4);
+  const amounts = arr(5);
+  if (!recipients || !amounts || recipients.length !== amounts.length) return null;
+  let sum = 0n;
+  for (const a of amounts) sum += a;
+  if (sum !== value || sum === 0n) return null;
+  return recipients.map((r, k) => ({ recipient: `0x${r.toString(16).padStart(40, '0')}`, quoteIn: amounts[k]! })).filter((x) => x.quoteIn > 0n);
+}
 
 type BuyStatus = 'seen' | 'confirmed' | 'refuted';
 
@@ -92,7 +127,7 @@ export class LaunchSecondLedger {
   private readonly exemptedAt = new Map<string, { block: number; logIndex: number }>();
   /** waiters woken on every change (confirmation loops plan the burst the moment a log lands) */
   private waiters: (() => void)[] = [];
-  /** feed hints by tx hash (one direct buy per tx) */
+  /** feed hints by `txHash` (a direct buy) or `txHash#i` (the i-th recipient of a helper-contract buy) */
   private readonly hints = new Map<string, LedgerBuy>();
   /** confirmed buys by `txHash:logIndex` */
   private readonly logs = new Map<string, LedgerBuy>();
@@ -211,6 +246,15 @@ export class LaunchSecondLedger {
       this.hints.set(hash, { txHash: hash, recipient: wordAddr(input, 2), quoteIn, block, logIndex: -1, source: 'feed', status: 'seen' });
       return 'buy';
     }
+    if (tx.selector === SEL_HELPER_BUY) {
+      // helper-contract team buy: one hint per recipient, all confirmed or refuted by the tx's receipt
+      const buys = decodeHelperBuy(input, tx.value, this.curve);
+      if (!buys) return null;
+      this.ingested.add(hash);
+      if (this.loggedTx.has(hash)) return null;
+      buys.forEach((b, i) => this.hints.set(`${hash}#${i}`, { txHash: hash, recipient: b.recipient, quoteIn: b.quoteIn, block, logIndex: -1, source: 'feed', status: 'seen' }));
+      return 'buy';
+    }
     if (tx.to === this.curve && tx.selector === SEL_SELL) {
       this.ingested.add(hash);
       return 'out-needs-sender';
@@ -292,7 +336,7 @@ export class LaunchSecondLedger {
     const key = `${hash}:${logIndex}`;
     if (this.logs.has(key)) return false;
     this.loggedTx.add(hash);
-    this.hints.delete(hash);
+    this.dropHints(hash);
     this.logs.set(key, { txHash: hash, recipient, quoteIn, block, logIndex, source: 'log', status: 'confirmed', ...(data ?? {}) });
     return true;
   }
@@ -314,18 +358,28 @@ export class LaunchSecondLedger {
         changed = this.ingestLog({ ...l, transactionHash: l.transactionHash ?? hash, blockNumber: l.blockNumber ?? r.blockNumber }) || changed;
       }
     }
-    const h = this.hints.get(hash);
-    if (h && h.status === 'seen') {
-      h.status = 'refuted';
-      changed = true;
+    for (const h of this.hintsOf(hash)) {
+      if (h.status === 'seen') {
+        h.status = 'refuted';
+        changed = true;
+      }
     }
     this.loggedTx.add(hash);
     return changed;
   }
 
+  /** The hints of one tx: a direct buy (`hash`) or every recipient of a helper buy (`hash#i`). */
+  private hintsOf(hash: string): LedgerBuy[] {
+    return [...this.hints.values()].filter((h) => h.txHash === hash);
+  }
+
+  private dropHints(hash: string): void {
+    for (const [k, h] of this.hints) if (h.txHash === hash) this.hints.delete(k);
+  }
+
   /** Team / dev feed hints (tx hashes) neither confirmed nor refuted yet; taxed buys do not matter. */
   pendingHints(): Hex[] {
-    return [...this.hints.values()].filter((h) => h.status === 'seen' && this.kindOf(h) !== 'other').map((h) => h.txHash as Hex);
+    return [...new Set([...this.hints.values()].filter((h) => h.status === 'seen' && this.kindOf(h) !== 'other').map((h) => h.txHash as Hex))];
   }
 
   /**
