@@ -217,6 +217,26 @@ describe('log-originated launches (third-party launcher contracts)', () => {
     h.backend.resolveFill!(null);
   });
 
+  it('re-prices with whatever time is left when the decision comes closer than the lead to the first send', async () => {
+    // 31 Oct 2026 00:05 UTC: the decision fired on the 2nd of 6 helper-contract buy logs with ~200 ms
+    // to the first send; the re-price (lead 250 ms) was skipped for lack of time and all six burst
+    // members reverted SlippageExceeded. Now the re-price runs at max(now, send − lead).
+    const h = harness([TEAM_BUY_PLAY], DEFAULT_LAUNCHERS as string[], { repriceLeadMs: 150 });
+    await h.sniper.start();
+    h.warm();
+    const buy = teamBuyTx(0.19);
+    h.chain.receipts.set(buy.hash, buyReceipt(buy, h.blockAt(8)));
+    h.second(new Map([[2, [launcherTx()]], [8, [buy]]]), 0, 8); // the team buy confirms at T+0.8 s: < 150 ms to the first send
+    h.sched.advance(h.sched.t);
+    await waitFor(() => h.backend.orders.length === 1);
+    const run = h.backend.orders[0]!.run;
+    const m = run.notes.join('; ').match(/repriced (\d+) ms before the first send/);
+    expect(m).not.toBeNull();
+    expect(Number(m![1])).toBeLessThan(150); // not the full lead: it used the time that was left
+    expect(run.minTokensOut).toBeGreaterThan(0n);
+    h.backend.resolveFill!(null);
+  });
+
   it('a launcher the config does not list is caught from the node ws TokenLaunched log (emitter = the factory)', async () => {
     const h = harness([TEAM_BUY_PLAY], []); // no LAUNCHERS at all
     await h.sniper.start();

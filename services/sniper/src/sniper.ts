@@ -1004,9 +1004,10 @@ export class Sniper {
    * launch-second buys applied to the launch reserves, or a fresh 'latest' read (≤ 25 ms, the
    * fast endpoints), whichever has absorbed more buying (the larger quote reserve).
    */
-  private async freshReserves(curve: Address, lg: LaunchSecondLedger | undefined, afterLaunch: Reserves | null, creatorTaxBps: number, current: Reserves): Promise<Reserves> {
+  private async freshReserves(curve: Address, lg: LaunchSecondLedger | undefined, afterLaunch: Reserves | null, creatorTaxBps: number, current: Reserves, budgetMs = 60): Promise<Reserves> {
     const fromLedger = lg && afterLaunch && lg.priceMovingBuys > 0 ? lg.reservesAfter(afterLaunch, creatorTaxBps) : null;
-    const fromRpc = await Promise.race([this.o.chain.getReserves(curve).catch(() => null), sleep(60).then(() => null)]);
+    // budget 0: no time left for an RPC round trip, the ledger's confirmed logs and the poll decide
+    const fromRpc = budgetMs > 0 ? await Promise.race([this.o.chain.getReserves(curve).catch(() => null), sleep(budgetMs).then(() => null)]) : null;
     let best = current;
     for (const r of [fromLedger, fromRpc]) if (r && r.quote > best.quote) best = r;
     return best;
@@ -1328,8 +1329,8 @@ export class Sniper {
     }
     // 4b) re-price right before the first send (see `repriceLeadMs`)
     const lead = this.o.repriceLeadMs ?? 0;
-    if (lead > 0 && plan.times[0]! - scheduler.now() > lead + 20) {
-      // poll 'latest' reserves from the fast endpoints while waiting (every ~100 ms): a single
+    if (lead > 0 && plan.times.length > 0) {
+      // poll 'latest' reserves from the fast endpoints while waiting (every ~50 ms): a single
       // read at the re-price point lost the race to its own 25 ms budget on 30 Oct 2026 (17:40
       // UTC: 0.97 ETH of helper-contract team buys, the ledger had seen half, the read timed out)
       const polled: { r: Reserves | null; on: boolean } = { r: null, on: true };
@@ -1337,26 +1338,36 @@ export class Sniper {
         while (polled.on) {
           const r = await this.o.chain.getReserves(curve).catch(() => null);
           if (r && (!polled.r || r.quote > polled.r.quote)) polled.r = r;
-          if (polled.on) await sleep(100);
+          if (polled.on) await sleep(50);
         }
       })();
-      await new Promise<void>((res) => scheduler.at(plan.times[0]! - lead, res));
+      // Re-price `lead` ms before the first send, or right now when less than that is left: the
+      // decision can fire mid-way through a helper contract's buy logs (31 Oct 2026 00:05 UTC: 2 of
+      // 6 logs seen, 0.22 of 0.89 ETH priced, no time for the lead → six SlippageExceeded reverts).
+      // Whatever time is left, the ledger's confirmed logs and the poll are re-read before signing.
+      const sendAt = plan.times[0]!;
+      const at = Math.max(scheduler.now(), sendAt - lead);
+      const actualLead = sendAt - at;
+      if (at > scheduler.now()) await new Promise<void>((res) => scheduler.at(at, res));
       polled.on = false;
       if (run.status !== 'pending') {
         this.endRun(run, 'aborted', `aborted before the burst: ${run.abortReason ?? ''}`);
         return;
       }
-      const fresh = await this.freshReserves(curve, lg, afterLaunch, l.event.creatorTaxBps, polled.r && polled.r.quote > reserves.quote ? polled.r : reserves);
+      const budget = Math.max(0, Math.min(60, sendAt - scheduler.now() - 10));
+      const fresh = await this.freshReserves(curve, lg, afterLaunch, l.event.creatorTaxBps, polled.r && polled.r.quote > reserves.quote ? polled.r : reserves, budget);
       if (fresh.quote !== reserves.quote || fresh.token !== reserves.token) {
         const rc2 = this.risk.reserveCheck(p, fresh);
         if (!rc2.ok) {
-          this.endRun(run, 'aborted', `repriced ${lead} ms before the first send: ${rc2.reasons.join('; ')}`);
+          this.endRun(run, 'aborted', `repriced ${actualLead} ms before the first send: ${rc2.reasons.join('; ')}`);
           return;
         }
         const mo2 = planMinOut({ ...p, maxTaxBps: run.maxTaxBps }, fresh, run.quoteIn, l.event.creatorTaxBps);
-        run.notes.push(`repriced ${lead} ms before the first send: expected ${mo2.expectedOut} (was ${mo.expectedOut}), ${lg?.priceMovingBuys ?? 0} launch-second buy(s) priced`);
+        run.notes.push(`repriced ${actualLead} ms before the first send: expected ${mo2.expectedOut} (was ${mo.expectedOut}), ${lg?.priceMovingBuys ?? 0} launch-second buy(s) priced`);
         run.minTokensOut = mo2.minTokensOut;
         reserves = fresh;
+      } else {
+        run.notes.push(`repriced ${actualLead} ms before the first send: unchanged, ${lg?.priceMovingBuys ?? 0} launch-second buy(s) priced`);
       }
       plan = clock.planBurst({ launchTs: l.ts, now: scheduler.now(), burst: p.burst, rttMs });
       run.plan = { ...plan, rttMs };
