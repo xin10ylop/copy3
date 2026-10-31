@@ -56,17 +56,23 @@ Change a setting without a restart: plays and settings are read from the DB on c
 ## What we know (numbers)
 
 **The 30-day backtest (28 Sep – 28 Oct) was evaluated per trade; the bot can only act per block.**
-Re-evaluated per block (exits checked after each block, the sell landing one block later):
+Re-evaluated per block (exits checked after each block, the sell landing one block later), **in the
+bot's own units** (sell value vs cost, as `hoodctl trades` prints it; the simulator's rules were checked
+against `position-logic.ts` on 31 Oct):
 
-| our rule, first in block, 0.07 ETH buys | month |
-|---|---|
-| per-trade (the original figure) | +25.2 ETH |
-| per-block, realistic | **+4.8 ETH** (bounds +4.6 … +5.8) |
-| per-block, last 10 days of the window (19–28 Oct) | +5.0 ETH (≈ +0.5/day) |
+| our rule, first in block, 0.07 ETH buys | month | last 10 days | low-volume days (≤ 60 launches) | high-volume days |
+|---|---|---|---|---|
+| original exits (trail 50/20, stop 40 on price), per trade | +25.2 ETH | | | |
+| original exits, per block | +4.8 ETH | | | |
+| **current exits (trail arm 20 / drop 10, stop 20, timeout 60, dump exit), per block** | **+8.9 ETH**, 41 % wins, 8 losing days of 31 | **+5.0 ETH** | **+0.17 / day** | **+0.31 / day** |
 
-Per-block walk-forward refit of the exits found nothing better than the current preset out of sample.
-Buy size: return per trade falls with size (1.66 % at 0.07, 1.35 % at 0.2, 0.65 % at 0.5); the useful
-top is 0.2–0.3 ETH per buy on this data.
+Stop 20–30 are within noise of each other (20 best on the last 10 days and on low-volume days); no stop is
+worse. Team threshold 0.15–0.2 raises the win rate to 48–50 % and cuts losing days to 5–6, but costs 40 %
+of the low-volume-day result, so 0.02 stays. Later entries (survivors at +10…+30 s) and post-dump entries
+lose in every variant: on this launchpad the only positive-expectation entry is the first block after the
+tax drops, on team launches. Chain-replay numbers quoted per launch with a price-based stop are looser
+than the bot (a 20 % stop on sell value ≈ a 10 % stop on price); use `scripts/backtest/audit_trades.py`
+(bot units) for any live-vs-model comparison.
 
 **Race.** Before the fix: 20 of 33 live sends first in block (61 %). After it (31 Oct, from 15:14 Beirut): decisions in 24–200 ms (helper and proxy buys decoded from the feed), first in block 6 of 7. Losses: 3 to a faster bot in the same block, 10 to
 late decisions (helper-contract team buys were only known from node logs 300–1 100 ms after the launch).
@@ -82,8 +88,7 @@ No filter widening adds volume at the same quality except 0.02 + 2 wallets (appl
 our real race positions +0.0009; backtest rule at our positions +0.0010; first in block +0.0034.
 The four trades run on the fixed code (TUSK 21:14, ENGINE, BELIEF, APPLE) match the backtest row for row.
 
-Realistic expectation at 0.07 per buy: first in block ≈ +0.5 ETH/day at ~90 launches/day; × ⅓ at the
-current race rate; × volume/90. Not the +24.7 ETH/month quoted before 31 Oct.
+Realistic expectation at 0.07 per buy, current exits: first in block ≈ +0.3 ETH/day on busy days (~90 launches), ≈ +0.17 on thin days; × the race rate (≈ 85 % after the 31 Oct fixes); not the +24.7 ETH/month quoted before 31 Oct.
 
 ## Open work
 
