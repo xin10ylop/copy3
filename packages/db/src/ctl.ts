@@ -198,12 +198,21 @@ export interface TradeRow {
   notes?: string | null;
 }
 
-/** The note that explains a row: the abort reason for aborted runs, the exit-signal reading for closed ones. */
-function whyOf(r: TradeRow): string | null {
-  if (!r.notes) return null;
+/**
+ * The notes that explain a row: the decision timing ("decided N ms after the launch block arrived",
+ * the race's starting point), then the exit-signal reading for closed runs or the last note (the
+ * abort reason) for the others.
+ */
+function whyOf(r: TradeRow): string[] {
+  if (!r.notes) return [];
   const parts = r.notes.split('; ').map((x) => x.trim()).filter(Boolean);
-  if (r.status === 'closed') return parts.find((x) => x.startsWith('exit ')) ?? null;
-  return parts.filter((x) => !x.startsWith('exit ')).slice(-1)[0] ?? null;
+  const out: string[] = [];
+  const decided = parts.find((x) => x.startsWith('decided '));
+  if (decided) out.push(decided);
+  const rest = parts.filter((x) => !x.startsWith('decided '));
+  const last = r.status === 'closed' ? rest.find((x) => x.startsWith('exit ')) : rest.filter((x) => !x.startsWith('exit ')).slice(-1)[0];
+  if (last) out.push(last);
+  return out;
 }
 
 /** `hoodctl trades [days]`: one line per trade, net return and the running total (exported for tests). */
@@ -234,8 +243,7 @@ export function formatTrades(rows: TradeRow[], tz = DISPLAY_TZ): string[] {
     out.push(
       `${fmtWhen(r.decidedAt, tz)}  ${r.mode.padEnd(5)}  ${(r.symbol ?? '?').slice(0, 11).padEnd(11)}  ${r.buyEth === null ? '-'.padStart(7) : r.buyEth.toFixed(4).padStart(7)}   ${result.padEnd(9)}  ${closed ? (r.pnlEth! >= 0 ? '+' : '') + r.pnlEth!.toFixed(5) : '-'.padStart(8)}  ${pct === null ? '-'.padStart(6) : ((pct >= 0 ? '+' : '') + pct.toFixed(1) + '%').padStart(6)}  ${r.heldSec === null ? '-'.padStart(5) : (r.heldSec.toFixed(0) + 's').padStart(5)}   ${(closed ? `${r.exit ?? '?'}, ${race}` : race).padEnd(20)}  ${closed ? (cum >= 0 ? '+' : '') + cum.toFixed(5) : ''}`,
     );
-    const why = whyOf(r);
-    if (why) out.push(`${' '.repeat(28)}└ ${why.slice(0, 150)}`);
+    for (const why of whyOf(r)) out.push(`${' '.repeat(28)}└ ${why.slice(0, 150)}`);
   }
   out.push('');
   out.push(`${n} closed trade(s), ${wins} win(s), net ${cum >= 0 ? '+' : ''}${cum.toFixed(5)} ETH`);
