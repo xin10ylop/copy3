@@ -35,13 +35,15 @@ tty=()
 # run a command in an app container: exec into a running tracker (fast), else a one-off container
 app_run() {
   if [[ -n "$(compose ps -q --status running tracker 2>/dev/null)" ]]; then
-    compose exec "${tty[@]}" tracker "$@"
+    compose exec -e HOOD_TZ="${HOOD_TZ:-UTC}" "${tty[@]}" tracker "$@"
   else
-    compose run --rm --no-deps "${tty[@]}" migrate "$@"
+    compose run --rm --no-deps -e HOOD_TZ="${HOOD_TZ:-UTC}" "${tty[@]}" migrate "$@"
   fi
 }
 
-ctl() { app_run pnpm --silent --filter @hood/db ctl "$@"; }
+# timestamps hoodctl prints: HOOD_TZ in the environment, else HOOD_TZ= in .env.ohio, else UTC
+HOOD_TZ="${HOOD_TZ:-$(sed -n 's/^HOOD_TZ=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)}"
+ctl() { HOOD_TZ="${HOOD_TZ:-UTC}" app_run pnpm --silent --filter @hood/db ctl "$@"; }
 
 cmd="${1:-help}"
 [[ $# -gt 0 ]] && shift

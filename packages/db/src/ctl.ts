@@ -109,16 +109,37 @@ const SENT = new Set(['mined', 'reverted', 'not_mined']);
 const LANDED = new Set(['mined', 'reverted']);
 
 /** `hoodctl race` output: one row per measurement, then the summary per source (exported for tests). */
-export function formatRace(rows: RaceRow[]): string[] {
+/** Time zone for the timestamps hoodctl prints: HOOD_TZ (IANA name, e.g. Asia/Beirut), default UTC. */
+export const DISPLAY_TZ = process.env.HOOD_TZ || 'UTC';
+const tzFormats = new Map<string, Intl.DateTimeFormat>();
+/** `YYYY-MM-DD HH:mm:ss` in `tz` (an invalid zone falls back to UTC). */
+export function fmtWhen(d: Date, tz = DISPLAY_TZ): string {
+  let f = tzFormats.get(tz);
+  if (!f) {
+    try {
+      f = new Intl.DateTimeFormat('sv-SE', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+    } catch {
+      f = new Intl.DateTimeFormat('sv-SE', { timeZone: 'UTC', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+    }
+    tzFormats.set(tz, f);
+  }
+  return f.format(d).replace('T', ' ');
+}
+/** The zone label for a column header: `UTC` or the city part of the IANA name (`Beirut`). */
+export function tzLabel(tz = DISPLAY_TZ): string {
+  return tz === 'UTC' ? 'UTC' : (tz.split('/').pop() ?? tz).replace(/_/g, ' ');
+}
+
+export function formatRace(rows: RaceRow[], tz = DISPLAY_TZ): string[] {
   const out: string[] = [];
-  out.push('decided_at (UTC)     source launch tx      status      offset txIdx ahead inBlock  sent-vs-boundary');
+  out.push(`${`decided_at (${tzLabel(tz)})`.padEnd(21)}source launch tx      status      offset txIdx ahead inBlock  sent-vs-boundary`);
   for (const r of rows) {
     const x = r.race;
     const status = x.status ?? '?';
     const sent = x.sendVsBoundaryMs === undefined ? '' : `${x.sendVsBoundaryMs >= 0 ? '+' : ''}${x.sendVsBoundaryMs} ms`;
     const why = status === 'reverted' && x.revertReason ? `  ${x.revertReason}` : !SENT.has(status) && x.reason ? `  ${x.reason}` : '';
     out.push(
-      `${r.decidedAt.toISOString().slice(0, 19).replace('T', ' ')}  ${(x.source ?? '?').padEnd(6)} ${short(r.launchTx).padEnd(13)} ${status.padEnd(11)} ${cell(x.blockOffset, true).padStart(6)} ${cell(x.txIndex).padStart(5)} ${cell(x.buysAhead).padStart(5)} ${cell(x.buysInBlock).padStart(7)}  ${sent.padStart(16)}${why}`,
+      `${fmtWhen(r.decidedAt, tz)}  ${(x.source ?? '?').padEnd(6)} ${short(r.launchTx).padEnd(13)} ${status.padEnd(11)} ${cell(x.blockOffset, true).padStart(6)} ${cell(x.txIndex).padStart(5)} ${cell(x.buysAhead).padStart(5)} ${cell(x.buysInBlock).padStart(7)}  ${sent.padStart(16)}${why}`,
     );
   }
   const sources = [...new Set(rows.map((r) => r.race.source ?? '?'))].sort();
@@ -186,9 +207,9 @@ function whyOf(r: TradeRow): string | null {
 }
 
 /** `hoodctl trades [days]`: one line per trade, net return and the running total (exported for tests). */
-export function formatTrades(rows: TradeRow[]): string[] {
+export function formatTrades(rows: TradeRow[], tz = DISPLAY_TZ): string[] {
   const out: string[] = [];
-  out.push('when (UTC)           mode   symbol       buy ETH   result      pnl ETH    pnl %   held   race                  cumulative');
+  out.push(`${`when (${tzLabel(tz)})`.padEnd(21)}mode   symbol       buy ETH   result      pnl ETH    pnl %   held   race                  cumulative`);
   let cum = 0;
   let wins = 0;
   let n = 0;
@@ -211,7 +232,7 @@ export function formatTrades(rows: TradeRow[]): string[] {
       : '-';
     const result = closed ? (r.pnlEth! > 0 ? 'WIN' : 'loss') : r.status;
     out.push(
-      `${r.decidedAt.toISOString().slice(0, 19).replace('T', ' ')}  ${r.mode.padEnd(5)}  ${(r.symbol ?? '?').slice(0, 11).padEnd(11)}  ${r.buyEth === null ? '-'.padStart(7) : r.buyEth.toFixed(4).padStart(7)}   ${result.padEnd(9)}  ${closed ? (r.pnlEth! >= 0 ? '+' : '') + r.pnlEth!.toFixed(5) : '-'.padStart(8)}  ${pct === null ? '-'.padStart(6) : ((pct >= 0 ? '+' : '') + pct.toFixed(1) + '%').padStart(6)}  ${r.heldSec === null ? '-'.padStart(5) : (r.heldSec.toFixed(0) + 's').padStart(5)}   ${(closed ? `${r.exit ?? '?'}, ${race}` : race).padEnd(20)}  ${closed ? (cum >= 0 ? '+' : '') + cum.toFixed(5) : ''}`,
+      `${fmtWhen(r.decidedAt, tz)}  ${r.mode.padEnd(5)}  ${(r.symbol ?? '?').slice(0, 11).padEnd(11)}  ${r.buyEth === null ? '-'.padStart(7) : r.buyEth.toFixed(4).padStart(7)}   ${result.padEnd(9)}  ${closed ? (r.pnlEth! >= 0 ? '+' : '') + r.pnlEth!.toFixed(5) : '-'.padStart(8)}  ${pct === null ? '-'.padStart(6) : ((pct >= 0 ? '+' : '') + pct.toFixed(1) + '%').padStart(6)}  ${r.heldSec === null ? '-'.padStart(5) : (r.heldSec.toFixed(0) + 's').padStart(5)}   ${(closed ? `${r.exit ?? '?'}, ${race}` : race).padEnd(20)}  ${closed ? (cum >= 0 ? '+' : '') + cum.toFixed(5) : ''}`,
     );
     const why = whyOf(r);
     if (why) out.push(`${' '.repeat(28)}└ ${why.slice(0, 150)}`);
@@ -313,7 +334,7 @@ async function main(sql: Sql, cmd: string, rest: string[]): Promise<void> {
     }
     case 'events': {
       const rows = await q<{ ts: Date; level: string; type: string; payload: unknown }>(`select ts, level, type, payload from events order by id desc limit $1`, [n(rest[0], 30)]);
-      for (const r of rows.reverse()) console.log(`${new Date(r.ts).toISOString()} ${r.level.padEnd(5)} ${r.type.padEnd(22)} ${JSON.stringify(r.payload).slice(0, 140)}`);
+      for (const r of rows.reverse()) console.log(`${fmtWhen(new Date(r.ts))} ${r.level.padEnd(5)} ${r.type.padEnd(22)} ${JSON.stringify(r.payload).slice(0, 140)}`);
       return;
     }
     default:

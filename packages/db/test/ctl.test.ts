@@ -1,6 +1,6 @@
 /** hoodctl (packages/db/src/ctl.ts): importing it has no side effects; `status` reads the kill switch like the sniper does. */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { formatRace, formatTrades, keygen, killSwitchOn, race, status } from '../src/ctl.js';
+import { fmtWhen, formatRace, formatTrades, keygen, killSwitchOn, race, status, tzLabel } from '../src/ctl.js';
 import { insertSnipe, setSetting } from '../src/helpers.js';
 import { makeTestDb, reset, type TestDb } from './pglite.js';
 
@@ -88,6 +88,20 @@ describe('hoodctl race: where probe txs / live buys landed vs the first T+1 bloc
     expect(text).toContain('probe: 1 run(s), 1 sent, 1 landed');
     expect(text).toContain('all: 2 run(s), 2 sent, 2 landed');
     expect(formatRace([]).join('\n')).toMatch(/no race measurements yet/);
+  });
+
+  it('prints timestamps in HOOD_TZ (Beirut = UTC+2 after the October clock change), header named after the zone', () => {
+    const at = new Date('2026-10-29T12:00:00Z');
+    expect(fmtWhen(at, 'Asia/Beirut')).toBe('2026-10-29 14:00:00');
+    expect(fmtWhen(at, 'UTC')).toBe('2026-10-29 12:00:00');
+    expect(fmtWhen(at, 'Not/AZone')).toBe('2026-10-29 12:00:00');
+    expect(tzLabel('Asia/Beirut')).toBe('Beirut');
+    const lines = formatRace([{ decidedAt: at, launchTx: LTX('1'), race: { source: 'live', status: 'mined', blockOffset: 0, txIndex: 0, buysAhead: 0, buysInBlock: 1 } }], 'Asia/Beirut');
+    expect(lines[0]).toMatch(/^decided_at \(Beirut\)/);
+    expect(lines[1]).toMatch(/^2026-10-29 14:00:00  live/);
+    const t = formatTrades([{ id: 1, decidedAt: at, mode: 'live', status: 'closed', symbol: 'X', buyEth: 0.002, pnlEth: 0.0001, exit: 'timeout', heldSec: 60, race: null }], 'Asia/Beirut');
+    expect(t[0]).toMatch(/^when \(Beirut\)/);
+    expect(t[1]).toMatch(/^2026-10-29 14:00:00  live/);
   });
 });
 
