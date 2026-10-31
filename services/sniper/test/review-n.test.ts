@@ -618,14 +618,17 @@ describe('N16: the TokenLaunched ws log confirms a launch as soon as it arrives'
 describe('receipt race (launcher-contract launches are built from the receipt)', () => {
   const receipt = { transactionHash: `0x${'77'.repeat(32)}`, status: '0x1', blockNumber: '0x5f5e100', gasUsed: '0x5208', logs: [], transactionIndex: '0x2', blockHash: `0x${'ab'.repeat(32)}`, cumulativeGasUsed: '0x5208', effectiveGasPrice: '0x1', from: `0x${'11'.repeat(20)}`, to: `0x${'22'.repeat(20)}`, contractAddress: null, logsBloom: `0x${'00'.repeat(256)}`, type: '0x2' };
   const endpoint = (name: string, answer: () => Promise<unknown>, calls: string[]) =>
-    custom({
-      async request({ method }: { method: string }) {
-        calls.push(`${name}:${method}`);
-        if (method === 'eth_getTransactionReceipt') return answer();
-        if (method === 'eth_chainId') return '0x1237';
-        throw new Error(`unexpected ${method}`);
+    custom(
+      {
+        async request({ method }: { method: string }) {
+          calls.push(`${name}:${method}`);
+          if (method === 'eth_getTransactionReceipt') return answer();
+          if (method === 'eth_chainId') return '0x1237';
+          throw new Error(`unexpected ${method}`);
+        },
       },
-    });
+      { retryCount: 0 }, // like the live sequencer-RPC clients (http(..., { retryCount: 0 }))
+    );
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
   it('the sequencer RPC is asked first and alone; the lagging archive node is not even called when the sequencer has the receipt', async () => {

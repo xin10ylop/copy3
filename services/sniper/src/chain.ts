@@ -211,7 +211,8 @@ export class ViemChain implements ChainClient {
   readonly logChunk = { chunk: LOG_CHUNK_BLOCKS };
 
   /**
-   * Receipt endpoints raced by `getReceipt` (first to return the receipt wins). A launcher-contract
+   * Receipt endpoints: `getReceipt` and 'latest' `getReserves` ask the sequencer RPC(s) first and
+   * fall back to the archive node (`http`, metered) only when they error. A launcher-contract
    * launch is built from its RECEIPT; Alchemy served it ~1.2 s after the launch block on the Ohio
    * box (29 Oct 2026: a 0.427 ETH team launch was recognised after the +1 s boundary and never
    * sniped), the sequencer's own RPC serves it within ~100 ms. The http client is always included.
