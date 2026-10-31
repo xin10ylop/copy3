@@ -45,8 +45,13 @@ export const SEL_TRANSFER_FROM = '0x23b872dd';
  * node's logs (31 Oct 2026: the decision fired on 2 of 6 logs with 200 ms left to the send).
  */
 export const SEL_HELPER_BUY = '0x6f49227e';
+/**
+ * A proxy buy (0xc0bba43f…, 102 team launches in the 30-day data; META 31 Oct 2026): one tx per
+ * wallet, `(address curve, uint256 minOut, address recipient)` with `msg.value` = quoteIn.
+ */
+export const SEL_PROXY_BUY = '0x240acbf8';
 /** selectors the ledger cares about (buffered per second by the sniper) */
-export const LEDGER_SELECTORS: ReadonlySet<string> = new Set([SEL_BUY, SEL_SELL, SEL_TRANSFER, SEL_TRANSFER_FROM, SEL_HELPER_BUY]);
+export const LEDGER_SELECTORS: ReadonlySet<string> = new Set([SEL_BUY, SEL_SELL, SEL_TRANSFER, SEL_TRANSFER_FROM, SEL_HELPER_BUY, SEL_PROXY_BUY]);
 
 const ZERO = '0x0000000000000000000000000000000000000000';
 const word = (input: string, i: number): string => input.slice(10 + i * 64, 10 + (i + 1) * 64);
@@ -244,6 +249,13 @@ export class LaunchSecondLedger {
       const quoteIn = BigInt(`0x${word(input, 0)}`);
       if (quoteIn === 0n || tx.value !== quoteIn) return null; // a native-quote buy with value ≠ quoteIn reverts
       this.hints.set(hash, { txHash: hash, recipient: wordAddr(input, 2), quoteIn, block, logIndex: -1, source: 'feed', status: 'seen' });
+      return 'buy';
+    }
+    if (tx.selector === SEL_PROXY_BUY && input.length >= 10 + 3 * 64 && wordAddr(input, 0) === this.curve) {
+      // proxy buy: like curve.buy but through a contract (the CurveBuy log names the contract as buyer)
+      this.ingested.add(hash);
+      if (tx.value === 0n || this.loggedTx.has(hash)) return null;
+      this.hints.set(hash, { txHash: hash, recipient: wordAddr(input, 2), quoteIn: tx.value, block, logIndex: -1, source: 'feed', status: 'seen' });
       return 'buy';
     }
     if (tx.selector === SEL_HELPER_BUY) {

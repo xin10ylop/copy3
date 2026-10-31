@@ -277,6 +277,17 @@ describe('launch-second fingerprint: ledger → rules → burst at T+1', () => {
     h.scripted!.resolveFill!(null);
   });
 
+  it('a proxy buy (0x240acbf8: curve, minOut, recipient; value = quoteIn) is a feed hint for its recipient', () => {
+    const lg = new LaunchSecondLedger({ event: { deployer: LAUNCH.deployer, name: 'S', symbol: 'S', launchKind: 'launchToken', exemptions: [TEAM], creatorFeeRecipient: TEAM, creatorTaxBps: 0, devBuyQuoteIn: 0n, pairToken: QUOTE_TOKENS.eth, launchConfigId: 0n }, block: LAUNCH.block, ts: T, receivedAt: 0, txHash: LAUNCH.txHash, token: LAUNCH.token, curve: LAUNCH.curve, addressSource: 'receipt', source: 'feed', origin: 'feed' } as never);
+    lg.setAddresses(LAUNCH.token, LAUNCH.curve);
+    const w = (x: bigint | string): string => (typeof x === 'string' ? x.slice(2).toLowerCase().padStart(64, '0') : x.toString(16).padStart(64, '0'));
+    const mk = (curve: Address, value: bigint): DecodedTx =>
+      decodedTxFromRpc({ ...launchFixture.tx, hash: `0x${(++n).toString(16).padStart(4, '0').repeat(16)}` as Hex, from: TEAM, to: '0xc0bba43f04882558555296ace19a3f1ceda7bf8a' as Address, value, nonce: n, input: `0x240acbf8${w(curve)}${w(1n)}${w(TEAM)}` as Hex });
+    expect(lg.ingestTx(mk('0x9999999999999999999999999999999999999999' as Address, parseEther('0.13')), LAUNCH.block + 3)).toBeNull();
+    expect(lg.ingestTx(mk(LAUNCH.curve, parseEther('0.13')), LAUNCH.block + 3)).toBe('buy');
+    expect(lg.stats().seen).toEqual({ teamBuyEth: 0.13, teamBuyers: 1, devBuyEth: 0 });
+  });
+
   it('a helper buy for ANOTHER curve, or whose amounts do not add up to the value, is not a hint; a reverted helper buy refutes every recipient', async () => {
     const wallets = [TEAM, '0xabababababababababababababababababababab' as Address];
     const lg = new LaunchSecondLedger({ event: { deployer: LAUNCH.deployer, name: 'S', symbol: 'S', launchKind: 'launchToken', exemptions: wallets, creatorFeeRecipient: TEAM, creatorTaxBps: 0, devBuyQuoteIn: 0n, pairToken: QUOTE_TOKENS.eth, launchConfigId: 0n }, block: LAUNCH.block, ts: T, receivedAt: 0, txHash: LAUNCH.txHash, token: LAUNCH.token, curve: LAUNCH.curve, addressSource: 'receipt', source: 'feed', origin: 'feed' } as never);
