@@ -1,6 +1,6 @@
 /** hoodctl (packages/db/src/ctl.ts): importing it has no side effects; `status` reads the kill switch like the sniper does. */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { fmtWhen, formatRace, formatTrades, keygen, killSwitchOn, race, status, tzLabel } from '../src/ctl.js';
+import { epochAt, fmtWhen, formatRace, formatTrades, keygen, killSwitchOn, race, status, trades, tzLabel } from '../src/ctl.js';
 import { insertSnipe, setSetting } from '../src/helpers.js';
 import { makeTestDb, reset, type TestDb } from './pglite.js';
 
@@ -139,5 +139,40 @@ describe('hoodctl trades: one line per trade with the running total', () => {
     expect(lines[7]).toBe(`${' '.repeat(28)}└ decided 412 ms after the launch block arrived (launch-second)`);
     expect(lines[8]).toMatch(/└ exit stop_loss at -32\.1% \(peak \+29\.6%/);
     expect(lines[lines.length - 1]).toBe('3 closed trade(s), 1 win(s), net -0.00103 ETH');
+  });
+});
+
+describe('hoodctl epoch: pnl / race / trades / status count from a moment, older rows stay', () => {
+  it('trades and race filter on the epoch and say so; "all" ignores it; status adds a since-epoch line', async () => {
+    await db.sql.query(`delete from snipes`);
+    const old = new Date(Date.now() - 6 * 3600_000);
+    const fresh = new Date(Date.now() - 1 * 3600_000);
+    for (const [i, at] of [old, fresh].entries()) {
+      await db.sql.query(
+        `insert into snipes (token, curve, mode, status, decided_at, closed_at, quote_in, realized_pnl_eth, decision, sells, notes)
+         values ($1, $1, 'live', 'closed', $2, $2, 2000000000000000, $3, $4::jsonb, '[]'::jsonb, '')`,
+        [`0x${String(i).repeat(40)}`, at, i === 0 ? -0.001 : 0.002, JSON.stringify({ launch: { event: { symbol: i === 0 ? 'OLD' : 'NEW' } }, race: { status: 'mined', blockOffset: 0, buysAhead: 0 } })],
+      );
+    }
+    const epoch = new Date(Date.now() - 3 * 3600_000);
+    await setSetting(db.sql, 'epoch', { at: epoch.toISOString(), note: 'race fix' });
+    expect((await epochAt(db.sql))?.note).toBe('race fix');
+    let lines: string[] = [];
+    await trades(db.sql, 2, (l) => lines.push(l));
+    expect(lines.join('\n')).toContain('NEW');
+    expect(lines.join('\n')).not.toContain('OLD');
+    expect(lines[lines.length - 1]).toMatch(/^\(since the epoch \d{4}-\d\d-\d\d \d\d:\d\d:\d\d, "race fix"; add "all" to see every row\)$/);
+    lines = [];
+    await trades(db.sql, 2, (l) => lines.push(l), true);
+    expect(lines.join('\n')).toContain('OLD');
+    expect(lines.join('\n')).not.toContain('since the epoch');
+    lines = [];
+    await race(db.sql, 2, (l) => lines.push(l));
+    expect(lines.filter((l) => /^\d{4}-/.test(l))).toHaveLength(1);
+    lines = [];
+    await status(db.sql, (l) => lines.push(l));
+    expect(lines.find((l) => l.startsWith('since epoch'))).toMatch(/"race fix" → live: 1 closed, 0\.0020 ETH/);
+    await db.sql.query(`delete from settings where key = 'epoch'`);
+    await db.sql.query(`delete from snipes`);
   });
 });

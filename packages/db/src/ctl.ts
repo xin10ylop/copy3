@@ -38,6 +38,28 @@ export function killSwitchOn(v: unknown): boolean {
 }
 
 /** `hoodctl status` (exported for tests; `out` receives each line). */
+/**
+ * The epoch: `settings.epoch = { at, note }`. `hoodctl pnl / race / trades / status` count from it
+ * (rows before it stay in the database; `hoodctl trades 30 all` shows them). Set it when the code
+ * changed enough that older trades no longer describe the bot: `hoodctl epoch now "race fix"`.
+ */
+export async function epochAt(sql: Sql): Promise<{ at: Date; note: string | null } | null> {
+  const rows = await sql.query<{ value: { at?: string; note?: string } | string }>(`select value from settings where key = 'epoch'`);
+  const v = rows[0]?.value;
+  const o = typeof v === 'string' ? (JSON.parse(v) as { at?: string; note?: string }) : v;
+  if (!o?.at) return null;
+  const at = new Date(o.at);
+  return Number.isNaN(at.getTime()) ? null : { at, note: o.note ?? null };
+}
+/** SQL: the later of the day window and the epoch (ignored with `all`). */
+const sinceSql = (col: string, all: boolean): string =>
+  all ? `${col} >= now() - ($1 || ' days')::interval` : `${col} >= greatest(now() - ($1 || ' days')::interval, coalesce((select (value->>'at')::timestamptz from settings where key = 'epoch'), '-infinity'::timestamptz))`;
+async function epochLine(sql: Sql, all: boolean): Promise<string | null> {
+  if (all) return null;
+  const e = await epochAt(sql);
+  return e ? `(since the epoch ${fmtWhen(e.at)}${e.note ? `, "${e.note}"` : ''}; add "all" to see every row)` : null;
+}
+
 export async function status(sql: Sql, out: (line: string) => void = console.log): Promise<void> {
   const q = <T extends Row = Row>(text: string, params: unknown[] = []): Promise<T[]> => sql.query<T>(text, params);
   const kill = await getSetting<unknown>(sql, 'kill_switch');
@@ -53,15 +75,23 @@ export async function status(sql: Sql, out: (line: string) => void = console.log
   out(`armed       : ${armed?.c ?? 0}`);
   out(`open        : ${open.map((r) => `${r.mode}=${r.c}`).join(' ') || 'none'}`);
   out(`today PnL   : ${today.map((r) => `${r.mode}: ${r.n} closed, ${Number(r.pnl ?? 0).toFixed(4)} ETH`).join(' | ') || 'no closed snipes yet'}`);
+  const e = await epochAt(sql);
+  if (e) {
+    const since = await sql.query<{ mode: string; n: number; pnl: number | null }>(
+      `select mode, count(*) as n, sum(realized_pnl_eth) as pnl from snipes where status = 'closed' and closed_at >= $1 group by mode`,
+      [e.at],
+    );
+    out(`since epoch : ${fmtWhen(e.at)}${e.note ? ` "${e.note}"` : ''} → ${since.map((r) => `${r.mode}: ${r.n} closed, ${Number(r.pnl ?? 0).toFixed(4)} ETH`).join(' | ') || 'no closed snipes yet'}`);
+  }
   out(`auto_approve: ${sizing ? JSON.stringify(sizing) : 'not set (run seed)'}`);
 }
 
-async function pnl(sql: Sql, days: number): Promise<void> {
+async function pnl(sql: Sql, days: number, all = false): Promise<void> {
   const q = <T extends Row = Row>(text: string, params: unknown[] = []): Promise<T[]> => sql.query<T>(text, params);
   const perDay = await q<{ day: string; mode: string; n: string; wins: string; pnl: number | null }>(
     `select to_char(closed_at at time zone 'utc', 'YYYY-MM-DD') as day, mode, count(*) as n,
             count(*) filter (where realized_pnl_eth > 0) as wins, sum(realized_pnl_eth) as pnl
-       from snipes where status = 'closed' and closed_at >= now() - ($1 || ' days')::interval
+       from snipes where status = 'closed' and ${sinceSql('closed_at', all)}
       group by 1, 2 order by 1 desc, 2`,
     [String(days)],
   );
@@ -70,7 +100,7 @@ async function pnl(sql: Sql, days: number): Promise<void> {
   const perPlay = await q<{ play_id: number; name: string; mode: string; n: string; pnl: number | null }>(
     `select s.play_id, p.name, s.mode, count(*) as n, sum(s.realized_pnl_eth) as pnl
        from snipes s join plays p on p.id = s.play_id
-      where s.status = 'closed' and s.closed_at >= now() - ($1 || ' days')::interval
+      where s.status = 'closed' and ${sinceSql('s.closed_at', all)}
       group by 1, 2, 3 order by 5 desc nulls last`,
     [String(days)],
   );
@@ -168,10 +198,10 @@ export function formatRace(rows: RaceRow[], tz = DISPLAY_TZ): string[] {
 }
 
 /** `hoodctl race [days]`: every snipe row with a `decision.race` record in the last `days` days. */
-export async function race(sql: Sql, days: number, out: (line: string) => void = console.log): Promise<void> {
+export async function race(sql: Sql, days: number, out: (line: string) => void = console.log, all = false): Promise<void> {
   const rows = await sql.query<{ decided_at: Date; launch_tx: string | null; race: unknown }>(
     `select decided_at, decision->'launch'->>'txHash' as launch_tx, decision->'race' as race
-       from snipes where decision->'race' is not null and decided_at >= now() - ($1 || ' days')::interval
+       from snipes where decision->'race' is not null and ${sinceSql('decided_at', all)}
       order by decided_at, id`,
     [String(days)],
   );
@@ -181,6 +211,8 @@ export async function race(sql: Sql, days: number, out: (line: string) => void =
     race: (typeof r.race === 'string' ? JSON.parse(r.race) : (r.race ?? {})) as RaceRow['race'],
   }));
   for (const l of formatRace(parsed)) out(l);
+  const el = await epochLine(sql, all);
+  if (el) out(el);
 }
 
 export interface TradeRow {
@@ -250,7 +282,7 @@ export function formatTrades(rows: TradeRow[], tz = DISPLAY_TZ): string[] {
   return out;
 }
 
-export async function trades(sql: Sql, days: number, out: (line: string) => void = console.log): Promise<void> {
+export async function trades(sql: Sql, days: number, out: (line: string) => void = console.log, all = false): Promise<void> {
   const rows = await sql.query<{
     id: number;
     decided_at: Date;
@@ -271,7 +303,7 @@ export async function trades(sql: Sql, days: number, out: (line: string) => void
             case when sells->0->>'at' is not null then (sells->0->>'at')::numeric / 1000 - extract(epoch from decided_at) end as held_s,
             decision->'race' as race
        from snipes
-      where decided_at >= now() - ($1 || ' days')::interval and status in ('closed', 'failed', 'aborted', 'open', 'pending')
+      where ${sinceSql('decided_at', all)} and status in ('closed', 'failed', 'aborted', 'open', 'pending')
       order by decided_at, id`,
     [String(days)],
   );
@@ -289,6 +321,8 @@ export async function trades(sql: Sql, days: number, out: (line: string) => void
     notes: r.notes,
   }));
   for (const l of formatTrades(parsed)) out(l);
+  const el = await epochLine(sql, all);
+  if (el) out(el);
 }
 
 /** `hoodctl keygen [n]`: n fresh keys printed once, written nowhere (exported for tests). */
@@ -319,11 +353,30 @@ async function main(sql: Sql, cmd: string, rest: string[]): Promise<void> {
       return;
     }
     case 'pnl':
-      return pnl(sql, n(rest[0], 7));
+      return pnl(sql, n(rest[0], 7), rest.includes('all'));
     case 'race':
-      return race(sql, n(rest[0], 1));
+      return race(sql, n(rest[0], 1), undefined, rest.includes('all'));
     case 'trades':
-      return trades(sql, n(rest[0], 1));
+      return trades(sql, n(rest[0], 1), undefined, rest.includes('all'));
+    case 'epoch': {
+      // hoodctl epoch now ["note"] | <ISO timestamp> ["note"] | off
+      const [when, ...noteParts] = rest;
+      if (!when) {
+        const e = await epochAt(sql);
+        console.log(e ? `epoch ${fmtWhen(e.at)}${e.note ? ` "${e.note}"` : ''}` : 'no epoch (every command counts from its day window)');
+        return;
+      }
+      if (when === 'off') {
+        await q(`delete from settings where key = 'epoch'`);
+        console.log('epoch off');
+        return;
+      }
+      const at = when === 'now' ? new Date() : new Date(when);
+      if (Number.isNaN(at.getTime())) throw new Error('usage: ctl epoch now|<ISO timestamp>|off ["note"]');
+      await setSetting(sql, 'epoch', { at: at.toISOString(), note: noteParts.join(' ') || null, by: 'hoodctl' });
+      console.log(`epoch ${fmtWhen(at)}: pnl / race / trades / status count from here (add "all" to a command to see every row)`);
+      return;
+    }
     case 'plays': {
       const rows = await q<{ id: number; name: string; enabled: boolean; operator: string | null; stats: unknown }>(
         `select p.id, p.name, p.enabled, o.name as operator, p.stats from plays p left join operators o on o.id = p.operator_id order by p.id`,

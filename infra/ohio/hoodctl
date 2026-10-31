@@ -6,7 +6,8 @@
 #   hoodctl up | down | restart [svc] | ps | logs [-f] [svc...] | build
 #   hoodctl status | pnl [days] | kill [reason] | resume | plays | play on|off <id> | events [n]
 #           race [days]             probe / live race measurements (where we landed vs the first T+1 block)
-#           trades [days]           one line per trade: result, pnl, %, held, race, running total
+#           trades [days] [all]     one line per trade: result, pnl, %, held, race, running total (from the epoch unless "all")
+#           epoch now|<ISO>|off ["note"]   count pnl / race / trades / status from this moment (older rows stay)
 #           keygen [n]              print n new private keys + addresses (written nowhere)
 #                                   (= pnpm --filter @hood/db ctl ..., run inside an app container)
 #   hoodctl health                  /healthz of indexer, tracker, agent, sniper (127.0.0.1:8081-8084)
@@ -54,7 +55,7 @@ case "$cmd" in
   build)    compose build "$@" ;;
   ps)       compose ps -a "$@" ;;
   logs)     compose logs --tail "${HOOD_LOG_TAIL:-200}" "$@" ;;
-  status|pnl|kill|resume|plays|play|events|race|trades|keygen)
+  status|pnl|kill|resume|plays|play|events|race|trades|keygen|epoch)
             ctl "$cmd" "$@" ;;
   health)
     rc=0
