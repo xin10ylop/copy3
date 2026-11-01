@@ -59,6 +59,8 @@ export interface SnipeStats {
   playDeployers: { playId: number; deployer: string }[];
   /** losing positions closed in the last hour: when, and the launch's exempt set (team cool-off survives a restart) */
   recentLosses?: { closedAt: Date; exemptions: string[] }[];
+  /** every position closed in the last hour, in close order: the loss-streak pause survives a restart */
+  recentCloses?: { closedAt: Date; pnlEth: number }[];
 }
 
 export interface FeedBlockRow {
@@ -153,9 +155,14 @@ export class MemoryStore implements SniperStore {
     const recentLosses = all
       .filter((s) => s.status === 'closed' && (s.realizedPnlEth ?? 0) < 0 && s.closedAt && new Date(s.closedAt).getTime() >= hour)
       .map((s) => ({ closedAt: new Date(s.closedAt!), exemptions: ((s.decision as { launch?: { event?: { exemptions?: string[] } } } | null)?.launch?.event?.exemptions ?? []).map((e) => e.toLowerCase()) }));
+    const recentCloses = all
+      .filter((s) => s.status === 'closed' && s.closedAt && new Date(s.closedAt).getTime() >= hour)
+      .map((s) => ({ closedAt: new Date(s.closedAt!), pnlEth: s.realizedPnlEth ?? 0 }))
+      .sort((a, b) => a.closedAt.getTime() - b.closedAt.getTime());
     return {
       countsByPlay,
       recentLosses,
+      recentCloses,
       openCount: all.filter((s) => s.status === 'open' || s.status === 'pending').length,
       realizedPnlSince: all.filter((s) => s.closedAt && s.closedAt >= since).reduce((a, s) => a + (s.realizedPnlEth ?? 0), 0),
       realizedPnlTotal: all.reduce((a, s) => a + (s.realizedPnlEth ?? 0), 0),

@@ -130,7 +130,13 @@ export class PgStore implements SniperStore {
        WHERE mode = $1 AND status = 'closed' AND realized_pnl_eth < 0 AND closed_at >= now() - interval '1 hour'`,
       [mode],
     );
+    const closes = await this.sql.query<{ closed_at: Date; pnl: number | string | null }>(
+      `SELECT closed_at, realized_pnl_eth AS pnl FROM snipes
+       WHERE mode = $1 AND status = 'closed' AND closed_at >= now() - interval '1 hour' ORDER BY closed_at`,
+      [mode],
+    );
     return {
+      recentCloses: closes.map((r) => ({ closedAt: new Date(r.closed_at), pnlEth: Number(r.pnl ?? 0) })),
       countsByPlay: Object.fromEntries(counts.map((c) => [c.play_id, Number(c.n)])),
       recentLosses: losses.map((r) => {
         const ex = typeof r.exemptions === 'string' ? (JSON.parse(r.exemptions) as unknown) : r.exemptions;

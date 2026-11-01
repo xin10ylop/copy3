@@ -100,6 +100,9 @@ export interface SniperOptions {
   repriceLeadMs?: number;
   /** skip a team's launches for this many minutes after one of them closed at a loss (0 = off); see Risk */
   teamCoolOffMin?: number;
+  /** Risk.lossStreakPause / lossStreakPauseMin */
+  lossStreakPause?: number;
+  lossStreakPauseMin?: number;
   /** max wait for getReserves when start reserves are known. Default 5 ms. */
   reservesWaitMs?: number;
   /** live: the PonsSniper contract (chain-truth reconciliation, H3/H4) */
@@ -228,6 +231,8 @@ export class Sniper {
       dailyLossLimitPct: o.dailyLossLimitPct,
       maxGasPriceGwei: o.maxGasPriceGwei ?? 1,
       teamCoolOffMin: o.teamCoolOffMin ?? 0,
+      lossStreakPause: o.lossStreakPause ?? 0,
+      lossStreakPauseMin: o.lossStreakPauseMin ?? 10,
     });
     this.paperBank = o.mode === 'paper' ? new PaperBankroll(parseEther(String(o.paperBankrollEth ?? 0.1))) : null;
     const pl = o.paperLimits ?? DEFAULT_PAPER_LIMITS;

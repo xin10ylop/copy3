@@ -24,6 +24,7 @@ python3 sim_block.py DATA_DIR band|sizes|grid|hours   # per-block backtest over 
 RPC_URL=… python3 replay_window.py START_TS END_TS     # chain replay of a UTC window: qualifying launches, backtest and live rule per block
 RPC_URL=… python3 audit_trades.py trades.json          # every live run vs the chain, three ways, with our real race position
 daily_count.sql                                        # qualifying launches per day from the indexer DB
+RPC_URL=… python3 pause_rules.py DATA_DIR               # entry pauses (symbol blocks, pause after N losses) vs the live cool-off, per day/half/week
 ```
 Loading the month (1.5 GB of events) takes ~5 min and ~4 GB of RAM.
 

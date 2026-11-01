@@ -42,6 +42,16 @@ export interface RiskOptions {
    * UTC: one operator relaunched "TUSK" four times in five minutes, each bought, each −30 to −39 %.
    */
   teamCoolOffMin?: number;
+  /**
+   * After this many losing positions in a row, take no new entries for `lossStreakPauseMin`
+   * minutes; a win resets the count. 0 = off. Per-block backtest over 31 days (live exits, 4 229
+   * qualifying launches): 4 losses → 10 min pause beats no pause in every week, on 20 days vs 6,
+   * in both halves and on low-volume days (+16 % for the month). A pause after 2 losses helps the
+   * first half and loses the second. Live, 1 Nov 2026: "HF" relaunched 7× in 29 min with a fresh
+   * deployer and fresh team wallets each time (the team cool-off cannot see that), each −8 to −10 %.
+   */
+  lossStreakPause?: number;
+  lossStreakPauseMin?: number;
 }
 
 /** Percentage mode before any bankroll figure is known. */
@@ -91,7 +101,10 @@ export class Risk {
     tokens: string[];
     playDeployers: { playId: number; deployer: string }[];
     recentLosses?: { closedAt: Date; exemptions: string[] }[];
+    recentCloses?: { closedAt: Date; pnlEth: number }[];
   }): void {
+    // the loss-streak pause survives a restart too: replay the last hour's closes in order
+    for (const c of [...(stats.recentCloses ?? [])].sort((a, b) => a.closedAt.getTime() - b.closedAt.getTime())) this.countStreak(c.pnlEth, c.closedAt.getTime());
     for (const [k, v] of Object.entries(stats.countsByPlay)) this.countsByPlay.set(Number(k), v);
     // the team cool-off survives a restart (30 Oct 2026: three restarts in ten minutes forgot four
     // losses on one team; its fifth relaunch was bought and lost 39 %)
@@ -182,6 +195,8 @@ export class Risk {
     if (p.buyEth <= 0) reasons.push('buyEth must be > 0');
     const cool = this.teamCoolOff(l.event.exemptions, l.event.deployer, now);
     if (cool) reasons.push(`team cool-off: ${cool}`);
+    if (now < this.pausedUntil)
+      reasons.push(`loss-streak pause: ${this.opts.lossStreakPause} losses in a row, new entries resume in ${Math.ceil((this.pausedUntil - now) / 1000)} s`);
     return { ok: reasons.length === 0, reasons };
   }
 
@@ -273,9 +288,27 @@ export class Risk {
     this.rollDay();
     if (heldSlot) this.openCount = Math.max(0, this.openCount - 1);
     this.realizedTodayEth += pnlEth;
+    this.countStreak(pnlEth, now);
     if (pnlEth < 0 && (this.opts.teamCoolOffMin ?? 0) > 0) {
       for (const w of team) this.teamLossAt.set(w.toLowerCase(), now);
       if (this.teamLossAt.size > 5000) for (const k of [...this.teamLossAt.keys()].slice(0, 1000)) this.teamLossAt.delete(k);
+    }
+  }
+
+  /** losing positions closed in a row (a win resets it; 0 PnL — an adopted orphan — leaves it alone) */
+  lossStreak = 0;
+  /** no new entries before this time (ms) */
+  pausedUntil = 0;
+
+  private countStreak(pnlEth: number, at: number): void {
+    const n = this.opts.lossStreakPause ?? 0;
+    if (pnlEth > 0) this.lossStreak = 0;
+    else if (pnlEth < 0) {
+      this.lossStreak++;
+      if (n > 0 && this.lossStreak >= n) {
+        this.pausedUntil = Math.max(this.pausedUntil, at + (this.opts.lossStreakPauseMin ?? 10) * 60_000);
+        this.lossStreak = 0;
+      }
     }
   }
 

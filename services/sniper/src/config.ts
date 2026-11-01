@@ -88,6 +88,9 @@ export const ConfigSchema = z
     REPRICE_LEAD_MS: num(250),
     /** skip a team's launches this many minutes after one of them lost (0 = off); see Risk.teamCoolOffMin */
     TEAM_COOLOFF_MIN: num(5),
+    /** after this many losses in a row, no new entries for LOSS_STREAK_PAUSE_MIN minutes (0 = off); see Risk.lossStreakPause */
+    LOSS_STREAK_PAUSE: num(4),
+    LOSS_STREAK_PAUSE_MIN: num(10),
     HEALTH_PORT: num(8081),
     LOG_LEVEL: z.string().default('info'),
     /** none (wait for TokenLaunched/receipt) | nonce (CREATE prediction; Pons V2 uses CREATE2 → wrong) */

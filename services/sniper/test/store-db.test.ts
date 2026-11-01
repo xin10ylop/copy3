@@ -106,6 +106,9 @@ describe('PgStore (@hood/db on PGlite)', () => {
     expect(paper.realizedPnlSince).toBeCloseTo(-0.4, 9);
     expect(paper.openCount).toBe(1);
     expect(paper.tokens).toEqual(['0x' + 'a1'.repeat(20)]);
+    // the loss-streak pause survives a restart: the last hour's closes, in close order, per mode
+    expect(paper.recentCloses?.map((c) => c.pnlEth)).toEqual([-0.4]);
+    expect(live.recentCloses?.some((c) => c.pnlEth === -0.4)).toBe(false);
     // H1: an aborted, never-confirmed (spoofed) live launch does not block the deployer; a confirmed one does
     const spoofDeployer = '0x' + 'b1'.repeat(20);
     const realDeployer = '0x' + 'b2'.repeat(20);

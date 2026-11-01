@@ -166,3 +166,35 @@ describe('Risk: the team cool-off survives a restart', () => {
     expect(r.preCheck(decision, launch, now).reasons.join()).toMatch(/team cool-off: 0xteam0000.*cc lost 90 s ago/);
   });
 });
+
+describe('Risk: pause new entries after N losses in a row (1 Nov 2026: HF relaunched 7x with fresh wallets)', () => {
+  const launch = { event: { deployer: '0xdeployer000000000000000000000000000000dd', exemptions: [] } } as unknown as Parameters<Risk['preCheck']>[1];
+  const decision = { play: { id: 1 }, preset: { stopAfter: 1000, firstBuyOnly: false, maxFeeGwei: 1, buyEth: 0.002 } } as unknown as Parameters<Risk['preCheck']>[0];
+  it('4 losses in a row pause entries for 10 min; a win in between resets the count; an orphan (0 PnL) leaves it alone', () => {
+    const r = new Risk({ mode: 'live', maxConcurrent: 3, maxGasPriceGwei: 1, dailyLossLimitEth: 1, lossStreakPause: 4, lossStreakPauseMin: 10 });
+    const t = 10_000_000;
+    r.onPositionClosed(-0.0002, true, [], t);
+    r.onPositionClosed(-0.0002, true, [], t + 1);
+    r.onPositionClosed(+0.0008, true, [], t + 2); // a win: back to 0
+    r.onPositionClosed(-0.0002, true, [], t + 3);
+    r.onPositionClosed(-0.0002, true, [], t + 4);
+    r.onPositionClosed(0, true, [], t + 5); // orphan adoption: not a trade result
+    r.onPositionClosed(-0.0002, true, [], t + 6);
+    expect(r.preCheck(decision, launch, t + 7).reasons).toEqual([]); // 3 in a row
+    r.onPositionClosed(-0.0002, true, [], t + 8); // the 4th
+    expect(r.preCheck(decision, launch, t + 60_000).reasons.join()).toMatch(/loss-streak pause: 4 losses in a row, new entries resume in 541 s/);
+    expect(r.preCheck(decision, launch, t + 8 + 10 * 60_000).reasons).toEqual([]);
+    expect(r.lossStreak).toBe(0); // the count starts over after a pause
+  });
+
+  it('off by default (0), and the pause survives a restart (seeded from the last hour of closes, in close order)', () => {
+    const off = new Risk({ mode: 'live', maxConcurrent: 3, maxGasPriceGwei: 1, dailyLossLimitEth: 1 });
+    for (let i = 0; i < 6; i++) off.onPositionClosed(-0.0002, true, [], 1000 + i);
+    expect(off.preCheck(decision, launch, 2000).reasons).toEqual([]);
+    const now = Date.now();
+    const r = new Risk({ mode: 'live', maxConcurrent: 3, maxGasPriceGwei: 1, dailyLossLimitEth: 1, lossStreakPause: 4, lossStreakPauseMin: 10 });
+    const at = (sAgo: number, pnlEth: number) => ({ closedAt: new Date(now - sAgo * 1000), pnlEth });
+    r.seed({ countsByPlay: {}, realizedPnlSince: 0, tokens: [], playDeployers: [], recentCloses: [at(60, -0.0002), at(300, -0.0002), at(200, -0.0002), at(500, +0.001), at(100, -0.0002)] });
+    expect(r.preCheck(decision, launch, now).reasons.join()).toMatch(/loss-streak pause: 4 losses in a row, new entries resume in 540 s/);
+  });
+});
