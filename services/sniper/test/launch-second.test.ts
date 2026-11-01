@@ -298,6 +298,7 @@ describe('launch-second fingerprint: ledger → rules → burst at T+1', () => {
       });
       if (withReceipt) h.chain.receipts.set(tx.hash, { transactionHash: tx.hash, status: 'success', blockNumber: h.blockAt(3), gasUsed: 400_000n, logs });
       for (const l of logs.slice(0, logsSeen)) h.chain.emitTokenLog(l);
+      h.feed(emptyBlock(h.blockAt(3), T, T * 1000 + OFFSET + 300)); // the block itself arrives after its logs (heads source)
       await waitFor(() => h.scripted!.orders.length === 1);
       const o = h.scripted!.orders[0]!;
       h.scripted!.resolveFill!(null);
@@ -401,7 +402,7 @@ describe('launch-second fingerprint: ledger → rules → burst at T+1', () => {
     expect(h.sniper.counters.ledger_ts_lookups).toBe(3);
   });
 
-  it('while the launch second is still running by the clock, a log of an unseen block counts at once (no lookup on the hot path)', async () => {
+  it('a node log that arrives before its block is held until the block shows its second (no lookup when the block comes in time)', async () => {
     const h = harness();
     await h.sniper.start();
     h.warm();
@@ -411,8 +412,28 @@ describe('launch-second fingerprint: ledger → rules → burst at T+1', () => {
     h.chain.emitTokenLog(
       curveTradeLog({ curve: LAUNCH.curve, side: 'buy', trader: TEAM, recipient: TEAM, quote: parseEther('0.04'), tokens: 10n ** 26n, fee: parseEther('0.0004'), tax: 0n, block: h.blockAt(5), txHash: `0x${'6d'.repeat(32)}`, logIndex: 0 }),
     );
+    expect(lg.stats().seen.teamBuyEth).toBe(0); // held: its block has not arrived
+    h.feed(emptyBlock(h.blockAt(5), T, T * 1000 + OFFSET + 500)); // the block: second T
     expect(lg.stats().seen.teamBuyEth).toBeCloseTo(0.04, 12);
     expect(h.sniper.counters.ledger_ts_lookups).toBe(0);
+  });
+
+  it('BURSAR (1 Nov 23:26): the launch was the last block of its second; team logs of the NEXT block (second T+1) that arrive first never count', async () => {
+    const h = harness();
+    await h.sniper.start();
+    h.warm();
+    h.launchSecond(new Map(), 0, 9); // the launch is block k = 2; feed the second up to k = 9
+    await waitFor(() => h.chain.tokenWatchers.size > 0);
+    const lg = h.sniper.ledger(LAUNCH.txHash)!;
+    const next = h.blockAt(10); // first block of T+1, not yet delivered
+    for (const [i, q] of ['0.15', '0.16', '0.14', '0.13'].entries())
+      h.chain.emitTokenLog(
+        curveTradeLog({ curve: LAUNCH.curve, side: 'buy', trader: TEAM, recipient: TEAM, quote: parseEther(q), tokens: 10n ** 26n, fee: parseEther(q) / 100n, tax: 0n, block: next, txHash: `0x${'7a'.repeat(32)}`, logIndex: i }),
+      );
+    expect(lg.stats().seen.teamBuyEth).toBe(0);
+    h.feed(emptyBlock(next, T + 1, (T + 1) * 1000 + OFFSET));
+    expect(lg.stats().seen.teamBuyEth).toBe(0); // its block is second T+1: not a launch-second buy
+    expect(h.scripted!.orders).toHaveLength(0);
   });
 
   it('a team buy below the threshold (0.05 ETH) never fires', async () => {

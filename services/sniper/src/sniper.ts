@@ -56,8 +56,8 @@ import { ContractLimits } from './limits.js';
 import type { ActiveSnipe, ChangeChannel, SniperStore } from './store.js';
 import type { Decision, DetectedLaunch, Fill, SnipeRun } from './types.js';
 
-/** After the launch second ends by the clock, give the block stream this long to mark it before looking timestamps up. */
-const UNKNOWN_TS_GRACE_MS = 250;
+/** A node log whose block has not arrived yet waits this long for it before its timestamp is looked up. */
+const LOG_TS_WAIT_MS = 150;
 
 export interface SniperOptions {
   mode: 'live' | 'paper';
@@ -175,6 +175,8 @@ export class Sniper {
   };
   lastError: string | null = null;
   lastDecideUs = 0;
+  /** node logs held until their block's timestamp is known (see ledgerLog) */
+  private readonly pendingLogs = new Map<number, { lg: LaunchSecondLedger; log: RawLog }[]>();
   /** `${launchTx}:${txHash}` of receipt fetches started for partially logged txs */
   private readonly receiptFetches = new Set<string>();
   /** paper mode: the simulated contract balance for bankroll sizing */
@@ -498,6 +500,7 @@ export class Sniper {
     try {
       this.o.clock.ingest(b.timestamp, b.receivedAt, b.block);
       this.blockTs.set(b.block, b.timestamp);
+      if (this.pendingLogs.has(b.block)) this.flushPendingLogs(b.block);
       if (this.blockTs.size > 4096) this.blockTs.delete(this.blockTs.keys().next().value!);
       this.recorder.feedBlock(b);
       this.race.onFeedBlock(b);
@@ -659,32 +662,55 @@ export class Sniper {
   /**
    * CurveBuy / CurveSell / Transfer from the node: only blocks of the launch second count.
    *
-   * A block whose timestamp is unknown counts as in the second until a block of a later second
-   * has passed through the block stream (`firstBlockAfter`). Without a block stream that never
-   * happens: on 1 Nov 2026 (feed refused, no fallback yet) every exempt-wallet buy of the next
-   * 13–21 s was counted as a launch-second team buy (TRADECRAFT: "team 0.034 ETH by 4 wallets",
-   * none on chain). So once the launch second is over by the clock and no later block was seen,
-   * the log's block timestamp is looked up before the buy counts. A block count can't stand in
-   * for it: the chain packs up to 23 blocks into one second when the sequencer catches up.
+   * A node log often arrives before its block does (Alchemy's websocket beats the heads source by a
+   * few tens of ms). Its block's timestamp is then unknown, and counting it as "in the second" was
+   * wrong whenever the launch was the LAST block of its second: 1 Nov 2026 23:26 BURSAR, only the
+   * dev bought in the launch second, the team's 0.58 ETH landed in the next block (second T+1), its
+   * logs came first and the bot fired on them. So a log of a block not yet seen is held until that
+   * block arrives (or a timestamp lookup answers, after LOG_TS_WAIT_MS) and judged then. A block
+   * below `firstBlockAfter` is in the second by its number alone (block numbers and timestamps rise
+   * together), so it needs no wait.
+   * (1 Nov 2026, earlier: with no block stream at all, every buy of the next 13–21 s counted.)
    */
   private ledgerLog(lg: LaunchSecondLedger, log: RawLog): void {
     if (lg.dead || log.blockNumber === null || log.blockNumber === undefined) return;
     const b = Number(log.blockNumber);
     const ts = this.blockTs.get(b);
-    if (ts === undefined && lg.firstBlockAfter === null && this.o.scheduler.now() >= (lg.ts + 1) * 1000 + UNKNOWN_TS_GRACE_MS) {
-      this.counters.ledger_ts_lookups!++;
-      this.o.chain
-        .getBlockTimestamp(b)
-        .then((t) => {
-          if (!(t > 0)) return; // unknown: never count a buy we cannot place in the second
-          this.blockTs.set(b, t);
-          if (!lg.dead && lg.inSecond(b, t) && lg.ingestLog(log)) this.onLedgerChanged(lg);
-        })
-        .catch((e: unknown) => this.error('launch-second ledger: block timestamp', e));
+    if (ts === undefined && lg.firstBlockAfter === null && b >= lg.launch.block) {
+      const list = this.pendingLogs.get(b);
+      if (list) list.push({ lg, log });
+      else {
+        this.pendingLogs.set(b, [{ lg, log }]);
+        if (this.pendingLogs.size > 512) this.pendingLogs.delete(this.pendingLogs.keys().next().value!);
+        void (async (): Promise<void> => {
+          await sleep(LOG_TS_WAIT_MS);
+          if (!this.pendingLogs.has(b)) return; // the block arrived meanwhile
+          this.counters.ledger_ts_lookups!++;
+          const t = await this.o.chain.getBlockTimestamp(b).catch(() => 0);
+          if (t > 0 && !this.blockTs.has(b)) this.blockTs.set(b, t);
+          this.flushPendingLogs(b);
+        })().catch((e: unknown) => this.error('launch-second ledger: block timestamp', e));
+      }
       return;
     }
     if (!lg.inSecond(b, ts)) return;
     if (lg.ingestLog(log)) this.onLedgerChanged(lg);
+  }
+
+  /** Judge the node logs held for block `b` now that its timestamp is known (or give up on them). */
+  private flushPendingLogs(b: number): void {
+    const list = this.pendingLogs.get(b);
+    if (!list) return;
+    this.pendingLogs.delete(b);
+    const ts = this.blockTs.get(b);
+    if (ts === undefined) return; // never count a buy we cannot place in the second
+    for (const { lg, log } of list) {
+      try {
+        if (!lg.dead && lg.inSecond(b, ts) && lg.ingestLog(log)) this.onLedgerChanged(lg);
+      } catch (e) {
+        this.error('launch-second ledger: held node log', e);
+      }
+    }
   }
 
   /**
