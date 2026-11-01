@@ -11,7 +11,7 @@ Everything else in `docs/` is history or reference. Times in Beirut (UTC+2) unle
 | PonsSniper contract | `0x476ffafaab21b6523d4701dd16748bfb1b5a4dc7` | owner = cold Phantom wallet `0x9b19…ba55`, 3 operator keys (generated on the box), treasury = the contract (profits compound), **max 0.005 ETH per buy, 0.02 ETH per hour** (raise = redeploy) |
 | Block source | public sequencer feed `wss://feed.mainnet.chain.robinhood.com` (+ `delayed-feed`) | **blocked since 1 Nov ~07:00 UTC**: Cloudflare answers 403 "this source address range has been blocked … connecting in a manner intended to exceed or evade this feed service's limits"; the notice also forbids moving to new IP space, so no Elastic-IP swap. The sniper takes blocks from **public-RPC `newHeads` websockets** (globalstake, publicnode, bloXroute; `FEED_HEADS_WSS`): every block pushed ~70 ms after sealing, full block fetched over the same socket (~100 ms behind the feed in all); Robinhood's own public RPC is NOT usable for this (its `latest` moves in ~500 ms batches, ≥ 650 ms late). The feed is retried with a 1–10 min backoff and takes over again the moment it delivers; see "Feed outage" below |
 | Indexer, tracker, agent, Postgres | Ohio box, compose (`hoodctl`) | running; indexer in logs mode (`INDEXER_MODE=logs`, `WS_NEW_HEADS=0`) to keep Alchemy usage low |
-| Agent scout | compose `agent`, every 15 min | on (proposes operator plays; auto-approve needs ≥ 10 coins, ≥ 35 % wins, ≥ 0.002 ETH/snipe) |
+| Agent scout | compose `agent`, every 15 min | on, proposals only. **Auto-approve off** since 1 Nov (DB `settings.auto_approve.enabled = false`): its stats are per-trade backtests (≈ 5× too optimistic) and an approved play would compete for the 3 burst keys. Re-enable only after a per-block check of the play |
 | Agent nightly refit / auto-disable / blacklist | compose `agent` | **off** (`NIGHTLY_HOUR_UTC=-1` in `.env.ohio`). It disabled the live play on 31 Oct 03:00 UTC on pre-fix losses. Turn on only with a known-good rolling window |
 | Paper sniper | compose | off (`PAPER_SNIPER=0`); one sniper per database |
 | Telegram | compose profile | off, not wanted |
@@ -117,6 +117,14 @@ thing they would block). Before f39dd75 the bot only saw launches from the node'
 | RPC poll of `FAST_RPC[0]` (drpc) every 97 ms | ~90–160 ms | last resort, on only after 2 s without a block from the others (`fallback.active`) |
 | Robinhood public RPC `latest` | **≥ 650 ms** (updates in ~500 ms batches) | not a block source any more; still the send endpoint and raced for receipts |
 
+Ledger side effect (fixed in 48cc230): with no block stream the ledger counted every exempt-wallet
+buy of the next 13–21 s as a launch-second team buy (TRADECRAFT 09:00/09:02 decided on team buys the
+chain doesn't have; both aborted as too late). A late log with an unknown block timestamp is now looked
+up before it counts (`ledger_ts_lookups` on /healthz).
+
+First trades on the heads source: CAGEBOUT 14:06 and PITSWAN 14:20, decided 110 / 99 ms, first in
+block, −8.2 % / −10.0 % at the timeout; the chain replay of the live rule gives −8.0 % / −9.8 %.
+
 Cost in the race: the launch block arrives ~100 ms later than from the feed, so a launch in the last
 ~0.1–0.2 s of its second may be decided too late for the first T+1 block; the rest are unaffected
 (`hoodctl trades` prints "decided N ms after the launch block arrived (source)"). Load on the public
@@ -129,4 +137,4 @@ dump exit on transfers only (not team sells) · deadline T+1 · re-price before 
 time is left) · 600k gas · receipts and reserves raced via the sequencer RPC · reserve book that cannot
 double count · 5-min team cool-off (restart-safe) · daily loss base = total bankroll, then removed ·
 stop 40 → 20 · helper-contract buys as feed hints · exit-signal reading and abort reason in `hoodctl trades` ·
-timestamps in `HOOD_TZ` · nightly auto-disable off · helper (0x6f49227e) and proxy (0x240acbf8) team buys decoded from the feed · burst 40 × 3 ms · fee cap 0.2 gwei · trailing 20/15 · epoch · (1 Nov) feed 403 backoff · blocks from public-RPC newHeads sockets + RPC poll as last resort.
+timestamps in `HOOD_TZ` · nightly auto-disable off · helper (0x6f49227e) and proxy (0x240acbf8) team buys decoded from the feed · burst 40 × 3 ms · fee cap 0.2 gwei · trailing 20/15 · epoch · (1 Nov) feed 403 backoff · blocks from public-RPC newHeads sockets + RPC poll as last resort · late ledger logs timestamp-checked · auto-approve off.
