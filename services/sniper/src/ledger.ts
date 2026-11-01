@@ -138,6 +138,8 @@ export class LaunchSecondLedger {
   private readonly logs = new Map<string, LedgerBuy>();
   /** txs whose logs are known (hints for them are dropped) */
   private readonly loggedTx = new Set<string>();
+  /** txs whose full receipt was applied: every log of theirs is known */
+  private readonly receipted = new Set<string>();
   private readonly outs = new Map<string, LedgerOut>();
   private readonly ingested = new Set<string>();
   /** a run was created for this launch (or a match was refused): never decide again */
@@ -360,6 +362,7 @@ export class LaunchSecondLedger {
   applyReceipt(r: ReceiptLite): boolean {
     if (!this.curve) return false;
     const hash = r.transactionHash.toLowerCase();
+    this.receipted.add(hash);
     let changed = false;
     if (r.status === 'success') {
       // exemptions first: a tx that exempts a wallet and then buys for it is a team buy
@@ -381,6 +384,17 @@ export class LaunchSecondLedger {
   }
 
   /** The hints of one tx: a direct buy (`hash`) or every recipient of a helper buy (`hash#i`). */
+  /**
+   * Txs with confirmed CurveBuy logs whose receipt has not been applied. Node logs arrive one at a
+   * time: a helper-contract tx buys for several wallets in one atomic tx, and its first log proves
+   * the whole tx while the rest of its logs may still be on their way (1 Nov 2026 DWRK: priced at
+   * 2 of 5 logs, 0.48 ETH of team buys missing → SlippageExceeded on every send). The receipt has
+   * all of them at once.
+   */
+  unreceiptedTxs(): Hex[] {
+    return [...this.loggedTx].filter((h) => h !== this.launchTx && !this.receipted.has(h)) as Hex[];
+  }
+
   private hintsOf(hash: string): LedgerBuy[] {
     return [...this.hints.values()].filter((h) => h.txHash === hash);
   }

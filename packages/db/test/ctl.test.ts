@@ -1,6 +1,6 @@
 /** hoodctl (packages/db/src/ctl.ts): importing it has no side effects; `status` reads the kill switch like the sniper does. */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { epochAt, fmtWhen, formatRace, formatTrades, keygen, killSwitchOn, race, status, trades, tzLabel } from '../src/ctl.js';
+import { defaultTradeDays, epochAt, fmtWhen, formatRace, formatTrades, keygen, killSwitchOn, race, status, trades, tzLabel } from '../src/ctl.js';
 import { insertSnipe, setSetting } from '../src/helpers.js';
 import { makeTestDb, reset, type TestDb } from './pglite.js';
 
@@ -174,7 +174,13 @@ describe('hoodctl epoch: pnl / race / trades / status count from a moment, older
     lines = [];
     await status(db.sql, (l) => lines.push(l));
     expect(lines.find((l) => l.startsWith('since epoch'))).toMatch(/"race fix" → live: 1 closed, 0\.0020 ETH/);
+    // a day window that starts AFTER the epoch says so (it hides rows the epoch would show)
+    lines = [];
+    await trades(db.sql, 0.05, (l) => lines.push(l)); // last ~1.2 h: NEW only, OLD and the epoch are earlier
+    expect(lines[lines.length - 1]).toMatch(/^\(last 0\.05 day\(s\), from .*; the epoch .* is earlier: "hoodctl trades" alone counts from it\)$/);
+    expect(await defaultTradeDays(db.sql)).toBe(2); // epoch 3 h ago → the window reaches it
     await db.sql.query(`delete from settings where key = 'epoch'`);
+    expect(await defaultTradeDays(db.sql)).toBe(1);
     await db.sql.query(`delete from snipes`);
   });
 });

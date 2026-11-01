@@ -172,6 +172,8 @@ export class Sniper {
   };
   lastError: string | null = null;
   lastDecideUs = 0;
+  /** `${launchTx}:${txHash}` of receipt fetches started for partially logged txs */
+  private readonly receiptFetches = new Set<string>();
   /** paper mode: the simulated contract balance for bankroll sizing */
   readonly paperBank: PaperBankroll | null;
   private readonly runs = new Map<string, SnipeRun>();
@@ -711,9 +713,58 @@ export class Sniper {
     }
   }
 
+  /** Fetch (once per tx) the full receipt of every tx the ledger knows only from some of its logs. */
+  private completeLoggedTxs(lg: LaunchSecondLedger): void {
+    for (const hash of lg.unreceiptedTxs()) {
+      const key = `${lg.launch.txHash.toLowerCase()}:${hash}`;
+      if (this.receiptFetches.has(key)) continue;
+      this.receiptFetches.add(key);
+      if (this.receiptFetches.size > 4096) this.receiptFetches.delete(this.receiptFetches.values().next().value!);
+      void (async (): Promise<void> => {
+        const poll = this.o.receiptPollMs ?? 20;
+        const until = Date.now() + 2000;
+        while (!lg.dead && Date.now() < until && lg.unreceiptedTxs().includes(hash)) {
+          const r = await this.o.chain.getReceipt(hash).catch(() => null);
+          if (r) {
+            if (lg.applyReceipt(r)) this.onLedgerChanged(lg);
+            return;
+          }
+          await sleep(poll);
+        }
+      })().catch((e: unknown) => this.error('launch-second ledger: tx receipt', e));
+    }
+  }
+
+  /**
+   * Before pricing: wait (at most `budgetMs`) for the receipts of txs the ledger knows only part
+   * of, so the minimum output is set on every buy of a tx it has proof of. Returns how many txs
+   * were completed.
+   */
+  private async settleLedger(lg: LaunchSecondLedger, budgetMs: number): Promise<number> {
+    const txs = lg.unreceiptedTxs();
+    if (txs.length === 0 || budgetMs <= 0) return 0;
+    let done = 0;
+    const all = Promise.all(
+      txs.map((h) =>
+        this.o.chain
+          .getReceipt(h)
+          .then((r) => {
+            if (r) {
+              lg.applyReceipt(r);
+              done++;
+            }
+          })
+          .catch(() => undefined),
+      ),
+    );
+    await Promise.race([all, sleep(budgetMs)]);
+    return done;
+  }
+
   /** The ledger changed: re-run the rules for launch-second plays (memory, µs) and fire on a match. */
   private onLedgerChanged(lg: LaunchSecondLedger): void {
     lg.wake(); // a confirmation loop waiting on this ledger re-evaluates now (N16)
+    this.completeLoggedTxs(lg);
     if (lg.decided || lg.dead) return;
     const t0 = performance.now();
     const stats = lg.stats();
@@ -1032,9 +1083,13 @@ export class Sniper {
    * fast endpoints), whichever has absorbed more buying (the larger quote reserve).
    */
   private async freshReserves(curve: Address, lg: LaunchSecondLedger | undefined, afterLaunch: Reserves | null, creatorTaxBps: number, current: Reserves, budgetMs = 60): Promise<Reserves> {
-    const fromLedger = lg && afterLaunch && lg.priceMovingBuys > 0 ? lg.reservesAfter(afterLaunch, creatorTaxBps) : null;
     // budget 0: no time left for an RPC round trip, the ledger's confirmed logs and the poll decide
-    const fromRpc = budgetMs > 0 ? await Promise.race([this.o.chain.getReserves(curve).catch(() => null), sleep(budgetMs).then(() => null)]) : null;
+    const [fromRpc] = await Promise.all([
+      budgetMs > 0 ? Promise.race([this.o.chain.getReserves(curve).catch(() => null), sleep(budgetMs).then(() => null)]) : Promise.resolve(null),
+      lg ? this.settleLedger(lg, budgetMs) : Promise.resolve(0),
+    ]);
+    // the ledger AFTER the await: logs and receipts that landed during the read count
+    const fromLedger = lg && afterLaunch && lg.priceMovingBuys > 0 ? lg.reservesAfter(afterLaunch, creatorTaxBps) : null;
     let best = current;
     for (const r of [fromLedger, fromRpc]) if (r && r.quote > best.quote) best = r;
     return best;
@@ -1300,6 +1355,11 @@ export class Sniper {
       }
       return null;
     })();
+    if (lg && lg.unreceiptedTxs().length > 0) {
+      const first = plan.times[0] ?? scheduler.now();
+      const done = await this.settleLedger(lg, Math.min(80, first - scheduler.now() - 20));
+      if (done > 0) run.notes.push(`receipts completed ${done} partly logged launch-second tx(s) before pricing`);
+    }
     const start = (this.o.launchReserves ?? DEFAULT_LAUNCH_RESERVES)[String(l.event.launchConfigId)];
     const afterLaunch = start ? launchReserves(start, l.event.devBuyQuoteIn, l.event.creatorTaxBps) : null;
     // the ledger knows the launch-second buys (team buys move the price; the node may lag)

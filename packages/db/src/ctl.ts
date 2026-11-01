@@ -54,10 +54,24 @@ export async function epochAt(sql: Sql): Promise<{ at: Date; note: string | null
 /** SQL: the later of the day window and the epoch (ignored with `all`). */
 const sinceSql = (col: string, all: boolean): string =>
   all ? `${col} >= now() - ($1 || ' days')::interval` : `${col} >= greatest(now() - ($1 || ' days')::interval, coalesce((select (value->>'at')::timestamptz from settings where key = 'epoch'), '-infinity'::timestamptz))`;
-async function epochLine(sql: Sql, all: boolean): Promise<string | null> {
+/**
+ * The footer naming the window the rows come from. With a day window that starts after the
+ * epoch it says so: "hoodctl trades 1" on 1 Nov dropped a 31 Oct win while the footer still read
+ * "since the epoch" (the totals looked like a lost win).
+ */
+async function epochLine(sql: Sql, all: boolean, days?: number): Promise<string | null> {
   if (all) return null;
   const e = await epochAt(sql);
-  return e ? `(since the epoch ${fmtWhen(e.at)}${e.note ? `, "${e.note}"` : ''}; add "all" to see every row)` : null;
+  if (!e) return null;
+  const from = days === undefined ? null : new Date(Date.now() - days * 86_400_000);
+  if (from && from > e.at) return `(last ${days} day(s), from ${fmtWhen(from)}; the epoch ${fmtWhen(e.at)} is earlier: "hoodctl trades" alone counts from it)`;
+  return `(since the epoch ${fmtWhen(e.at)}${e.note ? `, "${e.note}"` : ''}; add "all" to see every row)`;
+}
+
+/** Day window of `hoodctl trades` without a number: from the epoch when one is set, else 1 day. */
+export async function defaultTradeDays(sql: Sql): Promise<number> {
+  const e = await epochAt(sql);
+  return e ? Math.max(1, Math.ceil((Date.now() - e.at.getTime()) / 86_400_000) + 1) : 1;
 }
 
 export async function status(sql: Sql, out: (line: string) => void = console.log): Promise<void> {
@@ -323,7 +337,7 @@ export async function trades(sql: Sql, days: number, out: (line: string) => void
     notes: r.notes,
   }));
   for (const l of formatTrades(parsed)) out(l);
-  const el = await epochLine(sql, all);
+  const el = await epochLine(sql, all, days);
   if (el) out(el);
 }
 
@@ -359,7 +373,7 @@ async function main(sql: Sql, cmd: string, rest: string[]): Promise<void> {
     case 'race':
       return race(sql, n(rest[0], 1), undefined, rest.includes('all'));
     case 'trades':
-      return trades(sql, n(rest[0], 1), undefined, rest.includes('all'));
+      return trades(sql, rest[0] !== undefined && Number.isFinite(Number(rest[0])) ? Number(rest[0]) : await defaultTradeDays(sql), undefined, rest.includes('all'));
     case 'epoch': {
       // hoodctl epoch now ["note"] | <ISO timestamp> ["note"] | off
       const [when, ...noteParts] = rest;

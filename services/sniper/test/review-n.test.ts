@@ -659,3 +659,18 @@ describe('receipt race (launcher-contract launches are built from the receipt)',
     expect((await vc2.getReceipt(receipt.transactionHash as Hex))?.blockNumber).toBe(100_000_000);
   });
 });
+
+describe('mostAdvanced: a latest-reserves read takes the most advanced fast endpoint, not the first (1 Nov 2026)', () => {
+  it('the stale first answer loses to a later, more advanced one within the grace window; a too-late one is ignored; all failing → null', async () => {
+    const { mostAdvanced } = await import('../src/chain.js');
+    const later = <T,>(ms: number, v: T): Promise<T> => new Promise((r) => setTimeout(() => r(v), ms));
+    const fail = (ms: number): Promise<never> => new Promise((_, j) => setTimeout(() => j(new Error('x')), ms));
+    const stale = { quote: 1_697_000_000_000_000_000n, token: 1n };
+    const fresh = { quote: 2_400_000_000_000_000_000n, token: 1n };
+    expect(await mostAdvanced([later(1, stale), later(10, fresh)], 25)).toEqual(fresh);
+    expect(await mostAdvanced([later(1, stale), later(80, fresh)], 25)).toEqual(stale);
+    expect(await mostAdvanced([fail(1), later(5, fresh)], 25)).toEqual(fresh);
+    expect(await mostAdvanced([fail(1), fail(2)], 25)).toBeNull();
+    expect(await mostAdvanced([], 25)).toBeNull();
+  });
+});

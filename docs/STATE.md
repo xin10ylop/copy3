@@ -39,7 +39,7 @@ it would make the next bootstrap's seed create a second, enabled `team-buy-0.1`,
 An **epoch** (`hoodctl epoch now "why"`) makes `trades` / `race` / `pnl` / `status` count from a moment; set on 31 Oct 15:14 Beirut ("race fix live"). `hoodctl trades 3 all` shows every row.
 
 ```
-hoodctl trades 1        # every run of the last 24 h with the note that explains it (abort reason, exit reading, decision latency)
+hoodctl trades          # every run since the epoch with the note that explains it (abort reason, exit reading, decision latency); `hoodctl trades 1` = last 24 h
 hoodctl race 1          # where our sends landed vs the first T+1 block (race win rate)
 sudo bash /opt/hood/hoodsniper/infra/ohio/golive.sh status   # service, feed, counters, kill, plays, bankroll
 hoodctl health          # live sniper on :8090: blocks per source, heads sockets up, rpcFallback (should be "off")
@@ -121,6 +121,14 @@ Ledger side effect (fixed in 48cc230): with no block stream the ledger counted e
 buy of the next 13–21 s as a launch-second team buy (TRADECRAFT 09:00/09:02 decided on team buys the
 chain doesn't have; both aborted as too late). A late log with an unknown block timestamp is now looked
 up before it counts (`ledger_ts_lookups` on /healthz).
+
+DWRK 14:52 (fixed in the commit after 48cc230): one helper tx bought 0.725 ETH for 5 team wallets;
+the trigger matched at its 2nd node log and the minimum was priced on 2 of the 5 buys, so all 4 sends
+landed but reverted (SlippageExceeded, out 0.529 M < min 0.568 M; the trade would have lost 11 % to the
+dump exit). Now a tx known from some of its logs has its receipt fetched (all logs at once) before
+pricing and again at the re-price, the re-price reads the ledger after its RPC await, and a 'latest'
+reserves read takes the most advanced fast endpoint instead of the first (Robinhood's RPC answers first
+from Ohio but is ≥ 650 ms stale).
 
 First trades on the heads source: CAGEBOUT 14:06 and PITSWAN 14:20, decided 110 / 99 ms, first in
 block, −8.2 % / −10.0 % at the timeout; the chain replay of the live rule gives −8.0 % / −9.8 %.

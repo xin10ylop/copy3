@@ -34,6 +34,41 @@ import {
   type Transport,
 } from 'viem';
 
+/** After the first fast endpoint answers a 'latest' read, wait this long for a more advanced one. */
+const READ_GRACE_MS = 25;
+
+/**
+ * The reserves with the largest quote among `reads` that settle within `graceMs` of the first
+ * success (quote only grows with buys, so the largest is the most recent view in the launch
+ * window). Null when every read fails.
+ */
+export function mostAdvanced(reads: Promise<Reserves>[], graceMs: number): Promise<Reserves | null> {
+  return new Promise((resolve) => {
+    let best: Reserves | null = null;
+    let pending = reads.length;
+    let timer: NodeJS.Timeout | null = null;
+    let done = false;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      resolve(best);
+    };
+    if (pending === 0) return finish();
+    for (const p of reads) {
+      p.then(
+        (r) => {
+          if (!best || r.quote > best.quote) best = r;
+          if (!timer && !done) timer = setTimeout(finish, graceMs);
+        },
+        () => undefined,
+      ).finally(() => {
+        if (--pending === 0) finish();
+      });
+    }
+  });
+}
+
 export interface ReceiptLite {
   transactionHash: Hex;
   status: 'success' | 'reverted';
@@ -243,17 +278,17 @@ export class ViemChain implements ChainClient {
 
   async getReserves(curve: Address, blockNumber?: number): Promise<Reserves> {
     if (blockNumber === undefined && this.receiptClients.length > 1) {
-      // 'latest' from whichever endpoint answers first (the sequencer RPC has the state ~100 ms
-      // after a block, a third-party node up to ~1 s later); a block-pinned read needs the archive node
+      // 'latest' from the fast endpoints: the MOST ADVANCED answer (largest quote reserve) among
+      // those that arrive within READ_GRACE_MS of the first, not simply the first. Robinhood's own
+      // public RPC is the closest to the box but its 'latest' moves in ~500 ms batches (measured
+      // 1 Nov 2026: ≥ 650 ms stale), so the first answer was routinely the stale one. A
+      // block-pinned read needs the archive node.
       const one = async (c: PublicClient): Promise<Reserves> => {
         const [q, t] = await c.readContract({ address: curve, abi: curveAbi, functionName: 'getReserves' });
         return { quote: BigInt(q as bigint), token: BigInt(t as bigint) };
       };
-      try {
-        return await Promise.any(this.receiptClients.slice(1).map((c) => one(c)));
-      } catch {
-        return one(this.http); // every sequencer RPC failed: the archive node
-      }
+      const best = await mostAdvanced(this.receiptClients.slice(1).map((c) => one(c)), READ_GRACE_MS);
+      return best ?? one(this.http); // every fast endpoint failed: the archive node
     }
     const [quote, token] = await this.http.readContract({
       address: curve,

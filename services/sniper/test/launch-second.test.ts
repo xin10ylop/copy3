@@ -277,6 +277,41 @@ describe('launch-second fingerprint: ledger → rules → burst at T+1', () => {
     h.scripted!.resolveFill!(null);
   });
 
+  it('DWRK (1 Nov): the match fires at the 2nd of 5 logs of one helper tx — the tx receipt completes the other 3 before pricing', async () => {
+    const amounts = ['0.07', '0.05', '0.14', '0.17', '0.16'].map((x) => parseEther(x));
+    const recipients = amounts.map(() => TEAM);
+    /** minTokensOut of the order when the node delivers `logsSeen` of the 5 logs and the receipt is (not) available */
+    async function run(logsSeen: number, withReceipt: boolean): Promise<{ minOut: bigint; notes: string }> {
+      const h = harness();
+      await h.sniper.start();
+      h.warm();
+      h.launchSecond(new Map(), 0, 2);
+      await waitFor(() => h.chain.tokenWatchers.size > 0);
+      const tx = helperBuyTx(LAUNCH.curve, recipients, amounts);
+      // exact CurveBuy numbers, applied in order from the launch reserves
+      let r = INITIAL;
+      const logs = amounts.map((q, i) => {
+        const tokens = quoteBuy(r, q, CURVE_FEE_BPS, 0, 0n);
+        const fee = (q * BigInt(CURVE_FEE_BPS)) / 10_000n;
+        r = { quote: r.quote + q - fee, token: r.token - tokens };
+        return curveTradeLog({ curve: LAUNCH.curve, side: 'buy', trader: tx.to!, recipient: TEAM, quote: q, tokens, fee, tax: 0n, block: h.blockAt(3), txHash: tx.hash, logIndex: i * 2 });
+      });
+      if (withReceipt) h.chain.receipts.set(tx.hash, { transactionHash: tx.hash, status: 'success', blockNumber: h.blockAt(3), gasUsed: 400_000n, logs });
+      for (const l of logs.slice(0, logsSeen)) h.chain.emitTokenLog(l);
+      await waitFor(() => h.scripted!.orders.length === 1);
+      const o = h.scripted!.orders[0]!;
+      h.scripted!.resolveFill!(null);
+      return { minOut: o.run.minTokensOut, notes: o.run.notes.join(' | ') };
+    }
+    const full = await run(5, true); // every log arrived before the decision
+    const partial = await run(2, true); // DWRK: the 2nd log matched (0.12 ≥ 0.1), 3 logs still on their way
+    expect(partial.minOut).toBe(full.minOut);
+    expect(partial.notes).toMatch(/reserves: launch config \+ 5 launch-second buy\(s\) from the ledger/);
+    // before the fix: priced at 2 of 5 buys → a minimum the curve can no longer give (every send reverts)
+    const stale = await run(2, false);
+    expect(stale.minOut).toBeGreaterThan(full.minOut);
+  });
+
   it('a proxy buy (0x240acbf8: curve, minOut, recipient; value = quoteIn) is a feed hint for its recipient', () => {
     const lg = new LaunchSecondLedger({ event: { deployer: LAUNCH.deployer, name: 'S', symbol: 'S', launchKind: 'launchToken', exemptions: [TEAM], creatorFeeRecipient: TEAM, creatorTaxBps: 0, devBuyQuoteIn: 0n, pairToken: QUOTE_TOKENS.eth, launchConfigId: 0n }, block: LAUNCH.block, ts: T, receivedAt: 0, txHash: LAUNCH.txHash, token: LAUNCH.token, curve: LAUNCH.curve, addressSource: 'receipt', source: 'feed', origin: 'feed' } as never);
     lg.setAddresses(LAUNCH.token, LAUNCH.curve);
