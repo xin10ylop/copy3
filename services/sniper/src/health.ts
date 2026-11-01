@@ -1,6 +1,7 @@
 /** /healthz (JSON), /metrics (Prometheus text), /clock (full clock snapshot). */
 import http from 'node:http';
 import type { ClockSnapshot, FeedStatsSnapshot } from '@hood/core';
+import type { FallbackSnapshot } from './block-poller.js';
 
 export interface HealthState {
   /** probe = paper fills + one real probe tx per planned burst (race measurement) */
@@ -8,6 +9,8 @@ export interface HealthState {
   startedAt: number;
   now: number;
   feed: FeedStatsSnapshot;
+  /** blocks from the sequencer RPC while the feed is down (null when the fallback is disabled) */
+  fallback?: FallbackSnapshot | null;
   clock: ClockSnapshot;
   rttMs: number;
   counters: Record<string, number>;
@@ -20,8 +23,15 @@ export interface HealthState {
 
 const FEED_STALE_MS = 5000;
 
+/** ms since the last block from either source (feed or RPC fallback); null before the first one. */
+export function blockAgeMs(s: HealthState): number | null {
+  const last = Math.max(s.feed.lastReceivedAt ?? -1, s.fallback?.lastBlockAt ?? -1);
+  return last < 0 ? null : s.now - last;
+}
+
 export function healthy(s: HealthState): boolean {
-  return s.feed.lastReceivedAt !== null && s.now - s.feed.lastReceivedAt < FEED_STALE_MS;
+  const age = blockAgeMs(s);
+  return age !== null && age < FEED_STALE_MS;
 }
 
 export function prometheus(s: HealthState): string {
@@ -31,7 +41,11 @@ export function prometheus(s: HealthState): string {
     if (!lines.some((l) => l.startsWith(`# HELP ${name} `))) lines.push(`# HELP ${name} ${help}`, `# TYPE ${name} gauge`);
     lines.push(`${name}${labels} ${v}`);
   };
-  g('sniper_up', healthy(s) ? 1 : 0, 'feed fresh within 5 s');
+  g('sniper_up', healthy(s) ? 1 : 0, 'a block (feed or RPC fallback) within 5 s');
+  g('sniper_block_age_ms', blockAgeMs(s), 'ms since the last block from either source');
+  g('sniper_fallback_active', s.fallback ? (s.fallback.active ? 1 : 0) : null, '1 = feed down, blocks come from the sequencer RPC');
+  g('sniper_fallback_blocks_total', s.fallback?.blocks ?? null, 'blocks delivered by the RPC fallback');
+  g('sniper_fallback_activations_total', s.fallback?.activations ?? null, 'times the RPC fallback switched on');
   g('sniper_live', s.mode === 'live' ? 1 : 0, '1 = live, 0 = paper');
   g('sniper_probe', s.mode === 'probe' ? 1 : 0, '1 = probe mode (paper fills + one real probe tx per planned burst)');
   g('sniper_feed_blocks_total', s.feed.blocks, 'feed blocks received');

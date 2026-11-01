@@ -1981,7 +1981,7 @@ export class Sniper {
     return this.ledgers.get(launchTxHash.toLowerCase());
   }
 
-  health(feed: HealthState['feed']): HealthState {
+  health(feed: HealthState['feed'], fallback: HealthState['fallback'] = null): HealthState {
     const positions = this.positions.open.map((p: PositionEntry) => ({
       key: p.key,
       token: p.token,
@@ -1994,6 +1994,7 @@ export class Sniper {
       startedAt: this.startedAt,
       now: this.o.scheduler.now(),
       feed,
+      fallback,
       clock: this.o.clock.snapshot(),
       rttMs: this.o.rttMs(),
       counters: {

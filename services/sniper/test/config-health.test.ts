@@ -73,4 +73,32 @@ describe('metrics', () => {
     expect(text.match(/# HELP sniper_clock_second_offset_ms /g)).toHaveLength(1);
     expect(healthy({ ...s, now: 1_010_000 })).toBe(false);
   });
+
+  it('a block from the RPC fallback keeps the sniper healthy while the feed is down', () => {
+    const feed = new FeedStats();
+    feed.recordBlock({ block: 1, timestamp: 1000, txs: [], receivedAt: 1_000_000, headerKind: 3 }, 0.1);
+    const s: HealthState = {
+      mode: 'live',
+      startedAt: 0,
+      now: 1_300_000, // feed stale for 5 min
+      feed: feed.snapshot(),
+      fallback: { active: true, polls: 3000, blocks: 2990, errors: 0, activations: 1, caughtUp: 0, gaps: 0, lastBlockAt: 1_299_900 },
+      clock: new SequencerClock({ minSeconds: 2 }).snapshot(),
+      rttMs: 3,
+      counters: {},
+      positions: [],
+      lastError: null,
+      nonce: null,
+      plays: 1,
+      armed: 0,
+    };
+    expect(healthy(s)).toBe(true);
+    const text = prometheus(s);
+    expect(text).toContain('sniper_up 1');
+    expect(text).toContain('sniper_fallback_active 1');
+    expect(text).toContain('sniper_fallback_blocks_total 2990');
+    expect(text).toContain('sniper_block_age_ms 100');
+    expect(healthy({ ...s, fallback: { ...s.fallback!, lastBlockAt: 1_290_000 } })).toBe(false);
+    expect(healthy({ ...s, fallback: null })).toBe(false);
+  });
 });

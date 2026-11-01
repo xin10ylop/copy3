@@ -46,7 +46,7 @@ export const ConfigSchema = z
     NODE_WS: z.string().default(''),
     PUBLIC_RPC: z.string().default('https://rpc.mainnet.chain.robinhood.com'),
     /** feed fallback: poll the sequencer RPC for blocks every N ms while the feed is down (0 = off) */
-    FEED_FALLBACK_POLL_MS: num(100),
+    FEED_FALLBACK_POLL_MS: num(97),
     /** feed fallback: start polling this long after the feed went down */
     FEED_FALLBACK_AFTER_MS: num(2000),
     /** comma list; first = primary (used for RTT measurement and nonce reads) */

@@ -162,9 +162,10 @@ export interface ChainClient {
   getReserves(curve: Address, blockNumber?: number): Promise<Reserves>;
   /**
    * The latest block with its transactions, as a FeedBlock (the sequencer RPC, 1.5 ms away, has it
-   * ~100 ms after sealing). The feed fallback (`RpcBlockPoller`) polls it while the feed is down.
+   * ~100 ms after sealing). The feed fallback (`RpcBlockPoller`) polls it while the feed is down;
+   * with `number` it fetches that block instead (the poller catches up blocks a slow poll skipped).
    */
-  getLatestBlock?(): Promise<FeedBlock | null>;
+  getLatestBlock?(number?: number): Promise<FeedBlock | null>;
   getBlockNumber(): Promise<number>;
   /** sniper.bought(token) + token.balanceOf(sniper), both read at ONE block (N11) */
   readSniper(sniper: Address, token: Address): Promise<SniperHolding>;
@@ -261,9 +262,12 @@ export class ViemChain implements ChainClient {
     return { quote, token };
   }
 
-  async getLatestBlock(): Promise<FeedBlock | null> {
+  async getLatestBlock(number?: number): Promise<FeedBlock | null> {
     const c = this.receiptClients[1] ?? this.http; // the sequencer RPC when configured
-    const b = await c.getBlock({ blockTag: 'latest', includeTransactions: true });
+    const b =
+      number === undefined
+        ? await c.getBlock({ blockTag: 'latest', includeTransactions: true })
+        : await c.getBlock({ blockNumber: BigInt(number), includeTransactions: true });
     const receivedAt = Date.now();
     const txs: DecodedTx[] = [];
     for (const t of b.transactions) {

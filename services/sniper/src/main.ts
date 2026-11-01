@@ -248,7 +248,7 @@ async function main(): Promise<void> {
         balanced.refreshBalances().catch((e: unknown) => logger.warn({ err: e }, 'balance refresh failed'));
       }, cfg.BALANCE_POLL_MS)
     : null;
-  const health = startHealthServer(cfg.HEALTH_PORT, () => s.health(feed.stats.snapshot()));
+  const health = startHealthServer(cfg.HEALTH_PORT, () => s.health(feed.stats.snapshot(), poller?.snapshot() ?? null));
   logger.info(
     { mode: cfg.EXECUTION_MODE, port: cfg.HEALTH_PORT, exitKey: live?.exitKey.address, burstKeys: live?.burstKeys.map((k) => k.address), probeKeys: probe?.keys.map((k) => k.address) },
     'sniper running',

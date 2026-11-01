@@ -10,7 +10,7 @@
 #           epoch now|<ISO>|off ["note"]   count pnl / race / trades / status from this moment (older rows stay)
 #           keygen [n]              print n new private keys + addresses (written nowhere)
 #                                   (= pnpm --filter @hood/db ctl ..., run inside an app container)
-#   hoodctl health                  /healthz of indexer, tracker, agent, sniper (127.0.0.1:8081-8084)
+#   hoodctl health                  /healthz of indexer, tracker, agent and the sniper (live unit on :8090, else compose :8084)
 #   hoodctl backfill [--force]      (re)start the one-shot backfill job (profile "backfill")
 #   hoodctl telegram                start the optional bot (profile "telegram")
 #   hoodctl nightly | scout         run the agent's nightly job / one scout pass now
@@ -59,10 +59,19 @@ case "$cmd" in
             ctl "$cmd" "$@" ;;
   health)
     rc=0
-    for pair in indexer:8081 tracker:8082 agent:8083 sniper:8084; do
+    # the live sniper is the systemd unit (golive.sh), on HEALTH_PORT of .env.executor (default 8090);
+    # sniper:8084 is the compose paper sniper, usually not running once live
+    pairs="indexer:8081 tracker:8082 agent:8083"
+    if systemctl is-active --quiet hood-sniper 2>/dev/null; then
+      live_port="$(sed -n 's/^HEALTH_PORT=//p' "$HOOD_DIR/.env.executor" 2>/dev/null | tail -n 1)"
+      pairs="$pairs live:${live_port:-8090}"
+    else
+      pairs="$pairs sniper:8084"
+    fi
+    for pair in $pairs; do
       name="${pair%%:*}" port="${pair##*:}"
       code="$(curl -sS -m 5 -o /tmp/hoodctl-health.$$ -w '%{http_code}' "http://127.0.0.1:$port/healthz" 2>/dev/null || true)"
-      summary="$(jq -c '{ok, mode, lagBlocks, head, lastBlock, feedBlocks: .feed.blocks?, raceSent: .counters.race_sent?, raceWon: .counters.race_first_in_block?, lastScout, lastError}
+      summary="$(jq -c '{ok, mode, lagBlocks, head, lastBlock, feedBlocks: .feed.blocks?, feedUrl: .feed.currentUrl?, rpcFallback: (if .fallback? then (if .fallback.active then "ON (\(.fallback.blocks) blocks)" else "off" end) else null end), raceSent: .counters.race_sent?, raceWon: .counters.race_first_in_block?, lastScout, lastError}
                         | with_entries(select(.value != null))' /tmp/hoodctl-health.$$ 2>/dev/null || true)"
       rm -f /tmp/hoodctl-health.$$
       if [[ "$code" == 200 ]]; then lvl=OK; else lvl=FAIL; rc=1; fi
