@@ -265,11 +265,13 @@ export function formatTrades(rows: TradeRow[], tz = DISPLAY_TZ): string[] {
     const race = r.race
       ? r.race.status === 'reverted' || r.race.status === 'not_mined'
         ? r.race.status
-        : r.race.blockOffset === 0 && (r.race.buysAhead ?? 0) === 0
-          ? 'won (first in block)'
-          : r.race.blockOffset === 0
-            ? `${r.race.buysAhead} ahead`
-            : `late +${r.race.blockOffset} blocks`
+        : r.race.blockOffset === null || r.race.blockOffset === undefined
+          ? 'landed (T+1 block unknown)' // the feed did not show the first T+1 block (gap / reconnect)
+          : r.race.blockOffset === 0 && (r.race.buysAhead ?? 0) === 0
+            ? 'won (first in block)'
+            : r.race.blockOffset === 0
+              ? `${r.race.buysAhead} ahead`
+              : `late +${r.race.blockOffset} blocks`
       : '-';
     const result = closed ? (r.pnlEth! > 0 ? 'WIN' : 'loss') : r.status;
     out.push(
