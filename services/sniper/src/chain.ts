@@ -8,9 +8,12 @@ import {
   MULTICALL3,
   PONS_V2,
   curveAbi,
+  decodedTxFromRpc,
   factoryAbi,
   parseTokenLaunchedLog,
   tokenAbi,
+  type DecodedTx,
+  type FeedBlock,
   type RawLog,
   type Reserves,
   type RpcTxLike,
@@ -157,6 +160,11 @@ export function blockRanges(from: number, to: number, chunk = LOG_CHUNK_BLOCKS):
 
 export interface ChainClient {
   getReserves(curve: Address, blockNumber?: number): Promise<Reserves>;
+  /**
+   * The latest block with its transactions, as a FeedBlock (the sequencer RPC, 1.5 ms away, has it
+   * ~100 ms after sealing). The feed fallback (`RpcBlockPoller`) polls it while the feed is down.
+   */
+  getLatestBlock?(): Promise<FeedBlock | null>;
   getBlockNumber(): Promise<number>;
   /** sniper.bought(token) + token.balanceOf(sniper), both read at ONE block (N11) */
   readSniper(sniper: Address, token: Address): Promise<SniperHolding>;
@@ -251,6 +259,22 @@ export class ViemChain implements ChainClient {
       ...(blockNumber !== undefined ? { blockNumber: BigInt(blockNumber) } : {}),
     });
     return { quote, token };
+  }
+
+  async getLatestBlock(): Promise<FeedBlock | null> {
+    const c = this.receiptClients[1] ?? this.http; // the sequencer RPC when configured
+    const b = await c.getBlock({ blockTag: 'latest', includeTransactions: true });
+    const receivedAt = Date.now();
+    const txs: DecodedTx[] = [];
+    for (const t of b.transactions) {
+      if (typeof t === 'string') continue;
+      try {
+        txs.push(decodedTxFromRpc({ ...t, from: t.from, to: t.to ?? null, transactionIndex: t.transactionIndex ?? null }));
+      } catch {
+        /* an undecodable tx (unknown type) is skipped; the feed decoder skips those too */
+      }
+    }
+    return { block: Number(b.number), timestamp: Number(b.timestamp), txs, receivedAt, blockHash: b.hash, headerKind: 3 };
   }
 
   getTransactionCount(address: Address, tag: 'latest' | 'pending'): Promise<number> {

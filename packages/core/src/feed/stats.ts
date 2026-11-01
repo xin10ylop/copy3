@@ -17,6 +17,8 @@ export interface FeedStatsSnapshot {
   resets: number;
   reconnects: number;
   failovers: number;
+  /** long backoffs after every feed URL refused the handshake (403 / 429) */
+  refusedBackoffs: number;
   currentUrl: string | null;
   decodeMs: { last: number; avg: number; p50: number; p99: number; max: number };
 }
@@ -32,6 +34,7 @@ export class FeedStats {
   resets = 0;
   reconnects = 0;
   failovers = 0;
+  refusedBackoffs = 0;
   currentUrl: string | null = null;
   lastBlock: number | null = null;
   lastTimestamp: number | null = null;
@@ -99,6 +102,7 @@ export class FeedStats {
       resets: this.resets,
       reconnects: this.reconnects,
       failovers: this.failovers,
+      refusedBackoffs: this.refusedBackoffs,
       currentUrl: this.currentUrl,
       decodeMs: {
         last: this.decodeLast,

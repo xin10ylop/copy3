@@ -28,6 +28,14 @@ export interface FeedClientOptions {
   staleMs?: number;
   /** First reconnect delay; doubles per consecutive failure up to `maxReconnectDelayMs`. */
   reconnectDelayMs?: number;
+  /**
+   * Backoff after the server REFUSES the handshake (HTTP 403 / 429: Cloudflare rate limit or ban on the
+   * public feed, 1 Nov 2026). Doubles per refusal up to `maxRefusedBackoffMs`. Reconnecting every
+   * 5 s against a rate limit only renews it. Default 60 000 ms.
+   */
+  refusedBackoffMs?: number;
+  /** Cap for the refused backoff. Default 600 000 ms. */
+  maxRefusedBackoffMs?: number;
   maxReconnectDelayMs?: number;
   /** While on a non-primary URL, go back to the primary after this long. Default 30 s. */
   primaryRetryMs?: number;
@@ -97,6 +105,10 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
   private watchdog: NodeJS.Timeout | null = null;
   private pinger: NodeJS.Timeout | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  /** consecutive handshakes refused with 403/429 (reset on a successful open) */
+  private refusals = 0;
+  /** the last socket error of the current attempt (a handshake refusal shows up here, then 'close 1006') */
+  private lastSocketError: string | null = null;
 
   constructor(options: FeedClientOptions) {
     super();
@@ -106,6 +118,8 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
       staleMs: options.staleMs ?? 3000,
       reconnectDelayMs: options.reconnectDelayMs ?? 200,
       maxReconnectDelayMs: options.maxReconnectDelayMs ?? 5000,
+      refusedBackoffMs: options.refusedBackoffMs ?? 60_000,
+      maxRefusedBackoffMs: options.maxRefusedBackoffMs ?? 600_000,
       primaryRetryMs: options.primaryRetryMs ?? 30_000,
       pingIntervalMs: options.pingIntervalMs ?? 10_000,
       requestReplay: options.requestReplay ?? true,
@@ -267,6 +281,8 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
     sock.on('open', () => {
       if (this.socket !== sock) return;
       this.failures = 0;
+      this.refusals = 0;
+      this.lastSocketError = null;
       this.connectedAt = this.now();
       this.lastFrameAt = this.connectedAt;
       this.stats.currentUrl = url;
@@ -291,7 +307,10 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
       }
     });
     sock.on('error', (err) => {
-      if (this.socket === sock) this.reportError(err);
+      if (this.socket === sock) {
+        this.lastSocketError = err.message;
+        this.reportError(err);
+      }
     });
     sock.on('close', (code, reason) => {
       if (this.socket !== sock) return;
@@ -314,7 +333,17 @@ export class FeedClient extends EventEmitter<FeedClientEvents> {
     }
     // First retry immediately-ish; back off only after a full rotation keeps failing.
     const rotations = Math.floor((this.failures - 1) / this.opts.urls.length);
-    const delay = Math.min(this.opts.maxReconnectDelayMs, this.opts.reconnectDelayMs * 2 ** rotations);
+    let delay = Math.min(this.opts.maxReconnectDelayMs, this.opts.reconnectDelayMs * 2 ** rotations);
+    const refused = /Unexpected server response: (403|429)/.test(this.lastSocketError ?? '');
+    this.lastSocketError = null;
+    if (refused) {
+      // every URL refused in a row → long backoff (one refusal per URL counts as one round)
+      this.refusals++;
+      if (this.refusals >= this.opts.urls.length) {
+        delay = Math.min(this.opts.maxRefusedBackoffMs, this.opts.refusedBackoffMs * 2 ** Math.floor(this.refusals / this.opts.urls.length - 1));
+        this.stats.refusedBackoffs++;
+      }
+    }
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect();

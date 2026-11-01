@@ -55,6 +55,29 @@ describe('FeedClient', () => {
     expect(stats.snapshot().decodeMs.max).toBeGreaterThan(0);
   });
 
+  it('a feed that REFUSES the handshake (403) is retried after the long refused backoff, not every reconnect delay', async () => {
+    // 1 Nov 2026: the public feed answered 403 for hours; reconnecting every 5 s only renews a rate limit
+    const attempts: number[] = [];
+    const wss = new WebSocketServer({
+      port: 0,
+      host: '127.0.0.1',
+      verifyClient: (_info, cb) => {
+        attempts.push(Date.now());
+        cb(false, 403, 'Forbidden');
+      },
+    });
+    servers.push(wss);
+    await new Promise((r) => wss.once('listening', r));
+    const url = `ws://127.0.0.1:${(wss.address() as AddressInfo).port}`;
+    const c = new FeedClient({ urls: [url], reconnectDelayMs: 10, maxReconnectDelayMs: 10, refusedBackoffMs: 400, maxRefusedBackoffMs: 400 });
+    clients.push(c);
+    c.on('error', () => undefined);
+    c.start();
+    await until(() => attempts.length >= 2, 3000);
+    expect(attempts[1]! - attempts[0]!).toBeGreaterThanOrEqual(350); // the refused backoff, not the 10 ms reconnect delay
+    expect(c.stats.snapshot().refusedBackoffs).toBeGreaterThanOrEqual(1);
+  });
+
   it('fails over to the secondary when the primary dies and replays from the next block', async () => {
     const primary = await server();
     const secondary = await server();
