@@ -100,5 +100,9 @@ describe('metrics', () => {
     expect(text).toContain('sniper_block_age_ms 100');
     expect(healthy({ ...s, fallback: { ...s.fallback!, lastBlockAt: 1_290_000 } })).toBe(false);
     expect(healthy({ ...s, fallback: null })).toBe(false);
+    // the gate's last block (any source) counts too; per-source counters are exported
+    const viaGate = { ...s, fallback: null, heads: null, blocks: { last: 5, lastAt: 1_299_950, lastSource: 'heads', bySource: { feed: 1, heads: 4 } } };
+    expect(healthy(viaGate)).toBe(true);
+    expect(prometheus(viaGate)).toContain('sniper_blocks_by_source_total{source="heads"} 4');
   });
 });

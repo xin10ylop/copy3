@@ -9,7 +9,7 @@ Everything else in `docs/` is history or reference. Times in Beirut (UTC+2) unle
 |---|---|---|
 | Live sniper | Ohio box, host service `hood-sniper` (`/opt/hood/hoodsniper/.env.executor`) | **live**, mode `live`, branch `claude/loving-wozniak-z508mk` |
 | PonsSniper contract | `0x476ffafaab21b6523d4701dd16748bfb1b5a4dc7` | owner = cold Phantom wallet `0x9b19…ba55`, 3 operator keys (generated on the box), treasury = the contract (profits compound), **max 0.005 ETH per buy, 0.02 ETH per hour** (raise = redeploy) |
-| Block source | public sequencer feed `wss://feed.mainnet.chain.robinhood.com` (+ `delayed-feed`) | **blocked since 1 Nov ~07:00 UTC**: Cloudflare answers 403 "this source address range has been blocked … connecting in a manner intended to exceed or evade this feed service's limits"; the notice also forbids moving to new IP space, so no Elastic-IP swap. The sniper runs on the **RPC fallback**: `eth_getBlockByNumber(latest)` on the sequencer RPC every 97 ms (~50 ms behind the feed on average; skipped blocks are fetched by number), feed retried with a 1–10 min backoff; see "Feed outage" below |
+| Block source | public sequencer feed `wss://feed.mainnet.chain.robinhood.com` (+ `delayed-feed`) | **blocked since 1 Nov ~07:00 UTC**: Cloudflare answers 403 "this source address range has been blocked … connecting in a manner intended to exceed or evade this feed service's limits"; the notice also forbids moving to new IP space, so no Elastic-IP swap. The sniper takes blocks from **public-RPC `newHeads` websockets** (globalstake, publicnode, bloXroute; `FEED_HEADS_WSS`): every block pushed ~70 ms after sealing, full block fetched over the same socket (~100 ms behind the feed in all); Robinhood's own public RPC is NOT usable for this (its `latest` moves in ~500 ms batches, ≥ 650 ms late). The feed is retried with a 1–10 min backoff and takes over again the moment it delivers; see "Feed outage" below |
 | Indexer, tracker, agent, Postgres | Ohio box, compose (`hoodctl`) | running; indexer in logs mode (`INDEXER_MODE=logs`, `WS_NEW_HEADS=0`) to keep Alchemy usage low |
 | Agent scout | compose `agent`, every 15 min | on (proposes operator plays; auto-approve needs ≥ 10 coins, ≥ 35 % wins, ≥ 0.002 ETH/snipe) |
 | Agent nightly refit / auto-disable / blacklist | compose `agent` | **off** (`NIGHTLY_HOUR_UTC=-1` in `.env.ohio`). It disabled the live play on 31 Oct 03:00 UTC on pre-fix losses. Turn on only with a known-good rolling window |
@@ -42,8 +42,8 @@ An **epoch** (`hoodctl epoch now "why"`) makes `trades` / `race` / `pnl` / `stat
 hoodctl trades 1        # every run of the last 24 h with the note that explains it (abort reason, exit reading, decision latency)
 hoodctl race 1          # where our sends landed vs the first T+1 block (race win rate)
 sudo bash /opt/hood/hoodsniper/infra/ohio/golive.sh status   # service, feed, counters, kill, plays, bankroll
-hoodctl health          # live sniper on :8090 (rpcFallback "ON (n blocks)" while the feed is blocked, feedUrl when it is back)
-curl -s localhost:8090/healthz | jq '{ok, feed: .feed.currentUrl, fallback}'
+hoodctl health          # live sniper on :8090: blocks per source, heads sockets up, rpcFallback (should be "off")
+curl -s localhost:8090/healthz | jq '{ok, feed: .feed.currentUrl, blocks, heads, fallback}'
 ```
 
 Qualifying launches per day (the market's volume; the strategy's income is proportional to it):
@@ -104,22 +104,24 @@ Realistic expectation at 0.07 per buy, current exits: first in block ≈ +0.3 ET
 
 From ~07:00 UTC both feed hosts refuse the box's handshake with HTTP 403 (Cloudflare, "source address
 range blocked … intended to exceed or evade this feed service's limits"; the same notice says routing
-new IP space is not permitted, so we do not rotate the IP: the sequencer RPC, which the bot also sends
-through, is the next thing they would block). Before f39dd75 the bot only saw launches from the node's
-logs 13–22 s late (one trade, HUNCH, decided 13.7 s late and lost). Since f39dd75 (deployed 07:27 UTC):
+new IP space is not permitted, so we do not rotate the IP: the RPC the bot sends through is the next
+thing they would block). Before f39dd75 the bot only saw launches from the node's logs 13–22 s late
+(one trade, HUNCH, decided 13.7 s late and lost).
 
-- the feed client backs off 1 min, doubling to 10, after a refused handshake instead of knocking every 5 s;
-- while the feed is down for > 2 s the sniper polls `latest` on the sequencer RPC (`FEED_FALLBACK_POLL_MS`,
-  default 97, deliberately not a multiple of the 100 ms seal grid, so the clock's boundary estimate is
-  not phase-locked to the poll; `FEED_FALLBACK_AFTER_MS=2000`); blocks a slow poll skipped are fetched
-  by number and delivered in order; the poller is off the moment the feed delivers a block again;
-- `/healthz` stays `ok` on fallback blocks and shows `fallback: {active, polls, blocks, caughtUp, gaps, errors}`;
-  `hoodctl health` checks the live unit on :8090 (not the compose paper sniper on :8084).
+**Block sources now** (all deliver through one ordered gate, `block-gate.ts`; the first with a block owns it):
 
-Cost in the race: the launch block arrives ~50 ms later on average than from the feed (0–97 ms), so a
-launch in the last ~150 ms of its second may be decided too late for the first T+1 block; the rest are
-unaffected. Public RPC load: ~10 requests/s. If the RPC also starts refusing (`fallback.errors` rising,
-`hoodctl health` FAIL), the bot is blind: stop it (`hoodctl kill`) rather than let it enter on stale state.
+| Source | Lag of the first block of a second (measured 1 Nov) | Role |
+|---|---|---|
+| sequencer feed (`FEED_URL`) | ~20–40 ms | primary; 403 since 1 Nov, retried with a 1–10 min backoff, takes over the moment it delivers |
+| public-RPC `newHeads` sockets (`FEED_HEADS_WSS`: globalstake, publicnode, bloXroute) | head ~70 ms + one fetch ~30–45 ms | **what runs now**; a block the feed delivered is never fetched, so it costs nothing while the feed works |
+| RPC poll of `FAST_RPC[0]` (drpc) every 97 ms | ~90–160 ms | last resort, on only after 2 s without a block from the others (`fallback.active`) |
+| Robinhood public RPC `latest` | **≥ 650 ms** (updates in ~500 ms batches) | not a block source any more; still the send endpoint and raced for receipts |
+
+Cost in the race: the launch block arrives ~100 ms later than from the feed, so a launch in the last
+~0.1–0.2 s of its second may be decided too late for the first T+1 block; the rest are unaffected
+(`hoodctl trades` prints "decided N ms after the launch block arrived (source)"). Load on the public
+nodes: 3 subscriptions + ~10 block fetches/s on one of them. If every socket is down (`heads.connected`
+0) the poller takes over; if that also errors (`fallback.errors` rising) the bot is blind: `hoodctl kill`.
 
 ## History of the fixes (30–31 Oct)
 
@@ -127,4 +129,4 @@ dump exit on transfers only (not team sells) · deadline T+1 · re-price before 
 time is left) · 600k gas · receipts and reserves raced via the sequencer RPC · reserve book that cannot
 double count · 5-min team cool-off (restart-safe) · daily loss base = total bankroll, then removed ·
 stop 40 → 20 · helper-contract buys as feed hints · exit-signal reading and abort reason in `hoodctl trades` ·
-timestamps in `HOOD_TZ` · nightly auto-disable off · helper (0x6f49227e) and proxy (0x240acbf8) team buys decoded from the feed · burst 40 × 3 ms · fee cap 0.2 gwei · trailing 20/15 · epoch · (1 Nov) feed 403 backoff + RPC block fallback.
+timestamps in `HOOD_TZ` · nightly auto-disable off · helper (0x6f49227e) and proxy (0x240acbf8) team buys decoded from the feed · burst 40 × 3 ms · fee cap 0.2 gwei · trailing 20/15 · epoch · (1 Nov) feed 403 backoff · blocks from public-RPC newHeads sockets + RPC poll as last resort.

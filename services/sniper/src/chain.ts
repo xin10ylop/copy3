@@ -8,16 +8,15 @@ import {
   MULTICALL3,
   PONS_V2,
   curveAbi,
-  decodedTxFromRpc,
   factoryAbi,
   parseTokenLaunchedLog,
   tokenAbi,
-  type DecodedTx,
   type FeedBlock,
   type RawLog,
   type Reserves,
   type RpcTxLike,
 } from '@hood/core';
+import { rpcBlockToFeedBlock, type RpcBlockLike } from './rpc-block.js';
 import {
   BaseError,
   createPublicClient,
@@ -229,8 +228,11 @@ export class ViemChain implements ChainClient {
   private readonly receiptClients: PublicClient[];
 
   /** `transport` replaces the http transport (tests); `receiptTransports` / `receiptUrls` add receipt endpoints. */
-  constructor(opts: { httpUrl: string; wsUrl?: string; transport?: Transport; receiptUrls?: string[]; receiptTransports?: Transport[] }) {
+  private readonly blockClient: PublicClient | null;
+
+  constructor(opts: { httpUrl: string; wsUrl?: string; transport?: Transport; receiptUrls?: string[]; receiptTransports?: Transport[]; blockUrl?: string }) {
     this.http = createPublicClient({ transport: opts.transport ?? http(opts.httpUrl, { batch: false, retryCount: 1, timeout: 5000 }) });
+    this.blockClient = opts.blockUrl ? createPublicClient({ transport: http(opts.blockUrl, { batch: false, retryCount: 0, timeout: 3000 }) }) : null;
     this.ws = opts.wsUrl ? createPublicClient({ transport: webSocket(opts.wsUrl, { keepAlive: true, reconnect: true }) }) : null;
     const extra = [
       ...(opts.receiptTransports ?? []).map((t) => createPublicClient({ transport: t })),
@@ -263,22 +265,12 @@ export class ViemChain implements ChainClient {
   }
 
   async getLatestBlock(number?: number): Promise<FeedBlock | null> {
-    const c = this.receiptClients[1] ?? this.http; // the sequencer RPC when configured
+    const c = this.blockClient ?? this.receiptClients[1] ?? this.http; // a fast public node when configured
     const b =
       number === undefined
         ? await c.getBlock({ blockTag: 'latest', includeTransactions: true })
         : await c.getBlock({ blockNumber: BigInt(number), includeTransactions: true });
-    const receivedAt = Date.now();
-    const txs: DecodedTx[] = [];
-    for (const t of b.transactions) {
-      if (typeof t === 'string') continue;
-      try {
-        txs.push(decodedTxFromRpc({ ...t, from: t.from, to: t.to ?? null, transactionIndex: t.transactionIndex ?? null }));
-      } catch {
-        /* an undecodable tx (unknown type) is skipped; the feed decoder skips those too */
-      }
-    }
-    return { block: Number(b.number), timestamp: Number(b.timestamp), txs, receivedAt, blockHash: b.hash, headerKind: 3 };
+    return rpcBlockToFeedBlock(b as unknown as RpcBlockLike, Date.now());
   }
 
   getTransactionCount(address: Address, tag: 'latest' | 'pending'): Promise<number> {

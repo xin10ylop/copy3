@@ -3,7 +3,9 @@ import { readFileSync } from 'node:fs';
 import { CHAIN_ID, FeedClient, SequencerClock, parsePlay, type Play } from '@hood/core';
 import { parseEther, type Address } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
+import { BlockGate } from './block-gate.js';
 import { RpcBlockPoller } from './block-poller.js';
+import { HeadsBlockSource } from './heads-source.js';
 import { ViemChain } from './chain.js';
 import { executorKeys, loadConfig, redactedConfig } from './config.js';
 import { LaunchDetector } from './detector.js';
@@ -42,7 +44,12 @@ async function main(): Promise<void> {
 
   const store: SniperStore = cfg.DATABASE_URL ? PgStore.fromUrl(cfg.DATABASE_URL) : new MemoryStore({ plays: loadPlaysFile(cfg.PLAYS_FILE) });
   // receipts are raced against the sequencer's own RPC: a launcher-contract launch is built from its receipt
-  const chain = new ViemChain({ httpUrl: cfg.NODE_HTTP || cfg.PUBLIC_RPC, ...(cfg.NODE_WS ? { wsUrl: cfg.NODE_WS } : {}), receiptUrls: [cfg.PUBLIC_RPC] });
+  const chain = new ViemChain({
+    httpUrl: cfg.NODE_HTTP || cfg.PUBLIC_RPC,
+    ...(cfg.NODE_WS ? { wsUrl: cfg.NODE_WS } : {}),
+    receiptUrls: [cfg.PUBLIC_RPC, ...cfg.FAST_RPC],
+    ...(cfg.FAST_RPC[0] ? { blockUrl: cfg.FAST_RPC[0] } : {}),
+  });
   const clock = new SequencerClock({ windowMs: cfg.CLOCK_WINDOW_MS });
   const scheduler = new PreciseScheduler(cfg.SPIN_MS);
   const senders = cfg.SEND_ENDPOINTS.map((u) => new JsonRpcHttp(u));
@@ -216,25 +223,34 @@ async function main(): Promise<void> {
   }
 
   const feed = new FeedClient({ urls: [cfg.FEED_URL, ...cfg.FEED_URL_SECONDARY] });
-  // feed fallback: blocks from the sequencer RPC while the feed is down (1 Nov 2026: 403 for hours)
-  const poller =
-    cfg.FEED_FALLBACK_POLL_MS > 0
-      ? new RpcBlockPoller({ chain, onBlock: (b) => s.onFeedBlock(b), logger, intervalMs: cfg.FEED_FALLBACK_POLL_MS, afterMs: cfg.FEED_FALLBACK_AFTER_MS })
-      : null;
-  feed.on('block', (b) => {
-    poller?.onFeedBlock(b);
+  // Every block source delivers through one ordered gate (block-gate.ts): the sequencer feed, the
+  // public-RPC newHeads sockets (1 Nov 2026: the feed refuses the box with 403) and, when nothing
+  // else delivers for FEED_FALLBACK_AFTER_MS, an RPC poll. Whichever is first owns the stream.
+  const blocks = new BlockGate((b, source) => {
+    if (source !== 'rpc-poll') poller?.onFeedBlock(b);
     s.onFeedBlock(b);
   });
+  const poller =
+    cfg.FEED_FALLBACK_POLL_MS > 0
+      ? new RpcBlockPoller({ chain, onBlock: (b) => blocks.deliver(b, 'rpc-poll'), logger, intervalMs: cfg.FEED_FALLBACK_POLL_MS, afterMs: cfg.FEED_FALLBACK_AFTER_MS })
+      : null;
+  const heads = cfg.FEED_HEADS_WSS.length > 0 ? new HeadsBlockSource({ urls: cfg.FEED_HEADS_WSS, gate: blocks, logger }) : null;
+  heads?.start();
+  const startedAt = Date.now();
+  const watchdog = poller
+    ? setInterval(() => {
+        if (Date.now() - (blocks.lastAt ?? startedAt) > cfg.FEED_FALLBACK_AFTER_MS) poller.ensurePolling();
+      }, 250)
+    : null;
+  watchdog?.unref?.();
+  feed.on('block', (b) => blocks.deliver(b, 'feed'));
   feed.on('gap', (g) => logger.warn(g, 'feed gap'));
   feed.on('reset', (r) => logger.warn(r, 'feed sequence reset'));
   feed.on('connected', (url) => {
     poller?.feedUp();
     logger.info({ url }, 'feed connected');
   });
-  feed.on('disconnected', (d) => {
-    poller?.feedDown();
-    logger.warn(d, 'feed disconnected');
-  });
+  feed.on('disconnected', (d) => logger.warn(d, 'feed disconnected'));
   feed.on('error', (e) => logger.warn({ err: e }, 'feed error'));
   feed.start();
 
@@ -248,7 +264,9 @@ async function main(): Promise<void> {
         balanced.refreshBalances().catch((e: unknown) => logger.warn({ err: e }, 'balance refresh failed'));
       }, cfg.BALANCE_POLL_MS)
     : null;
-  const health = startHealthServer(cfg.HEALTH_PORT, () => s.health(feed.stats.snapshot(), poller?.snapshot() ?? null));
+  const health = startHealthServer(cfg.HEALTH_PORT, () =>
+    s.health(feed.stats.snapshot(), { blocks: blocks.snapshot(), heads: heads?.snapshot() ?? null, fallback: poller?.snapshot() ?? null }),
+  );
   logger.info(
     { mode: cfg.EXECUTION_MODE, port: cfg.HEALTH_PORT, exitKey: live?.exitKey.address, burstKeys: live?.burstKeys.map((k) => k.address), probeKeys: probe?.keys.map((k) => k.address) },
     'sniper running',
@@ -260,6 +278,8 @@ async function main(): Promise<void> {
     if (balances) clearInterval(balances);
     gate?.stop();
     feed.stop();
+    if (watchdog) clearInterval(watchdog);
+    heads?.stop();
     poller?.stop();
     health.close();
     await s.stop();

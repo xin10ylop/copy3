@@ -2,15 +2,14 @@
 import type { Hex } from 'viem';
 import { z } from 'zod';
 
-const csv = z
-  .string()
-  .default('')
-  .transform((s) =>
-    s
-      .split(',')
-      .map((x) => x.trim())
-      .filter(Boolean),
-  );
+const splitCsv = (s: string): string[] =>
+  s
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean);
+const csv = z.string().default('').transform(splitCsv);
+/** comma list with a default; set the variable to '' to turn the feature off */
+const csvDefault = (d: string) => z.string().default(d).transform(splitCsv);
 
 const num = (d: number) => z.coerce.number().default(d);
 /** optional positive number; unset or '' = undefined */
@@ -45,9 +44,20 @@ export const ConfigSchema = z
     NODE_HTTP: z.string().default(''),
     NODE_WS: z.string().default(''),
     PUBLIC_RPC: z.string().default('https://rpc.mainnet.chain.robinhood.com'),
-    /** feed fallback: poll the sequencer RPC for blocks every N ms while the feed is down (0 = off) */
+    /**
+     * Public RPC websockets whose newHeads push every block ~70 ms after sealing: the block source
+     * while the sequencer feed refuses the box (1 Nov 2026, HTTP 403 for the address range). Run
+     * alongside the feed; a block the feed already delivered is never fetched. '' = off.
+     */
+    FEED_HEADS_WSS: csvDefault('wss://rpc-robinhood.globalstake.io/ws,wss://robinhood-rpc.publicnode.com,wss://robinhood.rpc.blxrbdn.com'),
+    /**
+     * Fast public HTTP RPCs (a head per block; Robinhood's own public RPC updates `latest` in ~500 ms
+     * batches): raced with PUBLIC_RPC for 'latest' reads and receipts; the first is the poller's block source.
+     */
+    FAST_RPC: csvDefault('https://robinhood.drpc.org,https://robinhood-rpc.publicnode.com'),
+    /** last-resort block source: poll FAST_RPC[0] (else PUBLIC_RPC) every N ms while no source delivers (0 = off) */
     FEED_FALLBACK_POLL_MS: num(97),
-    /** feed fallback: start polling this long after the feed went down */
+    /** start polling after this long without a block from the feed or the heads sockets */
     FEED_FALLBACK_AFTER_MS: num(2000),
     /** comma list; first = primary (used for RTT measurement and nonce reads) */
     SEND_ENDPOINTS: csv,

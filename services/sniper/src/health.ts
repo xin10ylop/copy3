@@ -1,7 +1,9 @@
 /** /healthz (JSON), /metrics (Prometheus text), /clock (full clock snapshot). */
 import http from 'node:http';
 import type { ClockSnapshot, FeedStatsSnapshot } from '@hood/core';
+import type { BlockGateSnapshot } from './block-gate.js';
 import type { FallbackSnapshot } from './block-poller.js';
+import type { HeadsSnapshot } from './heads-source.js';
 
 export interface HealthState {
   /** probe = paper fills + one real probe tx per planned burst (race measurement) */
@@ -9,7 +11,11 @@ export interface HealthState {
   startedAt: number;
   now: number;
   feed: FeedStatsSnapshot;
-  /** blocks from the sequencer RPC while the feed is down (null when the fallback is disabled) */
+  /** the ordered gate every block source delivers through: last block, when, from which source */
+  blocks?: BlockGateSnapshot | null;
+  /** public-RPC newHeads sockets (the block source while the feed refuses the box) */
+  heads?: HeadsSnapshot | null;
+  /** last resort: blocks polled from an RPC while nothing else delivers (null when disabled) */
   fallback?: FallbackSnapshot | null;
   clock: ClockSnapshot;
   rttMs: number;
@@ -25,7 +31,7 @@ const FEED_STALE_MS = 5000;
 
 /** ms since the last block from either source (feed or RPC fallback); null before the first one. */
 export function blockAgeMs(s: HealthState): number | null {
-  const last = Math.max(s.feed.lastReceivedAt ?? -1, s.fallback?.lastBlockAt ?? -1);
+  const last = Math.max(s.blocks?.lastAt ?? -1, s.feed.lastReceivedAt ?? -1, s.heads?.lastBlockAt ?? -1, s.fallback?.lastBlockAt ?? -1);
   return last < 0 ? null : s.now - last;
 }
 
@@ -43,7 +49,11 @@ export function prometheus(s: HealthState): string {
   };
   g('sniper_up', healthy(s) ? 1 : 0, 'a block (feed or RPC fallback) within 5 s');
   g('sniper_block_age_ms', blockAgeMs(s), 'ms since the last block from either source');
-  g('sniper_fallback_active', s.fallback ? (s.fallback.active ? 1 : 0) : null, '1 = feed down, blocks come from the sequencer RPC');
+  g('sniper_heads_connected', s.heads?.connected ?? null, 'public-RPC newHeads sockets up');
+  g('sniper_heads_blocks_total', s.heads?.blocks ?? null, 'blocks delivered from newHeads sockets');
+  g('sniper_heads_fetch_ms', s.heads?.lastFetchMs ?? null, 'head announced → block delivered, last block');
+  for (const [src, n] of Object.entries(s.blocks?.bySource ?? {})) g('sniper_blocks_by_source_total', n, 'blocks delivered per source', `{source="${src}"}`);
+  g('sniper_fallback_active', s.fallback ? (s.fallback.active ? 1 : 0) : null, '1 = no feed and no heads socket, blocks come from an RPC poll');
   g('sniper_fallback_blocks_total', s.fallback?.blocks ?? null, 'blocks delivered by the RPC fallback');
   g('sniper_fallback_activations_total', s.fallback?.activations ?? null, 'times the RPC fallback switched on');
   g('sniper_live', s.mode === 'live' ? 1 : 0, '1 = live, 0 = paper');

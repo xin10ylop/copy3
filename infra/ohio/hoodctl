@@ -71,7 +71,7 @@ case "$cmd" in
     for pair in $pairs; do
       name="${pair%%:*}" port="${pair##*:}"
       code="$(curl -sS -m 5 -o /tmp/hoodctl-health.$$ -w '%{http_code}' "http://127.0.0.1:$port/healthz" 2>/dev/null || true)"
-      summary="$(jq -c '{ok, mode, lagBlocks, head, lastBlock, feedBlocks: .feed.blocks?, feedUrl: .feed.currentUrl?, rpcFallback: (if .fallback? then (if .fallback.active then "ON (\(.fallback.blocks) blocks)" else "off" end) else null end), raceSent: .counters.race_sent?, raceWon: .counters.race_first_in_block?, lastScout, lastError}
+      summary="$(jq -c '{ok, mode, lagBlocks, head, lastBlock, feedBlocks: .feed.blocks?, feedUrl: .feed.currentUrl?, blocks: .blocks.bySource?, heads: (if .heads? then "\(.heads.connected)/\(.heads.urls) sockets, fetch \(.heads.lastFetchMs) ms" else null end), rpcFallback: (if .fallback? then (if .fallback.active then "ON (\(.fallback.blocks) blocks)" else "off" end) else null end), raceSent: .counters.race_sent?, raceWon: .counters.race_first_in_block?, lastScout, lastError}
                         | with_entries(select(.value != null))' /tmp/hoodctl-health.$$ 2>/dev/null || true)"
       rm -f /tmp/hoodctl-health.$$
       if [[ "$code" == 200 ]]; then lvl=OK; else lvl=FAIL; rc=1; fi

@@ -91,6 +91,11 @@ export class RpcBlockPoller {
     }
   }
 
+  /** Start polling now (the watchdog found no block from any source for `afterMs`). */
+  ensurePolling(): void {
+    this.start();
+  }
+
   private start(): void {
     if (this.timer) return;
     this.stats.activations++;
