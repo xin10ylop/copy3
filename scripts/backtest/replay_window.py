@@ -33,7 +33,7 @@ def ts_of(blocks):
             if r: BTS[b]=u(r['timestamp'])
     return BTS
 def block_at(ts):  # binary search a block number by timestamp
-    hi=u(rpc('eth_blockNumber',[])); lo=hi-3_000_000
+    hi=u(rpc("eth_blockNumber",[])); lo=1   # whole chain: a month-old window must not clamp to ~3.5 days back
     while lo<hi:
         mid=(lo+hi)//2; t=u(rpc('eth_getBlockByNumber',[hex(mid),False])['timestamp'])
         if t<ts: lo=mid+1

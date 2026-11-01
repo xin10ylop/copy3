@@ -1,3 +1,8 @@
+> **Correction 2 (1 Nov 2026).** The month dataset was missing team-dump transfers for most tokens
+> from 2 Oct (silent batch errors in the fetch). Corrected and validated against chain replays: the
+> live rule per block makes +2.52 %/trade, +9.8 ETH per 0.1-ETH buy over the month (was +3.10 %,
+> +12.0). See docs/STATE.md, "The month backtest had a data bug".
+
 # Correction (31 Oct 2026): the backtests below act inside blocks; the bot cannot
 
 Backtests #1–#3 evaluate every exit after every trade (log), so they (a) sell at the moment a team

@@ -101,7 +101,31 @@ Realistic expectation at 0.07 per buy, current exits: first in block ≈ +0.3 ET
 3. Rotate the Alchemy and Anthropic keys (the current ones were pasted in chat).
 4. Keep counting qualifying launches per day; if the market stays at 20–40/day, size expectations to it.
 
-## Feed outage (1 Nov)
+## The month backtest had a data bug (found 1 Nov)
+
+`transfers.json` of the month dataset covered every token only for 28 Sep – 1 Oct; from 2 Oct on only
+19–71 % (the fetch skipped batch items that came back with an error, without retrying: fixed in
+`scripts/backtest/fetch_timestamps_transfers.py`). Those launches had no team-dump events, so the
+simulated bot held through dumps the real bot exits on (one launch: +371 % in the dataset, −0.7 % on
+the chain). Rebuilt from chain transfer logs for all 4 646 qualifying launches (928 changed) and
+validated against an independent chain replay of 26 and 27 Oct (identical, launch by launch):
+
+| | per trade | month (per 0.1 ETH buy) |
+|---|---|---|
+| old dataset | +3.10 % | +12.0 |
+| corrected | +2.52 % | +9.8 |
+| corrected, trailing 20/10 instead of 20/15 | | +12.6 (better in both halves) |
+
+The edge is real in the corrected month but concentrated in 15–28 Oct (≈ +10 %/trade); 28 Sep – 14 Oct
+≈ +0.8 %. From the chain, every qualifying launch, live rule: 29 Oct −0.6 %, 30 Oct +0.6 %, 31 Oct –
+1 Nov −2.2 % per trade; the live bot's own trades match that replay within ~1.4 points. So the fade is
+in the market (qualifying launches/day also fell from ~100 to ~30), not in the bot.
+
+The loss-streak pause (4 → 10 min) is about neutral on corrected data (+14 % month, second half −0.1).
+Operator keys from deployer funding (traced for all month deployers): the big funding routes are public
+services (`0xe68d0bbc…` funded 603 launches by 600 deployers), not operators; no key worth building.
+
+
 
 From ~07:00 UTC both feed hosts refuse the box's handshake with HTTP 403 (Cloudflare, "source address
 range blocked … intended to exceed or evade this feed service's limits"; the same notice says routing
@@ -146,4 +170,4 @@ dump exit on transfers only (not team sells) · deadline T+1 · re-price before 
 time is left) · 600k gas · receipts and reserves raced via the sequencer RPC · reserve book that cannot
 double count · 5-min team cool-off (restart-safe) · daily loss base = total bankroll, then removed ·
 stop 40 → 20 · helper-contract buys as feed hints · exit-signal reading and abort reason in `hoodctl trades` ·
-timestamps in `HOOD_TZ` · nightly auto-disable off · helper (0x6f49227e) and proxy (0x240acbf8) team buys decoded from the feed · burst 40 × 3 ms · fee cap 0.2 gwei · trailing 20/15 · epoch · (1 Nov) feed 403 backoff · blocks from public-RPC newHeads sockets + RPC poll as last resort · late ledger logs timestamp-checked · auto-approve off.
+timestamps in `HOOD_TZ` · nightly auto-disable off · helper (0x6f49227e) and proxy (0x240acbf8) team buys decoded from the feed · burst 40 × 3 ms · fee cap 0.2 gwei · trailing 20/15 (20/10 recommended 1 Nov, corrected month) · epoch · (1 Nov) feed 403 backoff · blocks from public-RPC newHeads sockets + RPC poll as last resort · late ledger logs timestamp-checked · auto-approve off.

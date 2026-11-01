@@ -45,15 +45,26 @@ targets=[(c,tok_of[c],lb[c]) for c in lb if len(exby.get(c,set())-{dep_of[c]})>0
 print('tokens with team exemptions',len(targets),flush=True)
 try: transfers=json.load(open('transfers.json'))
 except Exception: transfers={}
-todo=[t for t in targets if t[1] not in transfers]
-for i in range(0,len(todo),20):
-    chunk=todo[i:i+20]
-    d=post([{'jsonrpc':'2.0','id':j,'method':'eth_getLogs','params':[{'fromBlock':hex(b),'toBlock':hex(b+1500),'address':tok,'topics':[T_TR]}]} for j,(c,tok,b) in enumerate(chunk)])
-    if isinstance(d,list):
-        for x in d:
-            if 'result' in x and isinstance(x['result'],list): transfers[chunk[x['id']][1]]=[{'b':int(l['blockNumber'],16),'li':int(l['logIndex'],16),'f':'0x'+l['topics'][1][-40:],'t':'0x'+l['topics'][2][-40:],'v':int(l['data'][2:66],16)} for l in x['result']]
-    time.sleep(0.2)
-    if (i//20)%20==0: print('transfers progress',i,len(transfers),flush=True); json.dump(transfers,open('transfers.json','w'))
+# 1 Nov 2026: batch items that came back with an error (429, response too large) used to be skipped
+# silently and never retried: transfers.json covered only 19-71 % of the tokens from 2 Oct on, the
+# simulated bot never saw those team dumps and held through them (the month backtest was inflated).
+# Now every token is retried until it has an answer, and a gap stops the run.
+for rnd in range(12):
+    todo=[t for t in targets if t[1] not in transfers]
+    if not todo: break
+    print(f'transfers round {rnd}: {len(todo)} tokens to fetch',flush=True)
+    for i in range(0,len(todo),20):
+        chunk=todo[i:i+20]
+        d=post([{'jsonrpc':'2.0','id':j,'method':'eth_getLogs','params':[{'fromBlock':hex(b),'toBlock':hex(b+1500),'address':tok,'topics':[T_TR]}]} for j,(c,tok,b) in enumerate(chunk)])
+        if isinstance(d,list):
+            for x in d:
+                if 'result' in x and isinstance(x['result'],list): transfers[chunk[x['id']][1]]=[{'b':int(l['blockNumber'],16),'li':int(l['logIndex'],16),'f':'0x'+l['topics'][1][-40:],'t':'0x'+l['topics'][2][-40:],'v':int(l['data'][2:66],16)} for l in x['result']]
+        time.sleep(0.2+0.3*rnd)
+        if (i//20)%20==0: print('transfers progress',i,len(transfers),flush=True); json.dump(transfers,open('transfers.json','w'))
+missing=[t for t in targets if t[1] not in transfers]
+if missing:
+    json.dump(transfers,open('transfers.json','w'))
+    raise SystemExit(f'{len(missing)} of {len(targets)} tokens still have no transfer data: the backtest would miss their team dumps; re-run')
 json.dump(transfers,open('transfers.json','w')); print('transfers done',len(transfers),flush=True)
 # blocks of transfers need timestamps too (exempt outflows)
 need2=set()
