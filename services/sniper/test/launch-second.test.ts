@@ -332,6 +332,54 @@ describe('launch-second fingerprint: ledger → rules → burst at T+1', () => {
     h.scripted!.resolveFill!(null);
   });
 
+  it('no block stream (feed down, 1 Nov): a late node log of a LATER second is not a launch-second team buy; one of the launch second still counts', async () => {
+    const h = harness();
+    await h.sniper.start();
+    h.warm();
+    h.launchSecond(new Map(), 0, 4); // the launch second up to the launch, then the stream stops
+    await waitFor(() => h.chain.tokenWatchers.size > 0);
+    const lg = h.sniper.ledger(LAUNCH.txHash)!;
+    expect(lg.firstBlockAfter).toBeNull();
+    h.sched.t = (T + 13) * 1000; // 13 s later, no block of a later second ever arrived
+    // a team buy at T+3 (its block never reached the sniper): looked up, outside the second, ignored
+    h.chain.blockTs.set(h.blockAt(32), T + 3);
+    h.chain.emitTokenLog(
+      curveTradeLog({ curve: LAUNCH.curve, side: 'buy', trader: TEAM, recipient: TEAM, quote: parseEther('0.2'), tokens: 10n ** 26n, fee: parseEther('0.002'), tax: 0n, block: h.blockAt(32), txHash: `0x${'6a'.repeat(32)}`, logIndex: 0 }),
+    );
+    await waitFor(() => h.sniper.counters.ledger_ts_lookups === 1);
+    await sleep(5);
+    expect(lg.stats().seen.teamBuyEth).toBe(0);
+    // an unknown timestamp (0) never counts either
+    h.chain.emitTokenLog(
+      curveTradeLog({ curve: LAUNCH.curve, side: 'buy', trader: TEAM, recipient: TEAM, quote: parseEther('0.3'), tokens: 10n ** 26n, fee: parseEther('0.003'), tax: 0n, block: h.blockAt(40), txHash: `0x${'6b'.repeat(32)}`, logIndex: 0 }),
+    );
+    await waitFor(() => h.sniper.counters.ledger_ts_lookups === 2);
+    await sleep(5);
+    expect(lg.stats().seen.teamBuyEth).toBe(0);
+    // a buy in block k = 7 of the launch second (never fed): looked up, in the second, counted
+    h.chain.blockTs.set(h.blockAt(7), T);
+    h.chain.emitTokenLog(
+      curveTradeLog({ curve: LAUNCH.curve, side: 'buy', trader: TEAM, recipient: TEAM, quote: parseEther('0.04'), tokens: 10n ** 26n, fee: parseEther('0.0004'), tax: 0n, block: h.blockAt(7), txHash: `0x${'6c'.repeat(32)}`, logIndex: 0 }),
+    );
+    await waitFor(() => lg.stats().seen.teamBuyEth > 0);
+    expect(lg.stats().seen.teamBuyEth).toBeCloseTo(0.04, 12);
+    expect(h.sniper.counters.ledger_ts_lookups).toBe(3);
+  });
+
+  it('while the launch second is still running by the clock, a log of an unseen block counts at once (no lookup on the hot path)', async () => {
+    const h = harness();
+    await h.sniper.start();
+    h.warm();
+    h.launchSecond(new Map(), 0, 4);
+    await waitFor(() => h.chain.tokenWatchers.size > 0);
+    const lg = h.sniper.ledger(LAUNCH.txHash)!;
+    h.chain.emitTokenLog(
+      curveTradeLog({ curve: LAUNCH.curve, side: 'buy', trader: TEAM, recipient: TEAM, quote: parseEther('0.04'), tokens: 10n ** 26n, fee: parseEther('0.0004'), tax: 0n, block: h.blockAt(5), txHash: `0x${'6d'.repeat(32)}`, logIndex: 0 }),
+    );
+    expect(lg.stats().seen.teamBuyEth).toBeCloseTo(0.04, 12);
+    expect(h.sniper.counters.ledger_ts_lookups).toBe(0);
+  });
+
   it('a team buy below the threshold (0.05 ETH) never fires', async () => {
     const h = harness();
     await h.sniper.start();

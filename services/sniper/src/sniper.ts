@@ -56,6 +56,9 @@ import { ContractLimits } from './limits.js';
 import type { ActiveSnipe, ChangeChannel, SniperStore } from './store.js';
 import type { Decision, DetectedLaunch, Fill, SnipeRun } from './types.js';
 
+/** After the launch second ends by the clock, give the block stream this long to mark it before looking timestamps up. */
+const UNKNOWN_TS_GRACE_MS = 250;
+
 export interface SniperOptions {
   mode: 'live' | 'paper';
   store: SniperStore;
@@ -163,6 +166,7 @@ export class Sniper {
     alerts: 0,
     errors: 0,
     ledger_launches: 0,
+    ledger_ts_lookups: 0,
     ledger_matches: 0,
     launch_second_unconfirmed: 0,
   };
@@ -645,11 +649,34 @@ export class Sniper {
     return changed;
   }
 
-  /** CurveBuy / CurveSell / Transfer from the node: only blocks of the launch second count. */
+  /**
+   * CurveBuy / CurveSell / Transfer from the node: only blocks of the launch second count.
+   *
+   * A block whose timestamp is unknown counts as in the second until a block of a later second
+   * has passed through the block stream (`firstBlockAfter`). Without a block stream that never
+   * happens: on 1 Nov 2026 (feed refused, no fallback yet) every exempt-wallet buy of the next
+   * 13–21 s was counted as a launch-second team buy (TRADECRAFT: "team 0.034 ETH by 4 wallets",
+   * none on chain). So once the launch second is over by the clock and no later block was seen,
+   * the log's block timestamp is looked up before the buy counts. A block count can't stand in
+   * for it: the chain packs up to 23 blocks into one second when the sequencer catches up.
+   */
   private ledgerLog(lg: LaunchSecondLedger, log: RawLog): void {
     if (lg.dead || log.blockNumber === null || log.blockNumber === undefined) return;
     const b = Number(log.blockNumber);
-    if (!lg.inSecond(b, this.blockTs.get(b))) return;
+    const ts = this.blockTs.get(b);
+    if (ts === undefined && lg.firstBlockAfter === null && this.o.scheduler.now() >= (lg.ts + 1) * 1000 + UNKNOWN_TS_GRACE_MS) {
+      this.counters.ledger_ts_lookups!++;
+      this.o.chain
+        .getBlockTimestamp(b)
+        .then((t) => {
+          if (!(t > 0)) return; // unknown: never count a buy we cannot place in the second
+          this.blockTs.set(b, t);
+          if (!lg.dead && lg.inSecond(b, t) && lg.ingestLog(log)) this.onLedgerChanged(lg);
+        })
+        .catch((e: unknown) => this.error('launch-second ledger: block timestamp', e));
+      return;
+    }
+    if (!lg.inSecond(b, ts)) return;
     if (lg.ingestLog(log)) this.onLedgerChanged(lg);
   }
 

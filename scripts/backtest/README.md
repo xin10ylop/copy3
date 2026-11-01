@@ -26,3 +26,8 @@ RPC_URL=… python3 audit_trades.py trades.json          # every live run vs the
 daily_count.sql                                        # qualifying launches per day from the indexer DB
 ```
 Loading the month (1.5 GB of events) takes ~5 min and ~4 GB of RAM.
+
+**Which RPC for the replay tools (1 Nov 2026).** `RPC_URL=https://rpc-robinhood.globalstake.io` works:
+wide `eth_getLogs` ranges and batches, no key. drpc and publicnode refuse historical log ranges on
+their free tiers. Robinhood's own `rpc.mainnet.chain.robinhood.com` answers curl but its Cloudflare
+returns 403 to Python's default `urllib` user agent; send a `user-agent` header if you use it.
