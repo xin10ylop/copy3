@@ -101,6 +101,17 @@ Realistic expectation at 0.07 per buy, current exits: first in block ≈ +0.3 ET
 3. Rotate the Alchemy and Anthropic keys (the current ones were pasted in chat).
 4. Keep counting qualifying launches per day; if the market stays at 20–40/day, size expectations to it.
 
+## Send endpoints (1 Nov)
+
+CABAL 21:11 and ASHEN 22:20: the first burst member left −130 / −19 ms before the T+1 boundary to
+both send endpoints (Robinhood RPC, Alchemy) and was included 1.5–1.8 s later (Expired), while two
+other bots' buys landed in the first T+1 block; the account nonce matched (no gap), base fee 0.02 gwei
+(cap 0.2), and the blocks before ours carried 57–98 txs after a steady ~33 (a forwarding backlog
+released at once). Burst members carry consecutive nonces, so a late member 0 holds the whole burst.
+`SEND_ENDPOINTS` now also fans out to the sequencer itself (`sequencer.mainnet.chain.robinhood.com`,
+send-only: it refuses reads, so it is never first — the first endpoint serves RTT and nonce reads),
+bloXroute and globalstake. Every member goes to every endpoint concurrently; the fastest path wins.
+
 ## The month backtest had a data bug (found 1 Nov)
 
 `transfers.json` of the month dataset covered every token only for 28 Sep – 1 Oct; from 2 Oct on only
