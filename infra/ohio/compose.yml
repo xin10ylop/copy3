@@ -28,8 +28,11 @@ x-logging: &logging
     max-file: "5"
 
 x-db-url: &db-url postgres://hood:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.ohio (bootstrap.sh generates it)}@postgres:5432/hood
-x-alchemy-http: &alchemy-http https://${ALCHEMY_HOST:-robinhood-mainnet.g.alchemy.com}/v2/${ALCHEMY_KEY:?set ALCHEMY_KEY in .env.ohio}
-x-alchemy-ws: &alchemy-ws wss://${ALCHEMY_HOST:-robinhood-mainnet.g.alchemy.com}/v2/${ALCHEMY_KEY:?set ALCHEMY_KEY in .env.ohio}
+# Chain readers (2 Nov 2026: no Alchemy). HTTP: Robinhood's official RPC (no result cap; 100 curves
+# x 2000 blocks of logs in ~170 ms). WS (log subscriptions): publicnode (Robinhood's RPC has no WS).
+# Override in .env.ohio: NODE_HTTP_URL, NODE_WS_URL (an Alchemy URL works there too).
+x-node-http: &node-http ${NODE_HTTP_URL:-https://rpc.mainnet.chain.robinhood.com}
+x-node-ws: &node-ws ${NODE_WS_URL:-wss://robinhood-rpc.publicnode.com}
 
 x-app: &app
   build:
@@ -146,7 +149,7 @@ services:
   # ~2-3 calls/s instead of ~20/s. It does NOT index ETH transfers / wallets / traces, so the
   # tracker arms nothing and the agent sees no new funding trails; INDEXER_MODE=blocks (every
   # block + receipts + callTracer traces, ~1.7M+ calls/day) restores them. Head: newHeads + Pons
-  # logs over Alchemy WS (INDEXER_WS_NEW_HEADS=0 keeps only the logs subscription and polls the
+  # logs over the WS node (INDEXER_WS_NEW_HEADS=0 keeps only the logs subscription and polls the
   # head once a second, far cheaper in compute units; INDEXER_NODE_WS= empty drops WS entirely).
   # Starts at the head on first run (START_BLOCK). /healthz shows per-method RPC counts.
   indexer:
@@ -154,8 +157,8 @@ services:
     environment:
       SERVICE: indexer
       DATABASE_URL: *db-url
-      NODE_HTTP: *alchemy-http
-      NODE_WS: ${INDEXER_NODE_WS-wss://${ALCHEMY_HOST:-robinhood-mainnet.g.alchemy.com}/v2/${ALCHEMY_KEY:?set ALCHEMY_KEY in .env.ohio}}
+      NODE_HTTP: *node-http
+      NODE_WS: ${INDEXER_NODE_WS-${NODE_WS_URL:-wss://robinhood-rpc.publicnode.com}}
       INDEXER_MODE: ${INDEXER_MODE:-logs}
       WS_NEW_HEADS: ${INDEXER_WS_NEW_HEADS:-0}
       LOGS_INTERVAL_MS: ${INDEXER_LOGS_INTERVAL_MS:-}
@@ -192,7 +195,7 @@ services:
     environment:
       SERVICE: indexer
       DATABASE_URL: *db-url
-      NODE_HTTP: *alchemy-http
+      NODE_HTTP: *node-http
       TRACE_INTERNAL: "1"
       RPC_MIN_INTERVAL_MS: ${BACKFILL_RPC_MIN_INTERVAL_MS:-100}
       BACKFILL_DAYS: ${BACKFILL_DAYS:-3}
@@ -253,7 +256,7 @@ services:
       SERVICE: agent
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY in .env.ohio}
       DATABASE_URL: *db-url
-      NODE_HTTP: *alchemy-http
+      NODE_HTTP: *node-http
       REPORTS_DIR: /reports
       HEALTH_PORT: "8080"
       AGENT_HEALTH_PORT: "8080"
@@ -291,7 +294,7 @@ services:
   # EXECUTOR_PRIVATE_KEYS (gas-only keys, never contract operators), sent at the burst's first slot
   # and measured (`hoodctl race`). No SNIPER_CONTRACT is passed, so live mode refuses to start here.
   # SEND_ENDPOINTS: the first entry is used for the RTT measurement (burst timing), so the public
-  # RPC (the sequencer's own front door, ~3 ms from us-east-2) goes first, Alchemy second.
+  # RPC (the sequencer's own front door, ~3 ms from us-east-2) goes first, the sequencer endpoint second.
   sniper:
     <<: *app
     environment:
@@ -313,10 +316,10 @@ services:
       DAILY_LOSS_LIMIT_PCT: ${DAILY_LOSS_LIMIT_PCT:-15}
       FEED_URL: ${FEED_URL:-wss://feed.mainnet.chain.robinhood.com}
       FEED_URL_SECONDARY: ${FEED_URL_SECONDARY:-wss://delayed-feed.mainnet.chain.robinhood.com}
-      NODE_HTTP: *alchemy-http
-      NODE_WS: *alchemy-ws
+      NODE_HTTP: *node-http
+      NODE_WS: *node-ws
       PUBLIC_RPC: ${PUBLIC_RPC:-https://rpc.mainnet.chain.robinhood.com}
-      SEND_ENDPOINTS: ${PUBLIC_RPC:-https://rpc.mainnet.chain.robinhood.com},https://${ALCHEMY_HOST:-robinhood-mainnet.g.alchemy.com}/v2/${ALCHEMY_KEY:?set ALCHEMY_KEY in .env.ohio}
+      SEND_ENDPOINTS: ${PUBLIC_RPC:-https://rpc.mainnet.chain.robinhood.com},https://sequencer.mainnet.chain.robinhood.com
       DATABASE_URL: *db-url
       FEED_BLOCKS_RETENTION_DAYS: ${FEED_BLOCKS_RETENTION_DAYS:-7}
       HEALTH_PORT: "8080"
@@ -362,7 +365,7 @@ services:
       AGENT_MAX_ROUNDS: ${AGENT_MAX_ROUNDS:-60}
       AGENT_MAX_COST_USD: ${AGENT_MAX_COST_USD:-8}
       DATABASE_URL: *db-url
-      NODE_HTTP: *alchemy-http
+      NODE_HTTP: *node-http
       PUBLIC_RPC: ${PUBLIC_RPC:-https://rpc.mainnet.chain.robinhood.com}
       REPORTS_DIR: /reports
       HEALTH_PORT: "8080"

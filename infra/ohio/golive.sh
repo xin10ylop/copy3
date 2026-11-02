@@ -65,10 +65,13 @@ cmd="${1:-help}"; shift || true
 for kv in "$@"; do case "$kv" in *=*) export "${kv%%=*}=${kv#*=}" ;; esac; done
 
 write_exec_env() {
-  local alchemy_key alchemy_host pg keys contract mode
-  alchemy_key="$(env_get "$OHIO_ENV" ALCHEMY_KEY)"; alchemy_host="$(env_get "$OHIO_ENV" ALCHEMY_HOST)"; pg="$(env_get "$OHIO_ENV" POSTGRES_PASSWORD)"
-  [[ -n "$alchemy_key" && -n "$pg" ]] || die "ALCHEMY_KEY / POSTGRES_PASSWORD missing in $OHIO_ENV"
-  alchemy_host="${alchemy_host:-robinhood-mainnet.g.alchemy.com}"
+  local node_http node_ws pg keys contract mode
+  pg="$(env_get "$OHIO_ENV" POSTGRES_PASSWORD)"
+  [[ -n "$pg" ]] || die "POSTGRES_PASSWORD missing in $OHIO_ENV"
+  # no Alchemy (2 Nov 2026): reads on publicnode (fresh state), log subscriptions on its WS;
+  # override with SNIPER_NODE_HTTP / SNIPER_NODE_WS in the environment or $OHIO_ENV
+  node_http="${SNIPER_NODE_HTTP:-$(env_get "$OHIO_ENV" SNIPER_NODE_HTTP)}"; node_http="${node_http:-https://robinhood-rpc.publicnode.com}"
+  node_ws="${SNIPER_NODE_WS:-$(env_get "$OHIO_ENV" SNIPER_NODE_WS)}"; node_ws="${node_ws:-wss://robinhood-rpc.publicnode.com}"
   keys=""; contract=""; mode=paper
   if [[ -f "$EXEC_ENV" ]]; then
     keys="$(env_get "$EXEC_ENV" EXECUTOR_PRIVATE_KEYS)"; contract="$(env_get "$EXEC_ENV" SNIPER_CONTRACT)"; mode="$(env_get "$EXEC_ENV" EXECUTION_MODE)"; mode="${mode:-paper}"
@@ -84,9 +87,9 @@ EXECUTOR_PRIVATE_KEYS=$keys
 SNIPER_CONTRACT=$contract
 FEED_URL=wss://feed.mainnet.chain.robinhood.com
 FEED_URL_SECONDARY=wss://delayed-feed.mainnet.chain.robinhood.com
-SEND_ENDPOINTS=https://rpc.mainnet.chain.robinhood.com,https://sequencer.mainnet.chain.robinhood.com,https://robinhood.rpc.blxrbdn.com,https://rpc-robinhood.globalstake.io,https://$alchemy_host/v2/$alchemy_key
-NODE_WS=wss://$alchemy_host/v2/$alchemy_key
-NODE_HTTP=https://$alchemy_host/v2/$alchemy_key
+SEND_ENDPOINTS=https://rpc.mainnet.chain.robinhood.com,https://sequencer.mainnet.chain.robinhood.com,https://robinhood.rpc.blxrbdn.com,https://rpc-robinhood.globalstake.io
+NODE_WS=$node_ws
+NODE_HTTP=$node_http
 PUBLIC_RPC=https://rpc.mainnet.chain.robinhood.com
 DATABASE_URL=postgres://hood:$pg@127.0.0.1:5432/hood
 HEALTH_PORT=$HEALTH_PORT
