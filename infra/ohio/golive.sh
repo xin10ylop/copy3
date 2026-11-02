@@ -68,9 +68,10 @@ write_exec_env() {
   local node_http node_ws pg keys contract mode
   pg="$(env_get "$OHIO_ENV" POSTGRES_PASSWORD)"
   [[ -n "$pg" ]] || die "POSTGRES_PASSWORD missing in $OHIO_ENV"
-  # no Alchemy (2 Nov 2026): reads on publicnode (fresh state), log subscriptions on its WS;
+  # no Alchemy (2 Nov 2026): reads on globalstake (fresh state; publicnode answers eth_estimateGas
+  # with "Invalid parameters", which fails the live gate), log subscriptions on publicnode's WS;
   # override with SNIPER_NODE_HTTP / SNIPER_NODE_WS in the environment or $OHIO_ENV
-  node_http="${SNIPER_NODE_HTTP:-$(env_get "$OHIO_ENV" SNIPER_NODE_HTTP)}"; node_http="${node_http:-https://robinhood-rpc.publicnode.com}"
+  node_http="${SNIPER_NODE_HTTP:-$(env_get "$OHIO_ENV" SNIPER_NODE_HTTP)}"; node_http="${node_http:-https://rpc-robinhood.globalstake.io}"
   node_ws="${SNIPER_NODE_WS:-$(env_get "$OHIO_ENV" SNIPER_NODE_WS)}"; node_ws="${node_ws:-wss://robinhood-rpc.publicnode.com}"
   keys=""; contract=""; mode=paper
   if [[ -f "$EXEC_ENV" ]]; then
