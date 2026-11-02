@@ -65,6 +65,13 @@ export const SizingSchema = z.object({
   fraction: z.number().positive().max(1).default(0.25),
   minEth: z.number().positive().default(0.01),
   maxEth: z.number().positive().default(0.3),
+  /**
+   * Stake multiplier by the launch-second idle exempt wallets seen at the decision (2 Nov 2026):
+   * the tier with the largest `minIdle` ≤ idle applies to the size computed above (then the
+   * contract cap). Walk-forward over the month: idle 1–3 ×0.5, 4–9 ×1.25, 10+ ×2 keeps the total
+   * stake (mean ×0.99) and earns +20 % per unit staked out of sample; worst day −430 → −308.
+   */
+  idleTiers: z.array(z.object({ minIdle: z.number().int().min(0), mult: z.number().positive().max(5) })).optional(),
 });
 export type Sizing = z.infer<typeof SizingSchema>;
 

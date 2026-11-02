@@ -339,6 +339,27 @@ describe('launch-second fingerprint: ledger → rules → burst at T+1', () => {
     expect(operator.reasons).toMatch(/team 0\.19 ETH by 1 wallet\(s\), dev 0 ETH, 1 idle exempt \(seen\)/);
   });
 
+  it('sizing.idleTiers (2 Nov): the order is sized by the idle exempt wallets the ledger saw at the decision', async () => {
+    const IDLE = '0x000000000000000000000000000000000000a1d1' as Address;
+    const exemptLog = (w: Address) => ({ address: LAUNCH.curve, topics: [TOPICS.SnipeTaxExempted, `0x${'0'.repeat(24)}${w.slice(2)}`] as Hex[], data: '0x' as Hex, blockNumber: LAUNCH.block, transactionHash: LAUNCH.txHash, logIndex: 90 });
+    const tiers = [
+      { minIdle: 1, mult: 0.5 },
+      { minIdle: 4, mult: 1.25 },
+    ];
+    const h = harness({ plays: [{ ...TEAM_BUY_PLAY, trigger: { launchSecond: { minTeamBuyEth: 0.1, minIdleExempt: 1 } }, preset: { ...TEAM_BUY_PLAY.preset, buyEth: 0.004, sizing: { mode: 'fixed', idleTiers: tiers } } }] });
+    h.chain.receipts.set(LAUNCH.txHash, launchReceipt({ logs: [...launchFixture.receipt.logs, exemptLog(IDLE)] }));
+    await h.sniper.start();
+    h.warm();
+    const buy = curveBuyTx(0.19);
+    h.chain.receipts.set(buy.hash, buyReceipt(buy, h.blockAt(3)));
+    h.launchSecond(new Map([[3, [buy]]]), 0, 4);
+    await waitFor(() => h.scripted!.orders.length === 1);
+    const o = h.scripted!.orders[0]!;
+    expect(o.run.quoteIn).toBe(parseEther('0.002')); // 1 idle → × 0.5
+    expect(o.run.notes.join()).toMatch(/size: fixed 0\.004 ETH × 0\.5 \(1 idle exempt\) → 0\.002 ETH/);
+    h.scripted!.resolveFill!(null);
+  });
+
   it('MINEHOOD (2 Nov): a match on part of a helper tx (1 idle) that the rest of the tx turns into 0 idle is refused at the send and ends aborted, not failed', async () => {
     const IDLE = '0x000000000000000000000000000000000000a1d1' as Address;
     const exemptLog = (w: Address) => ({ address: LAUNCH.curve, topics: [TOPICS.SnipeTaxExempted, `0x${'0'.repeat(24)}${w.slice(2)}`] as Hex[], data: '0x' as Hex, blockNumber: LAUNCH.block, transactionHash: LAUNCH.txHash, logIndex: 90 });

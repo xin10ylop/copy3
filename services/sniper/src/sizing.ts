@@ -27,13 +27,35 @@ export interface SizeDecision {
   bankrollEth: number | null;
   /** 'min' / 'max' when the preset clamp applied; 'contract' when maxQuoteIn / the spend budget capped it (NEW-6) */
   clamped: 'min' | 'max' | 'contract' | null;
+  /** Preset.sizing.idleTiers multiplier applied (undefined when no tier applied) */
+  mult?: number;
   note: string;
 }
 
 const eth = (wei: bigint): number => Number(formatEther(wei));
 
-/** Buy size for one burst. Pure; `bankrollWei` null = unknown (bankroll mode then buys `minEth`). */
-export function sizeBuy(p: Pick<Preset, 'buyEth' | 'sizing'>, bankrollWei: bigint | null, maxConcurrent: number): SizeDecision {
+/**
+ * Buy size for one burst. Pure; `bankrollWei` null = unknown (bankroll mode then buys `minEth`).
+ * `idleExempt` (launch-second idle exempt wallets at the decision) selects a `sizing.idleTiers`
+ * multiplier when the preset has tiers.
+ */
+export function sizeBuy(p: Pick<Preset, 'buyEth' | 'sizing'>, bankrollWei: bigint | null, maxConcurrent: number, idleExempt?: number): SizeDecision {
+  return applyIdleTier(baseSize(p, bankrollWei, maxConcurrent), p.sizing?.idleTiers, idleExempt);
+}
+
+/** The tier with the largest minIdle ≤ idle; the size is multiplied and rounded down to 0.001 ETH. */
+export function applyIdleTier(d: SizeDecision, tiers: readonly { minIdle: number; mult: number }[] | undefined, idle: number | undefined): SizeDecision {
+  if (!tiers?.length || idle === undefined) return d;
+  let tier: { minIdle: number; mult: number } | undefined;
+  for (const t of tiers) if (t.minIdle <= idle && (!tier || t.minIdle > tier.minIdle)) tier = t;
+  if (!tier || tier.mult === 1) return d;
+  const raw = (d.quoteIn * BigInt(Math.round(tier.mult * 1e6))) / PPM;
+  const stepped = raw - (raw % SIZE_STEP_WEI);
+  const q = stepped > 0n ? stepped : raw;
+  return { ...d, quoteIn: q, mult: tier.mult, note: `${d.note} × ${tier.mult} (${idle} idle exempt) → ${eth(q)} ETH` };
+}
+
+function baseSize(p: Pick<Preset, 'buyEth' | 'sizing'>, bankrollWei: bigint | null, maxConcurrent: number): SizeDecision {
   const s = p.sizing;
   if (!s || s.mode !== 'bankroll') {
     return { quoteIn: parseEther(String(p.buyEth)), mode: 'fixed', bankrollEth: null, clamped: null, note: `fixed ${p.buyEth} ETH` };

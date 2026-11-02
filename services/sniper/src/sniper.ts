@@ -1073,12 +1073,13 @@ export class Sniper {
   }
 
   // ------------------------------------------------------------------ decide + execute
-  private newRun(l: DetectedLaunch, d: Decision): SnipeRun {
-    // Preset.sizing: fixed buyEth, or a share of the bankroll (cached balance, memory only)
-    let sizing = sizeBuy(d.preset, d.preset.sizing?.mode === 'bankroll' ? this.bankrollWei() : null, this.risk.maxConcurrent);
-    // NEW-6: a bankroll size is clamped to what the contract takes now — min(maxEth, maxQuoteIn,
-    // remaining spend budget) — instead of refusing the whole play
-    const cap = sizing.mode === 'bankroll' ? this.limits.cap() : null;
+  private newRun(l: DetectedLaunch, d: Decision, idleExempt?: number): SnipeRun {
+    // Preset.sizing: fixed buyEth, or a share of the bankroll (cached balance, memory only),
+    // times the sizing.idleTiers multiplier for the launch-second idle exempt wallets
+    let sizing = sizeBuy(d.preset, d.preset.sizing?.mode === 'bankroll' ? this.bankrollWei() : null, this.risk.maxConcurrent, idleExempt);
+    // NEW-6: a bankroll (or tier-multiplied) size is clamped to what the contract takes now —
+    // min(maxEth, maxQuoteIn, remaining spend budget) — instead of refusing the whole play
+    const cap = sizing.mode === 'bankroll' || sizing.mult !== undefined ? this.limits.cap() : null;
     if (cap !== null && sizing.quoteIn > cap) {
       const stepped = cap - (cap % SIZE_STEP_WEI);
       sizing = { ...sizing, quoteIn: stepped, clamped: 'contract', note: `${sizing.note} → clamped to the contract cap ${formatEther(cap)} ETH (maxQuoteIn / spend budget)` };
@@ -1104,7 +1105,7 @@ export class Sniper {
       sizing,
     };
     if (maxTaxBps !== d.preset.maxTaxBps) run.notes.push(`maxTaxBps ${d.preset.maxTaxBps} clamped to ${maxTaxBps} (M3)`);
-    if (sizing.mode === 'bankroll') run.notes.push(`size: ${sizing.note}`);
+    if (sizing.mode === 'bankroll' || sizing.mult !== undefined) run.notes.push(`size: ${sizing.note}`);
     return run;
   }
 
@@ -1159,7 +1160,7 @@ export class Sniper {
 
   /** A play matched (at the launch block or later from the launch-second ledger): risk, then execute. */
   private async decide(l: DetectedLaunch, d: Decision, t0: number, ledger: LaunchSecondLedger | undefined, source: 'launch' | 'launch-second'): Promise<SnipeRun> {
-    const run = this.newRun(l, d);
+    const run = this.newRun(l, d, ledger?.stats().idleExempt);
     if (ledger) run.ledger = ledger;
     // the race starts here: how long after the launch block reached us did we decide (the +1 s
     // send window closes ~880 ms after the launch block; a decision past ~600 ms lands late)

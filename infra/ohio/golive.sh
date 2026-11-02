@@ -175,7 +175,8 @@ case "$cmd" in
       python3 -c "import sys; sys.exit(0 if float('$b') >= 0.0003 else 1)" || die "key $addr holds $b ETH of gas; send it $KEY_FUND_ETH ETH first"
     done
     log "play sizing: bankroll mode, $BUY_MIN_ETH–$BUY_MAX_ETH ETH per buy, fraction $BUY_FRACTION; daily-loss override removed"
-    "$HOODCTL" psql -q -c "update plays set preset = preset || '{\"buyEth\": $BUY_MIN_ETH, \"sizing\": {\"mode\": \"bankroll\", \"fraction\": $BUY_FRACTION, \"minEth\": $BUY_MIN_ETH, \"maxEth\": $BUY_MAX_ETH}}'::jsonb where name = '$PLAY_NAME'" >/dev/null
+    # merge into the existing sizing (keeps sizing.idleTiers), do not replace it
+    "$HOODCTL" psql -q -c "update plays set preset = preset || jsonb_build_object('buyEth', $BUY_MIN_ETH, 'sizing', coalesce(preset->'sizing', '{}'::jsonb) || '{\"mode\": \"bankroll\", \"fraction\": $BUY_FRACTION, \"minEth\": $BUY_MIN_ETH, \"maxEth\": $BUY_MAX_ETH}'::jsonb) where name = '$PLAY_NAME'" >/dev/null
     "$HOODCTL" psql -q -c "delete from settings where key = 'daily_loss_limit_eth'" >/dev/null
     "$HOODCTL" resume >/dev/null 2>&1 || true
     log "stopping the paper sniper in compose (PAPER_SNIPER=0): one sniper per database"

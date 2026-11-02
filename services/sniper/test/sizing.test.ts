@@ -36,6 +36,28 @@ describe('sizeBuy (Preset.sizing)', () => {
     expect(sizeBuy(bankroll(), eth('0.9999'), 2).quoteIn).toBe(eth('0.124')); // 0.1249875 → 0.124
   });
 
+  it('idleTiers (2 Nov): the tier with the largest minIdle ≤ idle multiplies the size, rounded down to 0.001 ETH', () => {
+    const tiers = [
+      { minIdle: 1, mult: 0.5 },
+      { minIdle: 10, mult: 2 },
+      { minIdle: 4, mult: 1.25 },
+    ];
+    const p = parsePreset({ buyEth: 0.07, sizing: { mode: 'bankroll', minEth: 0.002, maxEth: 0.003, fraction: 0.35, idleTiers: tiers } });
+    // bankroll 0.0099 × 0.35 / 2 → clamped to the 0.002 minimum, then the tier
+    expect(sizeBuy(p, eth('0.0099'), 2, 1)).toMatchObject({ quoteIn: eth('0.001'), mult: 0.5 });
+    expect(sizeBuy(p, eth('0.0099'), 2, 3).quoteIn).toBe(eth('0.001'));
+    expect(sizeBuy(p, eth('0.0099'), 2, 6)).toMatchObject({ quoteIn: eth('0.002'), mult: 1.25 }); // 0.0025 → 0.002
+    expect(sizeBuy(p, eth('0.0099'), 2, 18)).toMatchObject({ quoteIn: eth('0.004'), mult: 2 });
+    expect(sizeBuy(p, eth('0.0099'), 2, 18).note).toMatch(/× 2 \(18 idle exempt\) → 0\.004 ETH/);
+    // no idle count (not a launch-second play) or below every tier: the base size
+    expect(sizeBuy(p, eth('0.0099'), 2).quoteIn).toBe(eth('0.002'));
+    expect(sizeBuy(p, eth('0.0099'), 2, 0)).toMatchObject({ quoteIn: eth('0.002') });
+    expect(sizeBuy(p, eth('0.0099'), 2, 0).mult).toBeUndefined();
+    // at 0.05 ETH stakes: 0.025 / 0.0625 / 0.1
+    const big = parsePreset({ buyEth: 0.05, sizing: { mode: 'bankroll', minEth: 0.05, maxEth: 0.05, fraction: 0.35, idleTiers: tiers } });
+    expect([1, 6, 12].map((i) => sizeBuy(big, eth('0.2'), 3, i).quoteIn)).toEqual([eth('0.025'), eth('0.062'), eth('0.1')]);
+  });
+
   it('an unknown bankroll (no balance read yet) buys the minimum', () => {
     expect(sizeBuy(bankroll(), null, 3)).toMatchObject({ quoteIn: eth('0.01'), clamped: 'min', bankrollEth: null });
   });
