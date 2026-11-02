@@ -47,6 +47,8 @@ export interface LaunchSecondTotals {
 
 /** What the launch-second ledger knows about one launch (see ledger.ts). */
 export interface LaunchSecondStats {
+  /** SnipeTaxExempted wallets (deployer excluded) with no buy seen in the launch second */
+  idleExempt?: number;
   /** buys proven by a CurveBuy log (launch receipt, buy receipt or node log) */
   confirmed: LaunchSecondTotals;
   /** every buy seen so far: feed hints + confirmed buys, minus refuted (reverted) hints */

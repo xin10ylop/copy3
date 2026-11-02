@@ -313,6 +313,32 @@ describe('launch-second fingerprint: ledger → rules → burst at T+1', () => {
     expect(stale.minOut).toBeGreaterThan(full.minOut);
   });
 
+  it('minIdleExempt (1 Nov): every exempted wallet buying at once (the bundle that dumps) is skipped; an exempt wallet left idle passes', async () => {
+    const IDLE = '0x000000000000000000000000000000000000a1d1' as Address;
+    const exemptLog = (w: Address) => ({ address: LAUNCH.curve, topics: [TOPICS.SnipeTaxExempted, `0x${'0'.repeat(24)}${w.slice(2)}`] as Hex[], data: '0x' as Hex, blockNumber: LAUNCH.block, transactionHash: LAUNCH.txHash, logIndex: 90 });
+    async function run(extraExempt: boolean): Promise<{ orders: number; reasons: string; idle: number | undefined }> {
+      const h = harness({ plays: [{ ...TEAM_BUY_PLAY, trigger: { launchSecond: { minTeamBuyEth: 0.1, minIdleExempt: 1 } } }] });
+      if (extraExempt) h.chain.receipts.set(LAUNCH.txHash, launchReceipt({ logs: [...launchFixture.receipt.logs, exemptLog(IDLE)] }));
+      await h.sniper.start();
+      h.warm();
+      const buy = curveBuyTx(0.19);
+      h.chain.receipts.set(buy.hash, buyReceipt(buy, h.blockAt(3)));
+      h.launchSecond(new Map([[3, [buy]]]), 0, 4);
+      await sleep(30);
+      const o = h.scripted!.orders[0];
+      const idle = h.sniper.ledger(LAUNCH.txHash)?.stats().idleExempt;
+      if (o) h.scripted!.resolveFill!(null);
+      return { orders: h.scripted!.orders.length, reasons: o ? o.run.decision.reasons.join() : '', idle };
+    }
+    const bundle = await run(false); // the receipt exempts the deployer and TEAM; TEAM bought → 0 idle
+    expect(bundle.idle).toBe(0);
+    expect(bundle.orders).toBe(0);
+    const operator = await run(true); // a third exempted wallet that did not buy
+    expect(operator.idle).toBe(1);
+    expect(operator.orders).toBe(1);
+    expect(operator.reasons).toMatch(/team 0\.19 ETH by 1 wallet\(s\), dev 0 ETH, 1 idle exempt \(seen\)/);
+  });
+
   it('a proxy buy (0x240acbf8: curve, minOut, recipient; value = quoteIn) is a feed hint for its recipient', () => {
     const lg = new LaunchSecondLedger({ event: { deployer: LAUNCH.deployer, name: 'S', symbol: 'S', launchKind: 'launchToken', exemptions: [TEAM], creatorFeeRecipient: TEAM, creatorTaxBps: 0, devBuyQuoteIn: 0n, pairToken: QUOTE_TOKENS.eth, launchConfigId: 0n }, block: LAUNCH.block, ts: T, receivedAt: 0, txHash: LAUNCH.txHash, token: LAUNCH.token, curve: LAUNCH.curve, addressSource: 'receipt', source: 'feed', origin: 'feed' } as never);
     lg.setAddresses(LAUNCH.token, LAUNCH.curve);
@@ -612,6 +638,7 @@ describe('LaunchSecondLedger (unit)', () => {
     for (const tx of [team, dev, taxed]) expect(lg.ingestTx(tx, LAUNCH.block + 1)).toBe('buy');
     expect(lg.ingestTx(team, LAUNCH.block + 1)).toBeNull(); // idempotent per tx
     expect(lg.stats()).toEqual({
+      idleExempt: 0, // the deployer and TEAM are the exempted wallets; TEAM bought
       seen: { teamBuyEth: 0.2, teamBuyers: 1, devBuyEth: 0.1 },
       confirmed: { teamBuyEth: 0, teamBuyers: 0, devBuyEth: 0 },
       exemptOut: 0,

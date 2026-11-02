@@ -83,9 +83,13 @@ export function checkLaunchSecond(rule: LaunchSecondRule, ls: LaunchSecondStats 
   if (rule.minDevBuyEth !== undefined && lo.devBuyEth + EPS < rule.minDevBuyEth) return fail(`dev buy ${fmt(lo.devBuyEth)} ETH < min ${rule.minDevBuyEth}`);
   if (rule.maxDevBuyEth !== undefined && hi.devBuyEth > rule.maxDevBuyEth + EPS) return fail(`dev buy ${fmt(hi.devBuyEth)} ETH > max ${rule.maxDevBuyEth}`);
   if (rule.requireNoDevBuy && hi.devBuyEth > 0) return fail(`requireNoDevBuy but dev bought ${fmt(hi.devBuyEth)} ETH`);
+  // every buy seen counts (an exempt wallet that bought is not idle): re-checked right before the
+  // first send, when the second is almost over
+  if (rule.minIdleExempt !== undefined && (ls.idleExempt ?? 0) < rule.minIdleExempt)
+    return fail(`${ls.idleExempt ?? 0} idle exempt wallet(s) < min ${rule.minIdleExempt} (every exempted wallet bought at once)`);
   return {
     ok: true,
-    reason: `launchSecond: team ${fmt(lo.teamBuyEth)} ETH by ${lo.teamBuyers} wallet(s), dev ${fmt(lo.devBuyEth)} ETH (${tag})`,
+    reason: `launchSecond: team ${fmt(lo.teamBuyEth)} ETH by ${lo.teamBuyers} wallet(s), dev ${fmt(lo.devBuyEth)} ETH${rule.minIdleExempt !== undefined ? `, ${ls.idleExempt ?? 0} idle exempt` : ''} (${tag})`,
   };
 }
 

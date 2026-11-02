@@ -171,7 +171,11 @@ export class LaunchSecondLedger {
     return this.launch.ts;
   }
 
+  /** wallets exempted by SnipeTaxExempted (the launch receipt's list + later exemptions in the second) */
+  private listed = new Set<string>();
+
   private exemptSet(list: readonly string[]): Set<string> {
+    this.listed = new Set(list.map((x) => x.toLowerCase()));
     const s = new Set<string>([this.deployer, this.launch.event.creatorFeeRecipient.toLowerCase(), ...list.map((x) => x.toLowerCase()), ...(this.addedExempt ?? [])]);
     s.delete(ZERO);
     return s;
@@ -322,6 +326,7 @@ export class LaunchSecondLedger {
       const account = topicAddr(log.topics[1]);
       if (account === ZERO || this.exempt.has(account)) return false;
       this.addedExempt.add(account);
+      this.listed.add(account);
       this.exemptedAt.set(account, { block, logIndex });
       this.exempt.add(account);
       return true;
@@ -454,7 +459,11 @@ export class LaunchSecondLedger {
 
   stats(): LaunchSecondStats {
     const all = this.all();
+    const buyers = new Set(all.map((b) => b.recipient));
+    let idle = 0;
+    for (const w of this.listed) if (w !== this.deployer && w !== ZERO && !buyers.has(w)) idle++;
     return {
+      idleExempt: idle,
       confirmed: this.totals(all.filter((b) => b.status === 'confirmed')),
       seen: this.totals(all),
       exemptOut: this.outs.size,

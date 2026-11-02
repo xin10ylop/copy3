@@ -173,6 +173,14 @@ export const LaunchSecondRuleSchema = z.object({
   maxDevBuyEth: z.number().min(0).optional(),
   /** no dev buy at all in the launch second. */
   requireNoDevBuy: z.boolean().optional(),
+  /**
+   * Exempt wallets (SnipeTaxExempted, deployer excluded) that did NOT buy in the launch second, at
+   * least. 0 means every exempted wallet bought at once: the bundle that dumps within seconds.
+   * Corrected month: 0 idle → −0.9 %/trade, 26 % quick team dumps; ≥ 1 idle → +15 %/trade, 55 % wins.
+   * Out of sample (31 Oct – 2 Nov, 54 launches): 0 idle → −7.5 %/trade, all 16 quick dumps; ≥ 1 →
+   * +19.3 %/trade, 71 % wins, no quick dump.
+   */
+  minIdleExempt: z.number().int().min(0).optional(),
 });
 export type LaunchSecondRule = z.infer<typeof LaunchSecondRuleSchema>;
 
