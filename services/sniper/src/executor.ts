@@ -24,6 +24,7 @@ import { sniperAbi } from '@hood/contracts';
 import { TOPICS, type FeedBlock, type RawLog } from '@hood/core';
 import { decodeEventLog, encodeFunctionData, formatEther, keccak256, parseEther, parseGwei, type Address, type Hex, type LocalAccount } from 'viem';
 import type { ChainClient, ReceiptLite } from './chain.js';
+import { redactUrl } from './config.js';
 import type { Logger } from './log.js';
 import type { RawSender } from './rpc.js';
 import type { Scheduler } from './scheduler.js';
@@ -291,7 +292,8 @@ export async function broadcastRaw(
       if (!r.ok && !known) stats.sendErrors++;
       if (r.ok || known) accepted = true;
       if (!r.ok && r.error !== undefined && PERMANENT_RE.test(r.error)) permanent = true;
-      log.push({ endpoint: r.endpoint, sentAt: r.sentAt, doneAt: r.doneAt, ok: r.ok || known, ...(r.error ? { error: attempt ? `resend: ${r.error}` : r.error } : {}) });
+      // the send log is stored in snipes.burst: never an API key (Alchemy-style /v2/<key>, user:pass@, ?query)
+      log.push({ endpoint: redactUrl(r.endpoint), sentAt: r.sentAt, doneAt: r.doneAt, ok: r.ok || known, ...(r.error ? { error: attempt ? `resend: ${r.error}` : r.error } : {}) });
     }
     if (accepted || permanent) return accepted;
     if (attempt === 0) stats.resends++;

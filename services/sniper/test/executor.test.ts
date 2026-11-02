@@ -61,7 +61,7 @@ function setup(): { sched: ManualScheduler; chain: FakeChain; a: FakeSender; b: 
   const chain = new FakeChain();
   chain.nonce = 42;
   const a = new FakeSender('http://ohio', () => sched.now());
-  const b = new FakeSender('http://node', () => sched.now(), true);
+  const b = new FakeSender('https://node.example/v2/abcDEF0123456789_secretKey', () => sched.now(), true);
   const finals: SnipeRun[] = [];
   const ex = new LiveExecutor({
     account,
@@ -108,6 +108,9 @@ describe('LiveExecutor burst', () => {
     expect(a.sent.map((s) => s.at - a.sent[0]!.at)).toEqual([0, 15, 30, 45, 60, 75, 90, 105, 120, 135]);
     expect(b.sent).toHaveLength(10); // fan-out, even though this endpoint errors
     expect(r.burst.every((m) => m.sends.length === 2 && m.sends.some((s) => !s.ok && s.error === 'boom'))).toBe(true);
+    // the recorded send log never carries an endpoint's API key
+    expect(r.burst.every((m) => m.sends.every((x) => !x.endpoint.includes('secretKey')))).toBe(true);
+    expect(r.burst[0]!.sends.map((x) => x.endpoint)).toContain('https://node.example/v2/***');
 
     // every raw tx: EIP-1559, chain 4663, to the sniper, snipe(curve, token, quoteIn, minOut, maxTax, deadline, deadlineTs)
     for (const [i, m] of r.burst.entries()) {
