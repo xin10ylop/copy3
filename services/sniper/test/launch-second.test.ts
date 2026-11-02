@@ -339,6 +339,45 @@ describe('launch-second fingerprint: ledger → rules → burst at T+1', () => {
     expect(operator.reasons).toMatch(/team 0\.19 ETH by 1 wallet\(s\), dev 0 ETH, 1 idle exempt \(seen\)/);
   });
 
+  it('MINEHOOD (2 Nov): a match on part of a helper tx (1 idle) that the rest of the tx turns into 0 idle is refused at the send and ends aborted, not failed', async () => {
+    const IDLE = '0x000000000000000000000000000000000000a1d1' as Address;
+    const exemptLog = (w: Address) => ({ address: LAUNCH.curve, topics: [TOPICS.SnipeTaxExempted, `0x${'0'.repeat(24)}${w.slice(2)}`] as Hex[], data: '0x' as Hex, blockNumber: LAUNCH.block, transactionHash: LAUNCH.txHash, logIndex: 90 });
+    const h = harness({ plays: [{ ...TEAM_BUY_PLAY, trigger: { launchSecond: { minTeamBuyEth: 0.1, minIdleExempt: 1 } } }] });
+    h.chain.receipts.set(LAUNCH.txHash, launchReceipt({ logs: [...launchFixture.receipt.logs, exemptLog(IDLE)] }));
+    await h.sniper.start();
+    h.warm();
+    h.launchSecond(new Map(), 0, 2);
+    await waitFor(() => h.chain.tokenWatchers.size > 0);
+    // one helper tx buys for both exempted wallets; only TEAM's log is out before the decision (no receipt yet)
+    const amounts = [parseEther('0.19'), parseEther('0.09')];
+    const tx = helperBuyTx(LAUNCH.curve, [TEAM, IDLE], amounts);
+    let r = INITIAL;
+    const logs = amounts.map((q, i) => {
+      const tokens = quoteBuy(r, q, CURVE_FEE_BPS, 0, 0n);
+      const fee = (q * BigInt(CURVE_FEE_BPS)) / 10_000n;
+      r = { quote: r.quote + q - fee, token: r.token - tokens };
+      return curveTradeLog({ curve: LAUNCH.curve, side: 'buy', trader: tx.to!, recipient: i === 0 ? TEAM : IDLE, quote: q, tokens, fee, tax: 0n, block: h.blockAt(3), txHash: tx.hash, logIndex: i * 2 });
+    });
+    h.chain.emitTokenLog(logs[0]!);
+    h.feed(emptyBlock(h.blockAt(3), T, T * 1000 + OFFSET + 300));
+    await waitFor(() => h.scripted!.orders.length === 1);
+    const o = h.scripted!.orders[0]!;
+    expect(o.run.decision.reasons.join()).toMatch(/1 idle exempt \(seen\)/);
+    expect(o.guard?.() ?? null).toBeNull();
+    // the rest of the helper tx lands before the first send: IDLE bought too
+    h.chain.emitTokenLog(logs[1]!);
+    await waitFor(() => h.sniper.ledger(LAUNCH.txHash)?.stats().idleExempt === 0);
+    // what the live executor does right before the first member: run the guard, send nothing
+    const why = o.guard?.() ?? null;
+    expect(why).toMatch(/launch-second fingerprint no longer holds: .*0 idle exempt wallet\(s\) < min 1/);
+    o.run.notes.push(`send blocked before the first member: ${why}`);
+    o.run.sendBlocked = why!;
+    h.scripted!.resolveFill!(null);
+    await waitFor(() => o.run.status !== 'pending');
+    expect(o.run.status).toBe('aborted');
+    expect(o.run.notes.at(-1)).toBe(`nothing sent: ${why}`);
+  });
+
   it('a proxy buy (0x240acbf8: curve, minOut, recipient; value = quoteIn) is a feed hint for its recipient', () => {
     const lg = new LaunchSecondLedger({ event: { deployer: LAUNCH.deployer, name: 'S', symbol: 'S', launchKind: 'launchToken', exemptions: [TEAM], creatorFeeRecipient: TEAM, creatorTaxBps: 0, devBuyQuoteIn: 0n, pairToken: QUOTE_TOKENS.eth, launchConfigId: 0n }, block: LAUNCH.block, ts: T, receivedAt: 0, txHash: LAUNCH.txHash, token: LAUNCH.token, curve: LAUNCH.curve, addressSource: 'receipt', source: 'feed', origin: 'feed' } as never);
     lg.setAddresses(LAUNCH.token, LAUNCH.curve);

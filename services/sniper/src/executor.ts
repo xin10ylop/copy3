@@ -512,6 +512,7 @@ export class LiveExecutor implements ExecutionBackend {
           if (why) {
             this.stats.guardBlocked++;
             run.notes.push(`send blocked before the first member: ${why}`);
+            run.sendBlocked = why;
             m.status = 'skipped';
             this.abort(run.key);
             return finish();

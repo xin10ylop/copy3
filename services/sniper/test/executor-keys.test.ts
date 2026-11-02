@@ -193,6 +193,7 @@ describe('L2: last-moment kill switch', () => {
     expect(r.burst.map((m) => m.status)).toEqual(['skipped', 'skipped', 'skipped']);
     expect(r.notes.join()).toMatch(/send blocked before the first member: kill switch on/);
     expect(ex.stats.guardBlocked).toBe(1);
+    expect(r.sendBlocked).toBe('kill switch on');
   });
 });
 

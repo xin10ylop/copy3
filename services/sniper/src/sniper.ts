@@ -1519,6 +1519,11 @@ export class Sniper {
       if (v !== 'no_buy') return; // filled, or kept unresolved (slot held) and retried
     }
     // (status is mutated by abortRun while we await: read it through a function, not narrowed)
+    if (run.sendBlocked !== undefined && statusOf(run) !== 'aborted') {
+      // the last-moment check refused the first send: nothing left, so this is an abort, not a miss
+      this.endRun(run, 'aborted', `nothing sent: ${run.sendBlocked}`);
+      return;
+    }
     this.endRun(run, 'failed', statusOf(run) === 'aborted' ? 'no fill after the abort' : 'no burst member bought');
   }
 

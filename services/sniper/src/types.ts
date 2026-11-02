@@ -140,6 +140,8 @@ export interface SnipeRun {
   ended?: boolean;
   /** the burst passed the last kill-switch / daily-loss check right before its first send (L2) */
   sendCleared?: boolean;
+  /** why the last-moment check refused the first send (nothing left: the run ends `aborted` with this) */
+  sendBlocked?: string;
   /** executor key address that signed the burst (M1) */
   signer?: Address;
   /** holds a MAX_CONCURRENT slot (taken once the launch is receipt-confirmed, N10) */

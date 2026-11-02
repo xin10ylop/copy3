@@ -78,6 +78,7 @@ export class PaperExecutor implements ExecutionBackend {
         if (why) {
           this.pending.delete(key);
           run.notes.push(`send blocked before the first member: ${why}`);
+          run.sendBlocked = why;
           p.resolve(null);
           continue;
         }

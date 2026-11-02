@@ -428,8 +428,9 @@ describe('L2: kill switch', () => {
     await sleep(5);
     for (let k = 0; k < 3; k++) h.feed(emptyBlock(LAUNCH.block + 8 + k, T + 1, (T + 1) * 1000 + OFFSET + k * 100));
     await waitFor(() => run.status !== 'pending');
-    expect(run.status).toBe('failed');
+    expect(run.status).toBe('aborted');
     expect(run.notes.join()).toMatch(/send blocked before the first member: kill switch on/);
+    expect(run.notes.at(-1)).toBe('nothing sent: kill switch on');
     expect(run.fill).toBeUndefined();
   });
 });
