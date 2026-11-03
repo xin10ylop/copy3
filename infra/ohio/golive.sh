@@ -6,6 +6,7 @@
 #   sudo bash /opt/hood/hoodsniper/infra/ohio/golive.sh deploy OWNER=0x…   # PonsSniper with the cold owner, funded from the exit key
 #   sudo bash /opt/hood/hoodsniper/infra/ohio/golive.sh live               # stop the paper sniper, start the live one
 #   sudo bash /opt/hood/hoodsniper/infra/ohio/golive.sh status | stop | paper
+#   sudo bash /opt/hood/hoodsniper/infra/ohio/golive.sh drain TO=0x…       # after stop: every executor key's ETH back to TO
 #
 # Sizes (override with env vars on the command line):
 #   KEY_FUND_ETH=0.0012      gas per executor key (3 keys: 1 exit + MAX_CONCURRENT burst)
@@ -59,6 +60,19 @@ const chain={id:4663,name:'Robinhood Chain',nativeCurrency:{name:'Ether',symbol:
 const account=privateKeyToAccount('$1'); const w=createWalletClient({account,chain,transport:http('$RPC')}); const pc=createPublicClient({chain,transport:http('$RPC')});
 const hash=await w.sendTransaction({to:'$2',value:parseEther('$3')}); const r=await pc.waitForTransactionReceipt({hash,timeout:60000});
 console.log(r.status+' '+hash)"
+}
+
+# drain_key <from private key> <to address>: send the whole balance minus this transfer's fee
+drain_key() {
+  node_db "import {createWalletClient,createPublicClient,http} from 'viem'; import {privateKeyToAccount} from 'viem/accounts';
+const chain={id:4663,name:'Robinhood Chain',nativeCurrency:{name:'Ether',symbol:'ETH',decimals:18},rpcUrls:{default:{http:['$RPC']}}};
+const account=privateKeyToAccount('$1'); const pc=createPublicClient({chain,transport:http('$RPC')}); const w=createWalletClient({account,chain,transport:http('$RPC')});
+const bal=await pc.getBalance({address:account.address}); const gp=await pc.getGasPrice();
+const gas=(await pc.estimateGas({account:account.address,to:'$2',value:0n}))*3n/2n; const maxFee=gp*2n; const fee=gas*maxFee;
+if (bal<=fee) { console.log('skip '+account.address+': balance '+(Number(bal)/1e18)+' ETH is below the fee'); process.exit(0); }
+const hash=await w.sendTransaction({to:'$2',value:bal-fee,gas,maxFeePerGas:maxFee,maxPriorityFeePerGas:0n});
+const r=await pc.waitForTransactionReceipt({hash,timeout:60000});
+console.log(r.status+' '+account.address+' -> '+(Number(bal-fee)/1e18)+' ETH '+hash)"
 }
 
 cmd="${1:-help}"; shift || true
@@ -207,6 +221,16 @@ case "$cmd" in
     "$HOODCTL" kill golive-stop >/dev/null 2>&1 || true
     systemctl stop hood-sniper.service
     log "stopped. Open positions are resumed on the next start; to withdraw everything send 0 ETH from the owner wallet to the contract"
+    ;;
+  drain)
+    # send every executor key's ETH (gas money) back to your wallet; the contract is swept separately
+    # by a 0 ETH transfer from the owner wallet to it
+    [[ "${TO:-}" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "usage: golive.sh drain TO=<your wallet address>"
+    systemctl is-active --quiet hood-sniper.service && die "the live sniper is running: golive.sh stop first"
+    [[ -f "$EXEC_ENV" ]] || die "no $EXEC_ENV"
+    keys="$(env_get "$EXEC_ENV" EXECUTOR_PRIVATE_KEYS)"; IFS=',' read -ra arr <<<"$keys"
+    for k in "${arr[@]}"; do drain_key "$k" "$TO" >&2; done
+    print_keys
     ;;
   status)
     systemctl --no-pager --lines=0 status hood-sniper.service 2>/dev/null | sed -n '1,3p' >&2 || true
